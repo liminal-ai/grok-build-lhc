@@ -7,7 +7,7 @@ use tracing::warn;
 use xai_chat_state::{ChatPersistence, StrictAppendAck, StrictAppendError};
 use xai_grok_sampling_types::ConversationItem;
 
-use crate::capture::{CaptureHandle, is_session_registered, spawn_capture};
+use crate::capture::{CaptureHandle, any_capture_active, is_session_registered, spawn_capture};
 use crate::gating::is_enabled;
 use crate::inference::LhcInferenceSampler;
 
@@ -48,7 +48,11 @@ pub fn tee_chat_persistence(
 /// True when a capture worker is registered for `session_id`.
 ///
 /// Post-spawn gating uses registry presence, not a re-read of `GROK_LHC` (F9).
+/// Cheap process-wide atomic first — no registry mutex when LHC is off (L3).
 pub fn capture_active(session_id: &str) -> bool {
+    if !any_capture_active() {
+        return false;
+    }
     is_session_registered(session_id)
 }
 

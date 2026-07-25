@@ -2117,17 +2117,40 @@ impl SessionActor {
                 })),
             );
             let mut request = request;
-            // LHC-HOOK 4/5: substitute LHC request context (all-LHC or all-native)
+            // LHC-HOOK 4/6: substitute LHC request context (all-LHC or all-native)
+            // Cheap atomic first, then per-session registry — no mutex when off.
+            // Hook 4 is instrumented-redundant: observe native vs served (G1);
+            // observation never changes the served result.
+            if grok_lhc_host::any_capture_active()
+                && grok_lhc_host::capture_active(self.session_info.id.0.as_ref())
             {
                 let native_items = std::mem::take(&mut request.items);
                 let tools_before = request.tools.len();
                 let decision = grok_lhc_host::serve_request_context(
                     self.session_info.id.0.as_ref(),
-                    native_items.clone(),
+                    &native_items,
                 )
                 .await;
+                let observe = grok_lhc_host::equivalence_armed();
+                let native_for_obs = observe.then(|| native_items.clone());
                 let (items, substituted) =
                     grok_lhc_host::apply_serve_decision(native_items, decision);
+                if let Some(native_obs) = native_for_obs {
+                    let turn_index = self.chat_state_handle.get_prompt_index().await;
+                    let compact_occurred = self
+                        .chat_state_handle
+                        .get_last_compaction_prompt_index()
+                        .await
+                        .is_some();
+                    let _ = grok_lhc_host::observe_serve_equivalence(
+                        self.session_info.id.0.as_ref(),
+                        Some(turn_index),
+                        compact_occurred,
+                        substituted,
+                        &native_obs,
+                        &items,
+                    );
+                }
                 request.items = items;
                 debug_assert_eq!(
                     request.tools.len(),

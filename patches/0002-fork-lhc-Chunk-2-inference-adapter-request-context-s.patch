@@ -1,0 +1,903 @@
+From 8c52db9f3d7439f890cf13e903c340ba8f073209 Mon Sep 17 00:00:00 2001
+From: Lee Moore <lee.g.moore@gmail.com>
+Date: Sat, 25 Jul 2026 21:06:47 +0000
+Subject: [PATCH 2/2] =?UTF-8?q?fork(lhc):=20Chunk=202=20=E2=80=94=20infere?=
+ =?UTF-8?q?nce=20adapter,=20request-context=20serving,=20compact=20bridge?=
+ =?UTF-8?q?=20with=20write-back?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+LHC now compacts. Behind GROK_LHC (off by default; host behaviourally identical
+when unset, with no added per-turn work). Six marked core touchpoints, sentinel
+enforced. 141 lib + 71 certification + 5 golden tests.
+
+What this adds on top of Chunk 1's capture:
+- LHC inference adapter with per-call credential refresh, cancellation,
+  dedicated-model override, and typed error classification.
+- Request-context serving (hook 4), instrumented-redundant per Lee's ruling:
+  it stays through Chunk 2 gathering equivalence evidence, and comes out at
+  Chunk 3 if that evidence shows zero divergence.
+- Compact bridge with WRITE-BACK: LHC's compacted body is written back into
+  native state via the host's own replace_conversation_for_compaction. Ruled the
+  proven LHC-host architecture (pi-lhc, t3code); serving-without-write-back was
+  the deviation, and it caused the two-truths failure mode that desynced token
+  accounting and stranded fail-open on an oversized body.
+
+Design change ratified mid-chunk: classification moved from parsing rendered
+text to typed provenance from get_session_thread_view. The prefix-based
+classifier produced a new defect in three consecutive rounds — desync in the
+DEFAULT compact mode, image-bearing prompts failing to match because
+text_content() drops image parts while capture appends [image:...], and a
+residual that misplaced a prompt_index marker and could corrupt cancelled-turn
+rewind. Both acceptance verifiers returned DESIGN: SOUND; one argued it is
+forced, since once rendered text is excluded the typed view's only remaining
+discriminator is message_id provenance. Recorded as a binding law for Phase 4:
+hosts never parse renders.
+
+Serious defects caught and fixed during the chunk:
+- The written-back body was not a fixpoint. LHC renders bands, tool results and
+  runtime notes as User role; every one counted as a real user turn, so markers
+  landed on tool results and each compaction re-stamped and re-recorded the same
+  text. Found by the ruled hard gate.
+- Runtime notes round-tripped back as REAL user prompts, permanently promoting
+  synthetic host items in the canonical record.
+- get_classify_context turned a messages.list error into an EMPTY index and
+  returned success — every real prompt would classify synthetic, erasing all
+  markers and recapturing the user's own prompts as runtime_note.
+- capture_active took a registry mutex every turn with GROK_LHC unset,
+  violating off-by-default.
+- The equivalence instrument was miscalibrated in both directions: informational
+  divergence fired on cosmetic JSON whitespace on every tool window, while
+  raw_fingerprint reduced a tool-call assistant to a constant and later collided
+  on unescaped delimiters.
+
+Live-tail kinds are conserved through write-back (tool_call, tool_result,
+assistant_text, assistant_thinking, runtime_note, user_prompt); bands stay
+user_meta because compaction prose is what compaction is. Two exceptions are
+forced by host sink types and documented.
+
+Every one of 70 fingerprint contributions is now individually pinned, jointly
+pinned, or documented-redundant with a proof — verified by full deletion sweeps
+in which survivors exactly equal the documented-redundant set.
+
+17 rounds, dual adversarial verification throughout. Root causes of that count
+recorded in the onboarding doc: verifier sessions were started fresh each round
+(so each assumed first contact and ran a maximal search) and the orchestrator's
+stopping rule had no fixed point. Both fixed for Chunk 3.
+
+Carried to Chunk 3 as named checkpoints: G2 (capture the real write-back body
+from a live Replace compaction and re-verify instrument CALIBRATION, not just
+fixtures); Chunk 1's session-id coupling and async-guard limitations; /btw and
+memory flush on a compacted session; and the hook-4 removal ruling.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ crates/codegen/xai-grok-shell/Cargo.toml      |   2 +-
+ .../src/agent/handlers/model_switch.rs        |   2 +-
+ .../src/session/acp_session_impl/spawn.rs     |  11 +-
+ .../src/session/acp_session_impl/turn.rs      |  48 ++++
+ .../rewind_cross_compaction_tests.rs          | 224 ++++++++++++++++++
+ .../xai-grok-shell/src/session/compaction.rs  | 182 +++++++++++++-
+ .../src/session/lhc_inference.rs              | 222 +++++++++++++++++
+ .../codegen/xai-grok-shell/src/session/mod.rs |   2 +
+ 8 files changed, 689 insertions(+), 4 deletions(-)
+ create mode 100644 crates/codegen/xai-grok-shell/src/session/lhc_inference.rs
+
+diff --git a/crates/codegen/xai-grok-shell/Cargo.toml b/crates/codegen/xai-grok-shell/Cargo.toml
+index a064f20..adf512b 100644
+--- a/crates/codegen/xai-grok-shell/Cargo.toml
++++ b/crates/codegen/xai-grok-shell/Cargo.toml
+@@ -130,7 +130,7 @@ xai-agent-lifecycle = { workspace = true }
+ xai-interjection-core = { workspace = true }
+ xai-grok-sandbox = { path = "../xai-grok-sandbox", default-features = false }
+ xai-chat-state = { path = "../xai-chat-state" }
+-# LHC-HOOK 1/3: dependency on grok-lhc-host adapter
++# LHC-HOOK 1/6: dependency on grok-lhc-host adapter
+ grok-lhc-host = { path = "../../lhc/grok-lhc-host" }
+ xai-grok-compaction = { path = "../../common/xai-grok-compaction" }
+ xai-grok-sampler = { path = "../xai-grok-sampler" }
+diff --git a/crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs b/crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs
+index c7d8e02..608d41d 100644
+--- a/crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs
++++ b/crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs
+@@ -230,7 +230,7 @@ pub(crate) async fn apply(
+         model_id.0.as_ref(),
+         applied_effort.map(|eff| eff.to_string()),
+     );
+-    // LHC-HOOK 3/3: model / thinking-level change tee
++    // LHC-HOOK 3/6: model / thinking-level change tee
+     grok_lhc_host::capture_model_or_thinking_change(
+         session_id.0.as_ref(),
+         previous_model_id.as_ref(),
+diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs
+index cc6187f..e12f987 100644
+--- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs
++++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs
+@@ -441,12 +441,21 @@ pub(crate) async fn spawn_session_actor(
+         conversation.clone(),
+         chat_state_sampling_config,
+         actor_pruning_config,
+-        // LHC-HOOK 2/3: wrap persistence in the LHC capture tee
++        // LHC-HOOK 2/6: wrap persistence in the LHC capture tee (+ inference sampler)
+         grok_lhc_host::tee_chat_persistence(
+             session_info.id.0.as_ref(),
+             session_info.cwd.as_ref(),
+             &conversation,
+             chat_persistence,
++            Some(
++                crate::session::lhc_inference::ShellLhcInferenceSampler::new(
++                    sampling_config.clone(),
++                    auth_manager.clone(),
++                    session_info.id.0.to_string(),
++                    std::time::Duration::from_secs(60),
++                )
++                .into_arc(),
++            ),
+         ),
+         chat_state_event_tx,
+         tokio_util::sync::CancellationToken::new(),
+diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
+index 6c02f44..ccdf53f 100644
+--- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
++++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
+@@ -2117,7 +2117,55 @@ impl SessionActor {
+                 })),
+             );
+             let mut request = request;
++            // LHC-HOOK 4/6: substitute LHC request context (all-LHC or all-native)
++            // Cheap atomic first, then per-session registry — no mutex when off.
++            // Hook 4 is instrumented-redundant: observe native vs served (G1);
++            // observation never changes the served result.
++            if grok_lhc_host::any_capture_active()
++                && grok_lhc_host::capture_active(self.session_info.id.0.as_ref())
++            {
++                let native_items = std::mem::take(&mut request.items);
++                let tools_before = request.tools.len();
++                let decision = grok_lhc_host::serve_request_context(
++                    self.session_info.id.0.as_ref(),
++                    &native_items,
++                )
++                .await;
++                let observe = grok_lhc_host::equivalence_armed();
++                let native_for_obs = observe.then(|| native_items.clone());
++                let (items, substituted) =
++                    grok_lhc_host::apply_serve_decision(native_items, decision);
++                if let Some(native_obs) = native_for_obs {
++                    let turn_index = self.chat_state_handle.get_prompt_index().await;
++                    let compact_occurred = self
++                        .chat_state_handle
++                        .get_last_compaction_prompt_index()
++                        .await
++                        .is_some();
++                    let _ = grok_lhc_host::observe_serve_equivalence(
++                        self.session_info.id.0.as_ref(),
++                        Some(turn_index),
++                        compact_occurred,
++                        substituted,
++                        &native_obs,
++                        &items,
++                    );
++                }
++                request.items = items;
++                debug_assert_eq!(
++                    request.tools.len(),
++                    tools_before,
++                    "LHC serving must not alter tools"
++                );
++                if substituted {
++                    tracing::debug!(
++                        session_id = %self.session_info.id,
++                        "LHC serving: substituted conversation body"
++                    );
++                }
++            }
+             request.x_grok_session_id = Some(self.session_info.id.to_string());
++            // prompt_index is actor state — stamped after substitution (preserved).
+             request.x_grok_turn_idx =
+                 Some(self.chat_state_handle.get_prompt_index().await.to_string());
+             request.x_grok_agent_id = Some(xai_grok_telemetry::id::agent_id());
+diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/rewind_cross_compaction_tests.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/rewind_cross_compaction_tests.rs
+index c9e2eb7..e2d009e 100644
+--- a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/rewind_cross_compaction_tests.rs
++++ b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/rewind_cross_compaction_tests.rs
+@@ -461,3 +461,227 @@ async fn run_forked_rewind_scenario() {
+         "prompt_index must be reset to the rewind target"
+     );
+ }
++
++/// H3 — rewind after LHC write-back keeps the compacted body.
++///
++/// Drives production [`SessionActor::lhc_replace_and_writeback`] so deleting
++/// `persist_compaction_checkpoint` inside that choke fails this test (nothing
++/// lands on the persistence channel).
++#[tokio::test(flavor = "current_thread")]
++async fn rewind_after_lhc_writeback_shaped_checkpoint_keeps_compacted_body() {
++    let local = tokio::task::LocalSet::new();
++    local
++        .run_until(run_lhc_writeback_rewind_keeps_compacted())
++        .await;
++}
++
++async fn run_lhc_writeback_rewind_keeps_compacted() {
++    use crate::session::persistence::PersistenceMsg;
++    use grok_lhc_host::{MockLhcInferenceSampler, spawn_capture};
++    use std::sync::Arc;
++    use tempfile::TempDir;
++
++    let lhc_root = TempDir::new().unwrap();
++    let prev_lhc = std::env::var_os("GROK_LHC");
++    let prev_root = std::env::var_os("GROK_LHC_ROOT");
++    let prev_compact = std::env::var_os("GROK_LHC_COMPACT");
++    let prev_exp = std::env::var_os("GROK_LHC_COMPACT_EXPERIMENTAL");
++    unsafe {
++        std::env::set_var("GROK_LHC", "1");
++        std::env::set_var("GROK_LHC_ROOT", lhc_root.path());
++        std::env::set_var("GROK_LHC_COMPACT", "replace");
++        std::env::set_var("GROK_LHC_COMPACT_EXPERIMENTAL", "1");
++    }
++
++    let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
++    let (persistence_tx, mut persistence_rx) = tokio::sync::mpsc::unbounded_channel();
++    let mut actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
++
++    let unique = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .unwrap()
++        .as_nanos();
++    let sid = format!("rw-lhc-wb-{unique}");
++    actor.session_info.id = acp::SessionId::new(sid.clone());
++
++    let session_dir = crate::session::persistence::session_dir(&actor.session_info);
++    std::fs::create_dir_all(session_dir.join("compaction_checkpoints")).unwrap();
++
++    let mut u0 = ConversationItem::user("old-0");
++    u0.set_prompt_index(0);
++    let mut u1 = ConversationItem::user("please investigate area 9");
++    u1.set_prompt_index(1);
++    let mut u2 = ConversationItem::user("live-2");
++    u2.set_prompt_index(2);
++    let tool_asst =
++        ConversationItem::assistant_tool_calls(vec![xai_grok_sampling_types::ToolCall {
++            id: "c1".into(),
++            name: "bash".into(),
++            arguments: "{\"cmd\":\"ls\"}".into(),
++        }]);
++    let native = vec![
++        ConversationItem::system("SYS"),
++        u0,
++        ConversationItem::assistant("a0"),
++        u1,
++        tool_asst,
++        ConversationItem::tool_result("c1", "file_a"),
++        ConversationItem::assistant("done"),
++        u2,
++        ConversationItem::assistant("a2"),
++    ];
++
++    let sampler = Arc::new(MockLhcInferenceSampler::new());
++    let capture = spawn_capture(
++        &sid,
++        Some("/tmp"),
++        &native,
++        Some(lhc_root.path()),
++        Some(sampler),
++    )
++    .expect("capture must start for Replace write-back");
++    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
++
++    actor.chat_state_handle.restore_snapshot({
++        let mut snap = actor
++            .chat_state_handle
++            .snapshot()
++            .await
++            .expect("snapshot available");
++        snap.conversation = native.clone();
++        snap.prompt_index = 3;
++        snap.prompt_texts = vec![
++            "old-0".into(),
++            "please investigate area 9".into(),
++            "live-2".into(),
++        ];
++        snap
++    });
++
++    let ok = actor.lhc_replace_and_writeback().await;
++    if !ok {
++        capture.shutdown_async();
++        restore_lhc_env(prev_lhc, prev_root, prev_compact, prev_exp);
++        panic!(
++            "production lhc_replace_and_writeback failed under Replace mode — \
++             if the adapter fixture cannot compact, escalate H3 to Chunk 3 live harness"
++        );
++    }
++
++    let ckpt_file = loop {
++        match persistence_rx.try_recv() {
++            Ok(PersistenceMsg::CompactionCheckpoint(f)) => break f,
++            Ok(_) => continue,
++            Err(_) => {
++                capture.shutdown_async();
++                restore_lhc_env(prev_lhc, prev_root, prev_compact, prev_exp);
++                panic!(
++                    "lhc_replace_and_writeback must enqueue CompactionCheckpoint \
++                     via persist_compaction_checkpoint (deleting that call fails this test)"
++                );
++            }
++        }
++    };
++    let ckpt_id = ckpt_file.checkpoint_id.clone();
++    let compacted_history = ckpt_file.compacted_history.clone();
++    std::fs::write(
++        session_dir.join(format!("compaction_checkpoints/{ckpt_id}.json")),
++        serde_json::to_vec(&ckpt_file).unwrap(),
++    )
++    .unwrap();
++
++    let updates = vec![
++        user_chunk("P0", 0),
++        user_chunk("P1", 1),
++        user_chunk("P2", 2),
++        user_chunk("P3", 3),
++        user_chunk("P4", 4),
++        checkpoint_update(&ckpt_id, 5),
++        user_chunk("live-2", 5),
++        agent_chunk("a2"),
++        user_chunk("P6", 6),
++    ];
++    let mut content = Vec::new();
++    for u in &updates {
++        let env = SessionUpdateEnvelope::from_update(u).unwrap();
++        content.extend(serde_json::to_vec(&env).unwrap());
++        content.push(b'\n');
++    }
++    std::fs::write(session_dir.join("updates.jsonl"), content).unwrap();
++
++    let mut snap = actor
++        .chat_state_handle
++        .snapshot()
++        .await
++        .expect("snapshot available");
++    snap.conversation = compacted_history;
++    snap.prompt_index = 7;
++    snap.prompt_texts = (0..7).map(|i| format!("P{i}")).collect();
++    snap.last_compaction_prompt_index = Some(5);
++    actor.chat_state_handle.restore_snapshot(snap);
++
++    let resp = actor
++        .handle_rewind(RewindRequest {
++            target_prompt_index: 6,
++            force: true,
++            mode: RewindMode::ConversationOnly,
++        })
++        .await
++        .expect("handle_rewind ok");
++    assert!(
++        resp.success,
++        "rewind after LHC write-back must succeed: {resp:?}"
++    );
++
++    let conv = actor.chat_state_handle.get_conversation().await;
++    let texts: Vec<String> = conv.iter().map(|c| c.text_content()).collect();
++    let marker = actor
++        .chat_state_handle
++        .get_last_compaction_prompt_index()
++        .await;
++
++    capture.shutdown_async();
++    let _ = std::fs::remove_dir_all(&session_dir);
++    restore_lhc_env(prev_lhc, prev_root, prev_compact, prev_exp);
++
++    assert!(
++        !texts.iter().any(|t| t == "P0" || t == "P1" || t == "P2"),
++        "pre-compaction prompts must not return (un-compact): {texts:?}"
++    );
++    assert_eq!(
++        marker,
++        Some(5),
++        "compaction marker must remain after post-compact rewind"
++    );
++    assert_eq!(
++        actor.chat_state_handle.get_prompt_index().await,
++        6,
++        "prompt_index must be the rewind target"
++    );
++}
++
++fn restore_lhc_env(
++    prev_lhc: Option<std::ffi::OsString>,
++    prev_root: Option<std::ffi::OsString>,
++    prev_compact: Option<std::ffi::OsString>,
++    prev_exp: Option<std::ffi::OsString>,
++) {
++    unsafe {
++        match prev_lhc {
++            Some(v) => std::env::set_var("GROK_LHC", v),
++            None => std::env::remove_var("GROK_LHC"),
++        }
++        match prev_root {
++            Some(v) => std::env::set_var("GROK_LHC_ROOT", v),
++            None => std::env::remove_var("GROK_LHC_ROOT"),
++        }
++        match prev_compact {
++            Some(v) => std::env::set_var("GROK_LHC_COMPACT", v),
++            None => std::env::remove_var("GROK_LHC_COMPACT"),
++        }
++        match prev_exp {
++            Some(v) => std::env::set_var("GROK_LHC_COMPACT_EXPERIMENTAL", v),
++            None => std::env::remove_var("GROK_LHC_COMPACT_EXPERIMENTAL"),
++        }
++    }
++}
+diff --git a/crates/codegen/xai-grok-shell/src/session/compaction.rs b/crates/codegen/xai-grok-shell/src/session/compaction.rs
+index 3fac8e5..0e5fc9c 100644
+--- a/crates/codegen/xai-grok-shell/src/session/compaction.rs
++++ b/crates/codegen/xai-grok-shell/src/session/compaction.rs
+@@ -601,6 +601,17 @@ impl SessionActor {
+         self: &Arc<Self>,
+         user_context: Option<String>,
+     ) -> Result<(), acp::Error> {
++        // LHC writer choke (hook 5): at most one LHC call; fail-open sticky.
++        if !self.lhc_compact_drive_native_writer().await {
++            if user_context.is_some() {
++                tracing::warn!(
++                    session_id = %self.session_info.id,
++                    "LHC replace mode suppressed /compact; user context was discarded \
++                     (Replace is experimental — see GROK_LHC_COMPACT_EXPERIMENTAL)"
++                );
++            }
++            return Ok(());
++        }
+         self.record_compaction_variant();
+         let total_tokens = self.chat_state_handle.get_total_tokens().await;
+         tracing::Span::current().record("pre_tokens", total_tokens as i64);
+@@ -1838,6 +1849,169 @@ impl SessionActor {
+         let estimated_total = self.chat_state_handle.get_estimated_total_tokens().await;
+         estimated_total > context_window
+     }
++    /// LHC compact bridge choke (hook 5): pure plan + at most one LHC I/O.
++    ///
++    /// Replace success **writes back** the LHC body into native state via
++    /// `replace_conversation_for_compaction` (same path native compact uses).
++    /// Fail-open is sticky inside [`grok_lhc_host::CompactEventBridge`].
++    ///
++    /// Returns `true` when the native writer may proceed.
++    async fn lhc_compact_drive_native_writer(&self) -> bool {
++        let mut bridge =
++            grok_lhc_host::CompactEventBridge::new(grok_lhc_host::resolve_compact_mode());
++        if bridge.should_attempt_preview() {
++            grok_lhc_host::shadow_preview_compact(self.session_info.id.0.as_ref()).await;
++            bridge.record_preview_done();
++        }
++        if bridge.should_attempt_replace() {
++            let ok = self.lhc_replace_and_writeback().await;
++            bridge.record_replace_result(ok);
++        }
++        matches!(
++            bridge.choke_action(),
++            grok_lhc_host::CompactChokeAction::RunNative
++        )
++    }
++
++    /// Replace-mode: LHC compact → build write-back body → native replace.
++    /// Returns whether LHC+write-back succeeded (native must not also compact).
++    /// `pub(crate)` so certification can drive the production choke (H3).
++    pub(crate) async fn lhc_replace_and_writeback(&self) -> bool {
++        let session_id = self.session_info.id.0.as_ref();
++        let tokens_before_estimated = self.chat_state_handle.get_estimated_total_tokens().await;
++        // Native compact uses provider `total_tokens` for forked-prefix projection.
++        let tokens_before_total = self.chat_state_handle.get_total_tokens().await;
++        let native_before = self.chat_state_handle.get_conversation().await;
++        let writeback = match grok_lhc_host::replace_compact_for_writeback(session_id).await {
++            Ok(wb) => wb,
++            Err(err) => {
++                tracing::error!(
++                    session_id,
++                    %err,
++                    "LHC replace: compact/context failed; fail-open to native"
++                );
++                return false;
++            }
++        };
++        let items = match grok_lhc_host::build_writeback_conversation(
++            &native_before,
++            &writeback.view,
++            &writeback.kinds,
++        ) {
++            Ok(items) => items,
++            Err(err) => {
++                tracing::error!(
++                    session_id,
++                    %err,
++                    "LHC replace: write-back body build failed; fail-open to native"
++                );
++                return false;
++            }
++        };
++        let prompt_index_at_compaction = self.chat_state_handle.get_prompt_index().await;
++        // Match native `run_compact_inner` surround (~1642–1719), including
++        // checkpoint persistence and forked-prefix resolution — not only the
++        // replace/threshold window.
++        self.chat_state_handle
++            .record_compaction_at(prompt_index_at_compaction);
++        let original_user_info = native_before.get(1).and_then(|item| match item {
++            ConversationItem::User(parts) => parts.content.iter().find_map(|p| match p {
++                xai_grok_sampling_types::ContentPart::Text { text } => {
++                    Some(text.as_ref().to_owned())
++                }
++                _ => None,
++            }),
++            _ => None,
++        });
++        self.persist_compaction_checkpoint(
++            &items,
++            prompt_index_at_compaction,
++            None,
++            original_user_info,
++        );
++        let context_window = self
++            .chat_state_handle
++            .get_sampling_config()
++            .await
++            .map(|c| c.context_window.get())
++            .unwrap_or(DEFAULT_CONTEXT_WINDOW);
++        let prefix_len = if self
++            .compaction
++            .prefix_released
++            .load(std::sync::atomic::Ordering::Relaxed)
++        {
++            0
++        } else {
++            self.startup_hints.inherited_prefix_len.unwrap_or(0)
++        };
++        let items = if prefix_len == 0 {
++            items
++        } else {
++            self.resolve_forked_compacted_history(
++                items,
++                prefix_len,
++                tokens_before_total,
++                context_window,
++            )
++            .await
++        };
++        let new_len = items.len();
++        self.chat_state_handle
++            .replace_conversation_for_compaction(items);
++        if self.startup_hints.inherited_prefix_len.is_some() {
++            let post_replace_tokens = self.chat_state_handle.get_total_tokens().await;
++            if xai_token_estimation::exceeds_threshold(
++                post_replace_tokens,
++                context_window,
++                self.compaction.threshold_percent.get(),
++            ) {
++                self.compaction
++                    .auto_compact_suppressed
++                    .store(SUPPRESS_STICKY, std::sync::atomic::Ordering::Relaxed);
++                tracing::warn!(
++                    session_id = %self.session_info.id.0,
++                    post_replace_tokens,
++                    context_window,
++                    "LHC write-back: released history still over threshold; suppressing AUTO"
++                );
++            } else {
++                self.compaction
++                    .auto_compact_suppressed
++                    .store(SUPPRESS_NONE, std::sync::atomic::Ordering::Relaxed);
++            }
++        } else {
++            self.compaction
++                .auto_compact_suppressed
++                .store(SUPPRESS_NONE, std::sync::atomic::Ordering::Relaxed);
++        }
++        self.last_idle_flush_conversation_len
++            .store(new_len, std::sync::atomic::Ordering::Relaxed);
++        self.memory
++            .context_injected
++            .store(false, std::sync::atomic::Ordering::Relaxed);
++        // Actor replace is ordered ahead of this query on the same handle.
++        let tokens_after = self.chat_state_handle.get_estimated_total_tokens().await;
++        if tokens_after >= tokens_before_estimated {
++            tracing::error!(
++                session_id,
++                tokens_before = tokens_before_estimated,
++                tokens_after,
++                receipt_total = writeback.receipt_total_tokens,
++                "LHC write-back did not decrease get_estimated_total_tokens — accounting bug"
++            );
++            // Still treat as LHC-wrote so native does not hybrid-compact on top.
++        } else {
++            tracing::info!(
++                session_id,
++                tokens_before = tokens_before_estimated,
++                tokens_after,
++                receipt_total = writeback.receipt_total_tokens,
++                "LHC write-back complete; native state is LHC-compacted body"
++            );
++        }
++        true
++    }
++
+     /// Pre-sampling compaction check. Uses `get_estimated_total_tokens()`
+     /// (exact prior count + byte-estimate of items since last response) so
+     /// tool results are accounted for. Returns `None` when `is_flushing`.
+@@ -1897,6 +2071,7 @@ impl SessionActor {
+                 trigger_info.tokens_used,
+                 trigger_info.context_window,
+             );
++            // LHC-HOOK 5/6: auto-compact decision; LHC I/O at writer choke only
+             return Some(trigger_info);
+         }
+         None
+@@ -1969,6 +2144,7 @@ impl SessionActor {
+             cfg.context_window.get(),
+             trigger_info.percentage,
+         );
++        // Writer choke is inside run_compact_only (hook 5).
+         if let Err(e) = self.run_compact_only(trigger_info).await {
+             tracing::error!(error = %e, "Model-switch compaction failed");
+             if Self::is_auth_compact_error(&e) {
+@@ -2008,6 +2184,10 @@ impl SessionActor {
+         self: &Arc<Self>,
+         trigger_info: AutoCompactTriggerInfo,
+     ) -> Result<(), acp::Error> {
++        // LHC writer choke (hook 5): at most one LHC call; fail-open sticky.
++        if !self.lhc_compact_drive_native_writer().await {
++            return Ok(());
++        }
+         use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
+         self.record_compaction_variant();
+         let tokens_before = self.chat_state_handle.get_total_tokens().await;
+@@ -2154,7 +2334,7 @@ impl SessionActor {
+     ///
+     /// `auto_continue` should be `Some` when this compaction was triggered by auto-compact
+     /// and an auto-continue prompt will follow.
+-    fn persist_compaction_checkpoint(
++    pub(crate) fn persist_compaction_checkpoint(
+         &self,
+         compacted_history: &[ConversationItem],
+         prompt_index_at_compaction: usize,
+diff --git a/crates/codegen/xai-grok-shell/src/session/lhc_inference.rs b/crates/codegen/xai-grok-shell/src/session/lhc_inference.rs
+new file mode 100644
+index 0000000..433755e
+--- /dev/null
++++ b/crates/codegen/xai-grok-shell/src/session/lhc_inference.rs
+@@ -0,0 +1,222 @@
++//! Shell-side [`grok_lhc_host::LhcInferenceSampler`] — dedicated LHC transport.
++//!
++//! Builds a fresh client per call (credentials re-resolved via
++//! [`AuthManager`] / bearer resolver), using a dedicated non-main model when
++//! `GROK_LHC_INFERENCE_MODEL` is set; otherwise the session model with a
++//! distinct request id. Mirrors compaction's `prepare_chat_completion`
++//! refresh pattern, not a spawn-time credential snapshot.
++
++use std::sync::Arc;
++use std::time::Duration;
++
++use grok_lhc_host::{
++    InferenceRequestMessage, InferenceRequestRole, LhcInferenceError, LhcInferenceErrorKind,
++    LhcInferenceFuture, LhcInferenceRequest, LhcInferenceSample, LhcInferenceSampler,
++};
++use tokio_util::sync::CancellationToken;
++use xai_grok_sampling_types::{ConversationItem, ConversationRequest};
++
++use crate::auth::AuthManager;
++use crate::sampling::Client as OaiCompatClient;
++use crate::sampling::{SamplerConfig, SamplingError};
++
++/// Env override for a dedicated non-main LHC inference model slug.
++const LHC_INFERENCE_MODEL_ENV: &str = "GROK_LHC_INFERENCE_MODEL";
++
++/// Inference sampler wired at LHC tee/open (hook 2).
++pub struct ShellLhcInferenceSampler {
++    /// Template config (URL, backend, headers). Model may be overridden per call.
++    base_config: SamplerConfig,
++    auth_manager: Option<Arc<AuthManager>>,
++    session_id: String,
++    timeout: Duration,
++    /// Dedicated non-main model slug when set; else `base_config.model`.
++    dedicated_model: Option<String>,
++}
++
++impl ShellLhcInferenceSampler {
++    pub fn new(
++        base_config: SamplerConfig,
++        auth_manager: Option<Arc<AuthManager>>,
++        session_id: impl Into<String>,
++        timeout: Duration,
++    ) -> Self {
++        let dedicated_model = std::env::var(LHC_INFERENCE_MODEL_ENV)
++            .ok()
++            .map(|s| s.trim().to_string())
++            .filter(|s| !s.is_empty());
++        Self {
++            base_config,
++            auth_manager,
++            session_id: session_id.into(),
++            timeout,
++            dedicated_model,
++        }
++    }
++
++    pub fn into_arc(self) -> Arc<dyn LhcInferenceSampler> {
++        Arc::new(self)
++    }
++
++    fn model_slug(&self) -> String {
++        self.dedicated_model
++            .clone()
++            .unwrap_or_else(|| self.base_config.model.clone())
++    }
++
++    /// Rebuild a client with live credentials (compaction-style refresh).
++    async fn resolve_client(&self) -> Result<(OaiCompatClient, String), LhcInferenceError> {
++        let mut cfg = self.base_config.clone();
++        let model = self.model_slug();
++        cfg.model = model.clone();
++        if let Some(am) = &self.auth_manager {
++            // Refresh session token when expired / near-expiry.
++            let _ = am.auth().await;
++            if let Some(auth) = am.current_wire_valid() {
++                cfg.api_key = Some(auth.key);
++            }
++            // Live resolve for subsequent 401 races.
++            struct AmBearer(Arc<AuthManager>);
++            impl std::fmt::Debug for AmBearer {
++                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++                    f.debug_struct("AmBearer").finish()
++                }
++            }
++            impl xai_grok_sampler::BearerResolver for AmBearer {
++                fn current_bearer(&self) -> Option<String> {
++                    self.0.current_wire_valid().map(|a| a.key)
++                }
++            }
++            cfg.bearer_resolver = Some(std::sync::Arc::new(AmBearer(am.clone())));
++        }
++        OaiCompatClient::new(cfg)
++            .map(|c| (c, model))
++            .map_err(|e| LhcInferenceError {
++                kind: LhcInferenceErrorKind::Unavailable,
++                detail: e.to_string(),
++                request_messages: None,
++            })
++    }
++}
++
++fn classify_sampling_error(err: &SamplingError) -> LhcInferenceErrorKind {
++    match err {
++        SamplingError::Auth(_) => LhcInferenceErrorKind::Auth,
++        SamplingError::IdleTimeout { .. } => LhcInferenceErrorKind::Timeout,
++        SamplingError::EmptyResponse { .. } | SamplingError::MaxTokensTruncation => {
++            LhcInferenceErrorKind::Refusal
++        }
++        SamplingError::Http(_)
++        | SamplingError::Api { .. }
++        | SamplingError::InvalidConfiguration(_)
++        | SamplingError::Serialization(_)
++        | SamplingError::EventStreamError(_)
++        | SamplingError::StreamError { .. }
++        | SamplingError::DoomLoopDetected { .. } => LhcInferenceErrorKind::Transport,
++    }
++}
++
++impl LhcInferenceSampler for ShellLhcInferenceSampler {
++    fn sample(&self, req: LhcInferenceRequest, cancel: CancellationToken) -> LhcInferenceFuture {
++        let timeout = self.timeout;
++        let session_id = self.session_id.clone();
++        let this = ShellLhcInferenceSampler {
++            base_config: self.base_config.clone(),
++            auth_manager: self.auth_manager.clone(),
++            session_id: self.session_id.clone(),
++            timeout: self.timeout,
++            dedicated_model: self.dedicated_model.clone(),
++        };
++        Box::pin(async move {
++            if cancel.is_cancelled() {
++                return Err(LhcInferenceError {
++                    kind: LhcInferenceErrorKind::Cancelled,
++                    detail: "cancelled before sample".into(),
++                    request_messages: None,
++                });
++            }
++            let (client, model) = this.resolve_client().await?;
++            let label = req.op().as_prompt_label().to_string();
++            let max_output_tokens = req.max_output_tokens();
++            let user_text = req.user_prompt_text();
++            let system = format!(
++                "You are a Grok Build helper performing `{label}` for long-horizon context. \
++                 Reply with only the transformed text, no preamble. \
++                 Respect the target token budget implied by the user message."
++            );
++            let request_messages = vec![
++                InferenceRequestMessage {
++                    role: InferenceRequestRole::System,
++                    content: system.clone(),
++                },
++                InferenceRequestMessage {
++                    role: InferenceRequestRole::User,
++                    content: user_text.clone(),
++                },
++            ];
++            let request = ConversationRequest {
++                items: vec![
++                    ConversationItem::system(system),
++                    ConversationItem::user(user_text),
++                ],
++                tools: vec![],
++                hosted_tools: vec![],
++                tool_choice: None,
++                model: Some(model.clone()),
++                temperature: Some(0.0),
++                max_output_tokens: Some(max_output_tokens),
++                top_p: None,
++                x_grok_conv_id: Some(format!("lhc-inf-{session_id}")),
++                x_grok_req_id: Some(format!("xai-lhc-{}-{}", label, uuid::Uuid::new_v4())),
++                x_grok_session_id: Some(session_id),
++                x_grok_turn_idx: None,
++                x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
++                x_grok_deployment_id: None,
++                x_grok_user_id: None,
++                trace: None,
++                prompt_cache_key: None,
++                reasoning_effort: None,
++                json_schema: None,
++            };
++            let fut = client.conversation_collect(request);
++            tokio::select! {
++                _ = cancel.cancelled() => Err(LhcInferenceError {
++                    kind: LhcInferenceErrorKind::Cancelled,
++                    detail: "cancelled during sample".into(),
++                    request_messages: Some(request_messages),
++                }),
++                result = tokio::time::timeout(timeout, fut) => {
++                    match result {
++                        Ok(Ok(response)) => {
++                            let text = response.assistant_text();
++                            if text.trim().is_empty() {
++                                return Err(LhcInferenceError {
++                                    kind: LhcInferenceErrorKind::Refusal,
++                                    detail: "empty assistant text".into(),
++                                    request_messages: Some(request_messages),
++                                });
++                            }
++                            Ok(LhcInferenceSample {
++                                text,
++                                model,
++                                prompt_label: label,
++                                request_messages,
++                                max_output_tokens,
++                            })
++                        }
++                        Ok(Err(err)) => Err(LhcInferenceError {
++                            kind: classify_sampling_error(&err),
++                            detail: err.to_string(),
++                            request_messages: Some(request_messages),
++                        }),
++                        Err(_) => Err(LhcInferenceError {
++                            kind: LhcInferenceErrorKind::Timeout,
++                            detail: format!("inference timed out after {timeout:?}"),
++                            request_messages: Some(request_messages),
++                        }),
++                    }
++                }
++            }
++        })
++    }
++}
+diff --git a/crates/codegen/xai-grok-shell/src/session/mod.rs b/crates/codegen/xai-grok-shell/src/session/mod.rs
+index 2ec442a..b31c86a 100644
+--- a/crates/codegen/xai-grok-shell/src/session/mod.rs
++++ b/crates/codegen/xai-grok-shell/src/session/mod.rs
+@@ -328,6 +328,8 @@ pub mod helpers;
+ pub(crate) mod image_describe;
+ pub(crate) mod image_normalize;
+ pub mod inference_metrics;
++// LHC-HOOK 6/6: shell-local LHC inference transport (dedicated non-main path)
++pub(crate) mod lhc_inference;
+ pub use xai_grok_shared::session::info;
+ pub mod managed_mcp;
+ pub(crate) mod mcp_descriptors;
+-- 
+2.43.0
+

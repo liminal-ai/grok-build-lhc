@@ -461,3 +461,227 @@ async fn run_forked_rewind_scenario() {
         "prompt_index must be reset to the rewind target"
     );
 }
+
+/// H3 — rewind after LHC write-back keeps the compacted body.
+///
+/// Drives production [`SessionActor::lhc_replace_and_writeback`] so deleting
+/// `persist_compaction_checkpoint` inside that choke fails this test (nothing
+/// lands on the persistence channel).
+#[tokio::test(flavor = "current_thread")]
+async fn rewind_after_lhc_writeback_shaped_checkpoint_keeps_compacted_body() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(run_lhc_writeback_rewind_keeps_compacted())
+        .await;
+}
+
+async fn run_lhc_writeback_rewind_keeps_compacted() {
+    use crate::session::persistence::PersistenceMsg;
+    use grok_lhc_host::{MockLhcInferenceSampler, spawn_capture};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    let lhc_root = TempDir::new().unwrap();
+    let prev_lhc = std::env::var_os("GROK_LHC");
+    let prev_root = std::env::var_os("GROK_LHC_ROOT");
+    let prev_compact = std::env::var_os("GROK_LHC_COMPACT");
+    let prev_exp = std::env::var_os("GROK_LHC_COMPACT_EXPERIMENTAL");
+    unsafe {
+        std::env::set_var("GROK_LHC", "1");
+        std::env::set_var("GROK_LHC_ROOT", lhc_root.path());
+        std::env::set_var("GROK_LHC_COMPACT", "replace");
+        std::env::set_var("GROK_LHC_COMPACT_EXPERIMENTAL", "1");
+    }
+
+    let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (persistence_tx, mut persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
+
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let sid = format!("rw-lhc-wb-{unique}");
+    actor.session_info.id = acp::SessionId::new(sid.clone());
+
+    let session_dir = crate::session::persistence::session_dir(&actor.session_info);
+    std::fs::create_dir_all(session_dir.join("compaction_checkpoints")).unwrap();
+
+    let mut u0 = ConversationItem::user("old-0");
+    u0.set_prompt_index(0);
+    let mut u1 = ConversationItem::user("please investigate area 9");
+    u1.set_prompt_index(1);
+    let mut u2 = ConversationItem::user("live-2");
+    u2.set_prompt_index(2);
+    let tool_asst =
+        ConversationItem::assistant_tool_calls(vec![xai_grok_sampling_types::ToolCall {
+            id: "c1".into(),
+            name: "bash".into(),
+            arguments: "{\"cmd\":\"ls\"}".into(),
+        }]);
+    let native = vec![
+        ConversationItem::system("SYS"),
+        u0,
+        ConversationItem::assistant("a0"),
+        u1,
+        tool_asst,
+        ConversationItem::tool_result("c1", "file_a"),
+        ConversationItem::assistant("done"),
+        u2,
+        ConversationItem::assistant("a2"),
+    ];
+
+    let sampler = Arc::new(MockLhcInferenceSampler::new());
+    let capture = spawn_capture(
+        &sid,
+        Some("/tmp"),
+        &native,
+        Some(lhc_root.path()),
+        Some(sampler),
+    )
+    .expect("capture must start for Replace write-back");
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    actor.chat_state_handle.restore_snapshot({
+        let mut snap = actor
+            .chat_state_handle
+            .snapshot()
+            .await
+            .expect("snapshot available");
+        snap.conversation = native.clone();
+        snap.prompt_index = 3;
+        snap.prompt_texts = vec![
+            "old-0".into(),
+            "please investigate area 9".into(),
+            "live-2".into(),
+        ];
+        snap
+    });
+
+    let ok = actor.lhc_replace_and_writeback().await;
+    if !ok {
+        capture.shutdown_async();
+        restore_lhc_env(prev_lhc, prev_root, prev_compact, prev_exp);
+        panic!(
+            "production lhc_replace_and_writeback failed under Replace mode — \
+             if the adapter fixture cannot compact, escalate H3 to Chunk 3 live harness"
+        );
+    }
+
+    let ckpt_file = loop {
+        match persistence_rx.try_recv() {
+            Ok(PersistenceMsg::CompactionCheckpoint(f)) => break f,
+            Ok(_) => continue,
+            Err(_) => {
+                capture.shutdown_async();
+                restore_lhc_env(prev_lhc, prev_root, prev_compact, prev_exp);
+                panic!(
+                    "lhc_replace_and_writeback must enqueue CompactionCheckpoint \
+                     via persist_compaction_checkpoint (deleting that call fails this test)"
+                );
+            }
+        }
+    };
+    let ckpt_id = ckpt_file.checkpoint_id.clone();
+    let compacted_history = ckpt_file.compacted_history.clone();
+    std::fs::write(
+        session_dir.join(format!("compaction_checkpoints/{ckpt_id}.json")),
+        serde_json::to_vec(&ckpt_file).unwrap(),
+    )
+    .unwrap();
+
+    let updates = vec![
+        user_chunk("P0", 0),
+        user_chunk("P1", 1),
+        user_chunk("P2", 2),
+        user_chunk("P3", 3),
+        user_chunk("P4", 4),
+        checkpoint_update(&ckpt_id, 5),
+        user_chunk("live-2", 5),
+        agent_chunk("a2"),
+        user_chunk("P6", 6),
+    ];
+    let mut content = Vec::new();
+    for u in &updates {
+        let env = SessionUpdateEnvelope::from_update(u).unwrap();
+        content.extend(serde_json::to_vec(&env).unwrap());
+        content.push(b'\n');
+    }
+    std::fs::write(session_dir.join("updates.jsonl"), content).unwrap();
+
+    let mut snap = actor
+        .chat_state_handle
+        .snapshot()
+        .await
+        .expect("snapshot available");
+    snap.conversation = compacted_history;
+    snap.prompt_index = 7;
+    snap.prompt_texts = (0..7).map(|i| format!("P{i}")).collect();
+    snap.last_compaction_prompt_index = Some(5);
+    actor.chat_state_handle.restore_snapshot(snap);
+
+    let resp = actor
+        .handle_rewind(RewindRequest {
+            target_prompt_index: 6,
+            force: true,
+            mode: RewindMode::ConversationOnly,
+        })
+        .await
+        .expect("handle_rewind ok");
+    assert!(
+        resp.success,
+        "rewind after LHC write-back must succeed: {resp:?}"
+    );
+
+    let conv = actor.chat_state_handle.get_conversation().await;
+    let texts: Vec<String> = conv.iter().map(|c| c.text_content()).collect();
+    let marker = actor
+        .chat_state_handle
+        .get_last_compaction_prompt_index()
+        .await;
+
+    capture.shutdown_async();
+    let _ = std::fs::remove_dir_all(&session_dir);
+    restore_lhc_env(prev_lhc, prev_root, prev_compact, prev_exp);
+
+    assert!(
+        !texts.iter().any(|t| t == "P0" || t == "P1" || t == "P2"),
+        "pre-compaction prompts must not return (un-compact): {texts:?}"
+    );
+    assert_eq!(
+        marker,
+        Some(5),
+        "compaction marker must remain after post-compact rewind"
+    );
+    assert_eq!(
+        actor.chat_state_handle.get_prompt_index().await,
+        6,
+        "prompt_index must be the rewind target"
+    );
+}
+
+fn restore_lhc_env(
+    prev_lhc: Option<std::ffi::OsString>,
+    prev_root: Option<std::ffi::OsString>,
+    prev_compact: Option<std::ffi::OsString>,
+    prev_exp: Option<std::ffi::OsString>,
+) {
+    unsafe {
+        match prev_lhc {
+            Some(v) => std::env::set_var("GROK_LHC", v),
+            None => std::env::remove_var("GROK_LHC"),
+        }
+        match prev_root {
+            Some(v) => std::env::set_var("GROK_LHC_ROOT", v),
+            None => std::env::remove_var("GROK_LHC_ROOT"),
+        }
+        match prev_compact {
+            Some(v) => std::env::set_var("GROK_LHC_COMPACT", v),
+            None => std::env::remove_var("GROK_LHC_COMPACT"),
+        }
+        match prev_exp {
+            Some(v) => std::env::set_var("GROK_LHC_COMPACT_EXPERIMENTAL", v),
+            None => std::env::remove_var("GROK_LHC_COMPACT_EXPERIMENTAL"),
+        }
+    }
+}

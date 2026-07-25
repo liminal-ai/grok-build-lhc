@@ -195,7 +195,7 @@ impl LhcSession {
         }
     }
 
-    /// LHC assembled request context for serving (Chunk 2).
+    /// LHC assembled request context (model wire shape; not used for classification).
     pub async fn get_llm_request_context(
         &self,
     ) -> Result<lhc::shared_tech::view::LlmRequestContext, String> {
@@ -208,6 +208,55 @@ impl LhcSession {
             OpResult::Ok { value } => Ok(value),
             OpResult::Err { error } => Err(error.reason),
         }
+    }
+
+    /// Typed session thread view — structure + text for serve/write-back.
+    pub async fn get_session_thread_view(
+        &self,
+    ) -> Result<lhc::shared_tech::view::SessionThreadView, String> {
+        match self
+            .lhc
+            .thread_view
+            .get_session_thread_view(self.thread_ref.clone())
+            .await
+        {
+            OpResult::Ok { value } => Ok(value),
+            OpResult::Err { error } => Err(error.reason),
+        }
+    }
+
+    /// View + once-per-translation `message_id` → [`MessageKind`] index.
+    ///
+    /// One `messages.list` alongside the view (not per entry). **Whole-index
+    /// failure propagates as `Err`** — serving falls open to Native; write-back
+    /// must not proceed. Per-entry unknown ids still fail toward synthetic
+    /// inside the translator (different granularity).
+    pub async fn get_classify_context(
+        &self,
+    ) -> Result<
+        (
+            lhc::shared_tech::view::SessionThreadView,
+            crate::serving::SourceKindIndex,
+        ),
+        String,
+    > {
+        #[cfg(any(test, feature = "test-util"))]
+        if force_classify_list_failure() {
+            return Err("messages_list_failed: forced_test_failure".into());
+        }
+        let view = self.get_session_thread_view().await?;
+        let kinds = match self.lhc.messages.list(self.thread_ref.clone(), None).await {
+            OpResult::Ok { value } => crate::serving::SourceKindIndex::from_message_records(&value),
+            OpResult::Err { error } => {
+                warn!(
+                    session_id = %self.session_id,
+                    reason = %error.reason,
+                    "LHC: messages.list failed; aborting classify context"
+                );
+                return Err(format!("messages_list_failed: {}", error.reason));
+            }
+        };
+        Ok((view, kinds))
     }
 
     /// Preview what LHC compaction would do (shadow mode).
@@ -463,6 +512,22 @@ fn nibble_hex(n: u8) -> char {
 pub fn paths_disagree(expected: &Path, registry_file_path: &str) -> bool {
     registry_file_path != expected.to_string_lossy().as_ref()
         && Path::new(registry_file_path) != expected
+}
+
+/// Test-only: force `get_classify_context` to fail as if `messages.list` errored.
+#[cfg(any(test, feature = "test-util"))]
+static FORCE_CLASSIFY_LIST_FAILURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(any(test, feature = "test-util"))]
+fn force_classify_list_failure() -> bool {
+    FORCE_CLASSIFY_LIST_FAILURE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Arm/disarm whole-index classify failure (Q1).
+#[cfg(any(test, feature = "test-util"))]
+pub fn set_force_classify_list_failure(armed: bool) {
+    FORCE_CLASSIFY_LIST_FAILURE.store(armed, std::sync::atomic::Ordering::SeqCst);
 }
 
 #[cfg(test)]

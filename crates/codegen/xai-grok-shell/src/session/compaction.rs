@@ -601,7 +601,15 @@ impl SessionActor {
         self: &Arc<Self>,
         user_context: Option<String>,
     ) -> Result<(), acp::Error> {
-        if self.lhc_replace_suppresses_native_writer().await {
+        // LHC writer choke (hook 5): at most one LHC call; fail-open sticky.
+        if !self.lhc_compact_drive_native_writer().await {
+            if user_context.is_some() {
+                tracing::warn!(
+                    session_id = %self.session_info.id,
+                    "LHC replace mode suppressed /compact; user context was discarded \
+                     (Replace is experimental — see GROK_LHC_COMPACT_EXPERIMENTAL)"
+                );
+            }
             return Ok(());
         }
         self.record_compaction_variant();
@@ -1841,33 +1849,167 @@ impl SessionActor {
         let estimated_total = self.chat_state_handle.get_estimated_total_tokens().await;
         estimated_total > context_window
     }
-    /// LHC compact bridge (hook 5): shadow previews; replace suppresses native.
+    /// LHC compact bridge choke (hook 5): pure plan + at most one LHC I/O.
+    ///
+    /// Replace success **writes back** the LHC body into native state via
+    /// `replace_conversation_for_compaction` (same path native compact uses).
+    /// Fail-open is sticky inside [`grok_lhc_host::CompactEventBridge`].
+    ///
     /// Returns `true` when the native writer may proceed.
-    async fn lhc_compact_bridge_allow_native(&self) -> bool {
-        match grok_lhc_host::resolve_compact_mode() {
-            grok_lhc_host::CompactMode::Off => true,
-            grok_lhc_host::CompactMode::Shadow => {
-                grok_lhc_host::shadow_preview_compact(self.session_info.id.0.as_ref()).await;
-                true
-            }
-            grok_lhc_host::CompactMode::Replace => {
-                if grok_lhc_host::replace_compact(self.session_info.id.0.as_ref()).await {
-                    false
-                } else {
-                    // Fail-open: native resumes.
-                    true
-                }
-            }
+    async fn lhc_compact_drive_native_writer(&self) -> bool {
+        let mut bridge =
+            grok_lhc_host::CompactEventBridge::new(grok_lhc_host::resolve_compact_mode());
+        if bridge.should_attempt_preview() {
+            grok_lhc_host::shadow_preview_compact(self.session_info.id.0.as_ref()).await;
+            bridge.record_preview_done();
         }
+        if bridge.should_attempt_replace() {
+            let ok = self.lhc_replace_and_writeback().await;
+            bridge.record_replace_result(ok);
+        }
+        matches!(
+            bridge.choke_action(),
+            grok_lhc_host::CompactChokeAction::RunNative
+        )
     }
 
-    /// Choke point for every native compact writer (auto, preflight, manual,
-    /// model-switch, error-recovery). Replace mode must not hybrid-write.
-    async fn lhc_replace_suppresses_native_writer(&self) -> bool {
-        matches!(
-            grok_lhc_host::resolve_compact_mode(),
-            grok_lhc_host::CompactMode::Replace
-        ) && grok_lhc_host::replace_compact(self.session_info.id.0.as_ref()).await
+    /// Replace-mode: LHC compact → build write-back body → native replace.
+    /// Returns whether LHC+write-back succeeded (native must not also compact).
+    /// `pub(crate)` so certification can drive the production choke (H3).
+    pub(crate) async fn lhc_replace_and_writeback(&self) -> bool {
+        let session_id = self.session_info.id.0.as_ref();
+        let tokens_before_estimated = self.chat_state_handle.get_estimated_total_tokens().await;
+        // Native compact uses provider `total_tokens` for forked-prefix projection.
+        let tokens_before_total = self.chat_state_handle.get_total_tokens().await;
+        let native_before = self.chat_state_handle.get_conversation().await;
+        let writeback = match grok_lhc_host::replace_compact_for_writeback(session_id).await {
+            Ok(wb) => wb,
+            Err(err) => {
+                tracing::error!(
+                    session_id,
+                    %err,
+                    "LHC replace: compact/context failed; fail-open to native"
+                );
+                return false;
+            }
+        };
+        let items = match grok_lhc_host::build_writeback_conversation(
+            &native_before,
+            &writeback.view,
+            &writeback.kinds,
+        ) {
+            Ok(items) => items,
+            Err(err) => {
+                tracing::error!(
+                    session_id,
+                    %err,
+                    "LHC replace: write-back body build failed; fail-open to native"
+                );
+                return false;
+            }
+        };
+        let prompt_index_at_compaction = self.chat_state_handle.get_prompt_index().await;
+        // Match native `run_compact_inner` surround (~1642–1719), including
+        // checkpoint persistence and forked-prefix resolution — not only the
+        // replace/threshold window.
+        self.chat_state_handle
+            .record_compaction_at(prompt_index_at_compaction);
+        let original_user_info = native_before.get(1).and_then(|item| match item {
+            ConversationItem::User(parts) => parts.content.iter().find_map(|p| match p {
+                xai_grok_sampling_types::ContentPart::Text { text } => {
+                    Some(text.as_ref().to_owned())
+                }
+                _ => None,
+            }),
+            _ => None,
+        });
+        self.persist_compaction_checkpoint(
+            &items,
+            prompt_index_at_compaction,
+            None,
+            original_user_info,
+        );
+        let context_window = self
+            .chat_state_handle
+            .get_sampling_config()
+            .await
+            .map(|c| c.context_window.get())
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+        let prefix_len = if self
+            .compaction
+            .prefix_released
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0
+        } else {
+            self.startup_hints.inherited_prefix_len.unwrap_or(0)
+        };
+        let items = if prefix_len == 0 {
+            items
+        } else {
+            self.resolve_forked_compacted_history(
+                items,
+                prefix_len,
+                tokens_before_total,
+                context_window,
+            )
+            .await
+        };
+        let new_len = items.len();
+        self.chat_state_handle
+            .replace_conversation_for_compaction(items);
+        if self.startup_hints.inherited_prefix_len.is_some() {
+            let post_replace_tokens = self.chat_state_handle.get_total_tokens().await;
+            if xai_token_estimation::exceeds_threshold(
+                post_replace_tokens,
+                context_window,
+                self.compaction.threshold_percent.get(),
+            ) {
+                self.compaction
+                    .auto_compact_suppressed
+                    .store(SUPPRESS_STICKY, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    session_id = %self.session_info.id.0,
+                    post_replace_tokens,
+                    context_window,
+                    "LHC write-back: released history still over threshold; suppressing AUTO"
+                );
+            } else {
+                self.compaction
+                    .auto_compact_suppressed
+                    .store(SUPPRESS_NONE, std::sync::atomic::Ordering::Relaxed);
+            }
+        } else {
+            self.compaction
+                .auto_compact_suppressed
+                .store(SUPPRESS_NONE, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.last_idle_flush_conversation_len
+            .store(new_len, std::sync::atomic::Ordering::Relaxed);
+        self.memory
+            .context_injected
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        // Actor replace is ordered ahead of this query on the same handle.
+        let tokens_after = self.chat_state_handle.get_estimated_total_tokens().await;
+        if tokens_after >= tokens_before_estimated {
+            tracing::error!(
+                session_id,
+                tokens_before = tokens_before_estimated,
+                tokens_after,
+                receipt_total = writeback.receipt_total_tokens,
+                "LHC write-back did not decrease get_estimated_total_tokens — accounting bug"
+            );
+            // Still treat as LHC-wrote so native does not hybrid-compact on top.
+        } else {
+            tracing::info!(
+                session_id,
+                tokens_before = tokens_before_estimated,
+                tokens_after,
+                receipt_total = writeback.receipt_total_tokens,
+                "LHC write-back complete; native state is LHC-compacted body"
+            );
+        }
+        true
     }
 
     /// Pre-sampling compaction check. Uses `get_estimated_total_tokens()`
@@ -1915,9 +2057,6 @@ impl SessionActor {
                 "Forced auto-compact trigger (debug): model={model}, \
                  {percentage}% full ({estimated_total}/{cw} tokens)",
             );
-            if !self.lhc_compact_bridge_allow_native().await {
-                return None;
-            }
             return Some(AutoCompactTriggerInfo {
                 tokens_used: estimated_total,
                 context_window: cw,
@@ -1932,10 +2071,7 @@ impl SessionActor {
                 trigger_info.tokens_used,
                 trigger_info.context_window,
             );
-            // LHC-HOOK 5/5: compact bridge — shadow previews; replace suppresses native
-            if !self.lhc_compact_bridge_allow_native().await {
-                return None;
-            }
+            // LHC-HOOK 5/6: auto-compact decision; LHC I/O at writer choke only
             return Some(trigger_info);
         }
         None
@@ -2008,10 +2144,7 @@ impl SessionActor {
             cfg.context_window.get(),
             trigger_info.percentage,
         );
-        // Same compact bridge as pre-sampling (hook 5) — never hybrid writers.
-        if !self.lhc_compact_bridge_allow_native().await {
-            return Ok(());
-        }
+        // Writer choke is inside run_compact_only (hook 5).
         if let Err(e) = self.run_compact_only(trigger_info).await {
             tracing::error!(error = %e, "Model-switch compaction failed");
             if Self::is_auth_compact_error(&e) {
@@ -2051,7 +2184,8 @@ impl SessionActor {
         self: &Arc<Self>,
         trigger_info: AutoCompactTriggerInfo,
     ) -> Result<(), acp::Error> {
-        if self.lhc_replace_suppresses_native_writer().await {
+        // LHC writer choke (hook 5): at most one LHC call; fail-open sticky.
+        if !self.lhc_compact_drive_native_writer().await {
             return Ok(());
         }
         use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
@@ -2200,7 +2334,7 @@ impl SessionActor {
     ///
     /// `auto_continue` should be `Some` when this compaction was triggered by auto-compact
     /// and an auto-continue prompt will follow.
-    fn persist_compaction_checkpoint(
+    pub(crate) fn persist_compaction_checkpoint(
         &self,
         compacted_history: &[ConversationItem],
         prompt_index_at_compaction: usize,

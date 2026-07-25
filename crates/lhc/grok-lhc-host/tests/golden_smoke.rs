@@ -354,63 +354,82 @@ fn payload_objects_reject_unknown_fields_via_lhc_types() {
 fn golden_serving_substitute_preserves_system_prefix() {
     use grok_lhc_host::{ServeDecision, decide_substitution};
     use lhc::shared_tech::view::{
-        LlmRequestContext, LlmRequestContextMessage, LlmRequestContextPart,
-        LlmRequestContextPartType, LlmRequestContextRole,
+        SessionAssistantMessage, SessionAssistantPart, SessionAssistantPartType, SessionThreadView,
+        SessionThreadViewEntry, SessionThreadViewEntrySource, SessionThreadViewMessage,
+        SessionUserMessage,
     };
     let native = vec![
         ConversationItem::system("host-system-prefix"),
         ConversationItem::user("stale-native"),
     ];
-    let ctx = LlmRequestContext {
+    let src = |id: &str| SessionThreadViewEntrySource {
+        message_id: id.into(),
+        idempotency_key: None,
+    };
+    let view = SessionThreadView {
         thread_id: "golden-serve".into(),
-        messages: vec![
-            LlmRequestContextMessage {
-                role: LlmRequestContextRole::User,
-                content: vec![LlmRequestContextPart {
-                    type_: LlmRequestContextPartType::Text,
-                    text: "lhc-user".into(),
-                }],
-            },
-            LlmRequestContextMessage {
-                role: LlmRequestContextRole::Assistant,
-                content: vec![LlmRequestContextPart {
-                    type_: LlmRequestContextPartType::Text,
-                    text: "lhc-assistant".into(),
-                }],
-            },
+        entries: vec![
+            SessionThreadViewEntry::Message(SessionThreadViewMessage::User(SessionUserMessage {
+                content: "lhc-user".into(),
+                source_messages: vec![src("u")],
+            })),
+            SessionThreadViewEntry::Message(SessionThreadViewMessage::Assistant(
+                SessionAssistantMessage {
+                    content: vec![SessionAssistantPart {
+                        type_: SessionAssistantPartType::Text,
+                        text: Some("lhc-assistant".into()),
+                        thinking: None,
+                        tool_call_id: None,
+                        tool_name: None,
+                        arguments: None,
+                    }],
+                    source_messages: vec![src("a")],
+                },
+            )),
         ],
     };
-    let ServeDecision::Substitute { items } = decide_substitution(&native, &ctx) else {
+    let kinds = grok_lhc_host::SourceKindIndex::assume_sourced_users_are_prompts(&view);
+    let ServeDecision::Substitute { items } = decide_substitution(&native, &view, &kinds) else {
         panic!("expected substitute");
     };
-    let projected: Value = json!(items
-        .iter()
-        .map(|item| match item {
-            ConversationItem::System(s) => json!({ "role": "system", "text": s.content.as_ref() }),
-            ConversationItem::User(u) => {
-                let text = u
-                    .content
-                    .iter()
-                    .filter_map(|p| match p {
-                        ContentPart::Text { text } => Some(text.as_ref()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                json!({ "role": "user", "text": text })
-            }
-            ConversationItem::Assistant(a) => {
-                json!({ "role": "assistant", "text": a.content.as_ref() })
-            }
-            other => panic!("unexpected item in serving golden: {other:?}"),
-        })
-        .collect::<Vec<_>>());
+    let projected: Value = json!(
+        items
+            .iter()
+            .map(|item| match item {
+                ConversationItem::System(s) =>
+                    json!({ "role": "system", "text": s.content.as_ref() }),
+                ConversationItem::User(u) => {
+                    let text = u
+                        .content
+                        .iter()
+                        .filter_map(|p| match p {
+                            ContentPart::Text { text } => Some(text.as_ref()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    json!({ "role": "user", "text": text })
+                }
+                ConversationItem::Assistant(a) => {
+                    json!({ "role": "assistant", "text": a.content.as_ref() })
+                }
+                other => panic!("unexpected item in serving golden: {other:?}"),
+            })
+            .collect::<Vec<_>>()
+    );
     let path = goldens_dir().join("serving_substitute.json");
     if std::env::var("UPDATE_GOLDENS").ok().as_deref() == Some("1") {
-        fs::write(&path, serde_json::to_string_pretty(&projected).unwrap() + "\n").unwrap();
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&projected).unwrap() + "\n",
+        )
+        .unwrap();
     }
     let expected: Value =
         serde_json::from_str(&fs::read_to_string(&path).expect("serving_substitute.json"))
             .expect("golden json");
-    assert_eq!(projected, expected, "golden mismatch: serving_substitute.json");
+    assert_eq!(
+        projected, expected,
+        "golden mismatch: serving_substitute.json"
+    );
 }

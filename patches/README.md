@@ -28,11 +28,31 @@ Split it only if a future chunk changes hooks independently.
 
 ## Regenerating
 
-    git format-patch -1 <commit> --output-directory patches --suffix=.patch \
+    git format-patch <first-chunk-commit>~1..<head> \
+      --output-directory patches --suffix=.patch \
       -- Cargo.toml \
          crates/codegen/xai-grok-shell/Cargo.toml \
+         crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs \
          crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs \
-         crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs
+         crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs \
+         crates/codegen/xai-grok-shell/src/session/acp_session_tests/rewind_cross_compaction_tests.rs \
+         crates/codegen/xai-grok-shell/src/session/compaction.rs \
+         crates/codegen/xai-grok-shell/src/session/lhc_inference.rs \
+         crates/codegen/xai-grok-shell/src/session/mod.rs
+
+**Regenerate the WHOLE series, not one commit.** This example previously used
+`format-patch -1 <commit>` with only Chunk 1's four paths. Two traps in that:
+
+1. Running it after Chunk 2 would silently drop five touchpoints
+   (`turn.rs`, `compaction.rs`, `lhc_inference.rs`, `mod.rs`,
+   `rewind_cross_compaction_tests.rs`) — the recovery drill would restore an
+   incomplete fork and nothing would say so.
+2. `-1 <head>` only captures the newest commit. Root `Cargo.toml`'s
+   workspace-members entry lands in the CHUNK 1 commit, so a single-commit
+   regeneration drops it entirely. Hit for real on 2026-07-25.
+
+**When a hook is added, add its file to this list in the same commit.** The
+list must equal `git diff --name-only origin/main -- crates/codegen/ Cargo.toml`.
 
 Delete the old `*.patch` first — a stale patch that still applies is worse
 than no patch at all.

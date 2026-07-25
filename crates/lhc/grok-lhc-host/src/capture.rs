@@ -25,6 +25,10 @@ pub const CAPTURE_QUEUE_CAP: usize = 1024;
 /// Process-wide count of live capture workers — cheap gate for model-change (A9).
 static ACTIVE_CAPTURES: AtomicUsize = AtomicUsize::new(0);
 
+/// Test-only: increments on every registry mutex acquisition in [`lookup_session`].
+#[cfg(any(test, feature = "test-util"))]
+static REGISTRY_LOOKUPS: AtomicU64 = AtomicU64::new(0);
+
 enum CaptureCmd {
     Persist(ConversationItem),
     ReplaceHistory(Vec<ConversationItem>),
@@ -39,6 +43,21 @@ enum CaptureCmd {
     ListEvents(oneshot::Sender<Result<Vec<lhc::intake_stream::EventRecord>, String>>),
     GetLlmRequestContext(
         oneshot::Sender<Result<lhc::shared_tech::view::LlmRequestContext, String>>,
+    ),
+    GetSessionThreadView(
+        oneshot::Sender<Result<lhc::shared_tech::view::SessionThreadView, String>>,
+    ),
+    /// View + `message_id`→kind index in one worker turn (serve/write-back).
+    GetClassifyContext(
+        oneshot::Sender<
+            Result<
+                (
+                    lhc::shared_tech::view::SessionThreadView,
+                    crate::serving::SourceKindIndex,
+                ),
+                String,
+            >,
+        >,
     ),
     PreviewCompact(oneshot::Sender<Result<lhc::shared_tech::view::PreviewCompactOutcome, String>>),
     Compact(oneshot::Sender<Result<lhc::shared_tech::view::CompactReceipt, String>>),
@@ -76,6 +95,10 @@ struct CaptureShared {
     /// Set when a `ReplaceHistory` was dropped — baseline is stale until a
     /// successful replace realigns the tracker (A6).
     baseline_poisoned: Arc<AtomicBool>,
+    /// Test-only: crash the worker after submitting this many events of the
+    /// next `ReplaceHistory` (0 = disabled). Exercises mid-apply death.
+    #[cfg(any(test, feature = "test-util"))]
+    crash_mid_replace_after: Arc<AtomicUsize>,
     /// Test-only join handle slot.
     #[cfg(any(test, feature = "test-util"))]
     join: Mutex<Option<JoinHandle<()>>>,
@@ -174,6 +197,38 @@ impl CaptureHandle {
         self.inner
             .tx
             .send(CaptureCmd::GetLlmRequestContext(tx))
+            .await
+            .map_err(|_| "capture worker gone".to_string())?;
+        rx.await.map_err(|_| "capture worker dropped".to_string())?
+    }
+
+    /// Fetch typed session thread view (classification source of truth).
+    pub async fn get_session_thread_view(
+        &self,
+    ) -> Result<lhc::shared_tech::view::SessionThreadView, String> {
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .tx
+            .send(CaptureCmd::GetSessionThreadView(tx))
+            .await
+            .map_err(|_| "capture worker gone".to_string())?;
+        rx.await.map_err(|_| "capture worker dropped".to_string())?
+    }
+
+    /// View + once-per-translation kind index (one worker round-trip).
+    pub async fn get_classify_context(
+        &self,
+    ) -> Result<
+        (
+            lhc::shared_tech::view::SessionThreadView,
+            crate::serving::SourceKindIndex,
+        ),
+        String,
+    > {
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .tx
+            .send(CaptureCmd::GetClassifyContext(tx))
             .await
             .map_err(|_| "capture worker gone".to_string())?;
         rx.await.map_err(|_| "capture worker dropped".to_string())?
@@ -340,6 +395,15 @@ impl CaptureHandle {
         });
         entered_rx
     }
+
+    /// Arm a crash after `n` events of the next `replace_history` are submitted
+    /// (partial apply). `n == 0` disarms. Test-only.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn arm_crash_mid_replace(&self, after_events: usize) {
+        self.inner
+            .crash_mid_replace_after
+            .store(after_events, Ordering::SeqCst);
+    }
 }
 
 struct RegistryEntry {
@@ -391,6 +455,8 @@ fn unregister_worker(session_id: &str, worker_id: u64) {
 }
 
 pub fn lookup_session(session_id: &str) -> Option<CaptureHandle> {
+    #[cfg(any(test, feature = "test-util"))]
+    REGISTRY_LOOKUPS.fetch_add(1, Ordering::Relaxed);
     let map = registry().lock().ok()?;
     let entry = map.get(session_id)?;
     let inner = entry.weak.upgrade()?;
@@ -403,6 +469,18 @@ pub fn is_session_registered(session_id: &str) -> bool {
 
 pub fn any_capture_active() -> bool {
     ACTIVE_CAPTURES.load(Ordering::Relaxed) > 0
+}
+
+/// Test-only: how many times [`lookup_session`] has taken the registry mutex.
+#[cfg(any(test, feature = "test-util"))]
+pub fn registry_lookup_count() -> u64 {
+    REGISTRY_LOOKUPS.load(Ordering::Relaxed)
+}
+
+/// Test-only: reset the registry-lookup counter.
+#[cfg(any(test, feature = "test-util"))]
+pub fn reset_registry_lookup_count() {
+    REGISTRY_LOOKUPS.store(0, Ordering::Relaxed);
 }
 
 /// Spawn a dedicated OS thread + tokio runtime owning the LHC session.
@@ -427,6 +505,8 @@ pub fn spawn_capture(
     let worker_id = next_worker_id();
     let baseline_poisoned = Arc::new(AtomicBool::new(false));
     let dropped = Arc::new(AtomicU64::new(0));
+    #[cfg(any(test, feature = "test-util"))]
+    let crash_mid_replace_after = Arc::new(AtomicUsize::new(0));
 
     let shared = Arc::new(CaptureShared {
         session_id: session_id.to_string(),
@@ -437,6 +517,8 @@ pub fn spawn_capture(
         crash_tx,
         dropped: Arc::clone(&dropped),
         baseline_poisoned: Arc::clone(&baseline_poisoned),
+        #[cfg(any(test, feature = "test-util"))]
+        crash_mid_replace_after: Arc::clone(&crash_mid_replace_after),
         #[cfg(any(test, feature = "test-util"))]
         join: Mutex::new(None),
     });
@@ -453,6 +535,8 @@ pub fn spawn_capture(
     let worker_id_for_exit = worker_id;
     let baseline_for_worker = Arc::clone(&baseline_poisoned);
     let dropped_for_worker = Arc::clone(&dropped);
+    #[cfg(any(test, feature = "test-util"))]
+    let crash_mid_for_worker = Arc::clone(&crash_mid_replace_after);
     let join = std::thread::Builder::new()
         .name(format!("lhc-capture-{session_id_owned}"))
         .spawn(move || {
@@ -554,6 +638,8 @@ pub fn spawn_capture(
                                         dropped_for_worker.as_ref(),
                                         #[cfg(any(test, feature = "test-util"))]
                                         &mut crash_rx,
+                                        #[cfg(any(test, feature = "test-util"))]
+                                        crash_mid_for_worker.as_ref(),
                                     )
                                     .await;
                                     if died {
@@ -578,10 +664,12 @@ pub fn spawn_capture(
                                 dropped_for_worker.as_ref(),
                                 #[cfg(any(test, feature = "test-util"))]
                                 &mut crash_rx,
+                                #[cfg(any(test, feature = "test-util"))]
+                                crash_mid_for_worker.as_ref(),
                             )
                             .await
                             {
-                                // Crash requested from inside Block.
+                                // Crash requested from inside Block / mid-replace.
                                 let _ = session.take();
                                 break;
                             }
@@ -604,6 +692,8 @@ pub fn spawn_capture(
                                         dropped_for_worker.as_ref(),
                                         #[cfg(any(test, feature = "test-util"))]
                                         &mut crash_rx,
+                                        #[cfg(any(test, feature = "test-util"))]
+                                        crash_mid_for_worker.as_ref(),
                                     )
                                     .await;
                                     if died {
@@ -659,6 +749,7 @@ pub fn spawn_capture(
 }
 
 /// Process one command. Returns true if the worker should exit (crash).
+#[allow(clippy::too_many_arguments)] // test-util crash arms add optional params
 async fn process_cmd(
     cmd: CaptureCmd,
     session: &mut Option<LhcSession>,
@@ -667,6 +758,7 @@ async fn process_cmd(
     baseline_poisoned: &AtomicBool,
     dropped: &AtomicU64,
     #[cfg(any(test, feature = "test-util"))] crash_rx: &mut watch::Receiver<bool>,
+    #[cfg(any(test, feature = "test-util"))] crash_mid_replace_after: &AtomicUsize,
 ) -> bool {
     let Some(sess) = session.as_mut() else {
         return true;
@@ -694,6 +786,34 @@ async fn process_cmd(
             // occurrence high-water marks.
             let (events, local) = map_history(session_id, ITEM_KEY_GENERATION, &items);
             tracker.merge_monotonic(&local);
+            #[cfg(any(test, feature = "test-util"))]
+            {
+                let n = crash_mid_replace_after.swap(0, Ordering::SeqCst);
+                if n > 0 {
+                    // Crash after `n` *novel* (Recorded) events — skipping
+                    // DuplicateKey survivors so arming(1) is not a no-op on the
+                    // preserved system message.
+                    let mut recorded = 0usize;
+                    for ev in events {
+                        let batch = submit_mapped(sess, vec![ev]).await;
+                        if let Ok(batch) = batch {
+                            let novel = batch
+                                .events
+                                .iter()
+                                .any(|e| matches!(e.outcome, BatchEventOutcome::Recorded));
+                            if novel {
+                                recorded += 1;
+                                if recorded >= n {
+                                    baseline_poisoned.store(true, Ordering::SeqCst);
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                    baseline_poisoned.store(false, Ordering::SeqCst);
+                    return false;
+                }
+            }
             let _ = submit_mapped(sess, events).await;
             baseline_poisoned.store(false, Ordering::SeqCst);
             debug!(
@@ -745,6 +865,14 @@ async fn process_cmd(
         }
         CaptureCmd::GetLlmRequestContext(ack) => {
             let _ = ack.send(sess.get_llm_request_context().await);
+            false
+        }
+        CaptureCmd::GetSessionThreadView(ack) => {
+            let _ = ack.send(sess.get_session_thread_view().await);
+            false
+        }
+        CaptureCmd::GetClassifyContext(ack) => {
+            let _ = ack.send(sess.get_classify_context().await);
             false
         }
         CaptureCmd::PreviewCompact(ack) => {

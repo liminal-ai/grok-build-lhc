@@ -4733,6 +4733,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "xai-chat-state",
  "xai-grok-sampling-types",

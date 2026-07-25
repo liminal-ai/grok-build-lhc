@@ -6,17 +6,32 @@ use std::thread;
 use std::time::Duration;
 
 use grok_lhc_host::{
-    CaptureHandle, CompactMode, MockLhcInferenceSampler, ServeDecision, apply_serve_decision,
-    body_has_tool_cycle, capture_active, capture_model_or_thinking_change, decide_substitution,
-    encode_session_id_for_path, is_enabled, lookup_session, paths_disagree, resolve_compact_mode,
-    serve_request_context, set_compact_mode_for_test, shutdown_session, spawn_capture,
-    tee_chat_persistence, thread_file_path,
+    CaptureHandle, CompactEventBridge, CompactMode, CountingLhcInferenceSampler,
+    LhcInferenceRequest, MockLhcInferenceSampler, ServeDecision, SourceKindIndex,
+    apply_serve_decision, body_has_tool_cycle, build_writeback_conversation, capture_active,
+    capture_model_or_thinking_change, compare_serve_equivalence, decide_substitution,
+    encode_session_id_for_path, equivalence_snapshot, inference_sampler_registered,
+    informational_hit_count, is_enabled, lookup_session, native_prompt_indices,
+    observe_serve_equivalence, paths_disagree, preview_call_count, project_conversation_canonical,
+    replace_call_count, reset_compact_call_counters, reset_equivalence_counters,
+    resolve_compact_mode, serve_compared_turns, serve_fallback_turns, serve_request_context,
+    set_compact_mode_for_test, set_force_classify_list_failure, shadow_preview_compact,
+    shutdown_session, spawn_capture, structural_hit_count, tee_chat_persistence, thread_file_path,
 };
 use lhc::intake_stream::{BatchEventOutcome, BatchSkipReason, EventRecord};
+use lhc::shared_tech::view::{
+    SessionAssistantMessage, SessionAssistantPart, SessionAssistantPartType,
+    SessionModelChangeEntry, SessionThreadView, SessionThreadViewEntry,
+    SessionThreadViewEntrySource, SessionThreadViewMessage, SessionThreadViewRuntimeEntry,
+    SessionToolResultMessage, SessionUserMessage,
+};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
-use xai_chat_state::{NullChatPersistence, PersistenceRecord};
-use xai_grok_sampling_types::{ConversationItem, SyntheticReason, ToolCall};
+use tokio_util::sync::CancellationToken;
+use xai_chat_state::{
+    ChatStateActor, NullChatPersistence, PersistenceRecord, estimate_conversation_tokens,
+};
+use xai_grok_sampling_types::{ConversationItem, SamplingConfig, SyntheticReason, ToolCall};
 
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -324,6 +339,97 @@ fn replace_history_records_compaction_meta_only() {
     );
     // Survivor a2 must not have been re-keyed under a new key.
     assert!(before_keys.is_subset(&keys(&after)));
+    handle.shutdown_blocking();
+}
+
+/// J1 — identical-content summary dedup is inert (correct by design).
+/// A byte-identical summary yields no new event, does not disturb the key
+/// stream for subsequent items, and leaves the occurrence walk aligned.
+#[test]
+fn identical_content_summary_dedup_is_inert() {
+    let root = TempDir::new().unwrap();
+    let sid = "cert-identical-summary-dedup";
+    let survivor = ConversationItem::assistant("survivor-a");
+    let summary = ConversationItem::user_meta("byte-identical summary text");
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+    handle.persist(&ConversationItem::user("seed"));
+    handle.persist(&survivor);
+    handle.flush_blocking();
+    let _ = wait_events(&handle, 1);
+
+    // First write-back-shaped replace: summary is new.
+    handle.replace_history(&[summary.clone(), survivor.clone()]);
+    handle.flush_blocking();
+    let after_first = wait_events(&handle, 1);
+    let keys_after_summary = keys(&after_first);
+    let summary_keys: Vec<_> = after_first
+        .iter()
+        .filter(|e| {
+            e.text_payload()
+                .is_some_and(|p| p.text.contains("byte-identical summary text"))
+        })
+        .map(|e| e.idempotency_key().to_string())
+        .collect();
+    assert_eq!(
+        summary_keys.len(),
+        1,
+        "summary must record exactly once on first replace"
+    );
+
+    // Second replace: same summary (byte-identical) + survivor + new live user.
+    let live = ConversationItem::user("live-after-dedup");
+    handle.replace_history(&[summary.clone(), survivor.clone(), live.clone()]);
+    handle.flush_blocking();
+    let after_second = wait_events(&handle, after_first.len() + 1);
+    let summary_hits = after_second
+        .iter()
+        .filter(|e| {
+            e.text_payload()
+                .is_some_and(|p| p.text.contains("byte-identical summary text"))
+        })
+        .count();
+    assert_eq!(
+        summary_hits, 1,
+        "byte-identical summary must yield no new event"
+    );
+    // Key stream for prior items undisturbed.
+    assert!(
+        keys_after_summary.is_subset(&keys(&after_second)),
+        "prior keys must remain; dedup must not reshuffle the stream"
+    );
+    let new_keys: BTreeSet<_> = keys(&after_second)
+        .difference(&keys_after_summary)
+        .cloned()
+        .collect();
+    assert!(
+        !new_keys.is_empty(),
+        "subsequent live user must still record"
+    );
+    assert!(
+        after_second.iter().any(|e| {
+            e.text_payload()
+                .is_some_and(|p| p.text.contains("live-after-dedup"))
+        }),
+        "live user text missing"
+    );
+
+    // Occurrence walk aligned: replace again with the same body — no growth.
+    let len_stable = after_second.len();
+    let keys_stable = keys(&after_second);
+    handle.replace_history(&[summary, survivor, live]);
+    handle.flush_blocking();
+    thread::sleep(Duration::from_millis(150));
+    let again = handle.list_events_blocking().unwrap();
+    assert_eq!(
+        again.len(),
+        len_stable,
+        "third identical replace must add nothing"
+    );
+    assert_eq!(
+        keys(&again),
+        keys_stable,
+        "occurrence walk must stay aligned"
+    );
     handle.shutdown_blocking();
 }
 
@@ -1169,13 +1275,1022 @@ async fn tee_chat_persistence_methods_reach_inner_and_lhc() {
     .expect("tee methods path timed out");
 }
 
+// ── Chunk 2 write-back: capture-tee loop idempotency (HARD GATE) ──────
+//
+// Write-back re-enters capture as `replace_history`. These four tests prove
+// the loop is idempotent for the write-back-shaped body specifically. If the
+// tee shape is unclean, STOP — do not patch capture unilaterally.
+
+fn view_src(id: &str) -> SessionThreadViewEntrySource {
+    SessionThreadViewEntrySource {
+        message_id: id.into(),
+        idempotency_key: None,
+    }
+}
+
+fn view_band(text: &str) -> SessionThreadViewEntry {
+    SessionThreadViewEntry::Message(SessionThreadViewMessage::User(SessionUserMessage {
+        content: text.into(),
+        source_messages: Vec::new(),
+    }))
+}
+
+fn view_user(text: &str, id: &str) -> SessionThreadViewEntry {
+    SessionThreadViewEntry::Message(SessionThreadViewMessage::User(SessionUserMessage {
+        content: text.into(),
+        source_messages: vec![view_src(id)],
+    }))
+}
+
+fn view_assistant_text(text: &str, id: &str) -> SessionThreadViewEntry {
+    SessionThreadViewEntry::Message(SessionThreadViewMessage::Assistant(
+        SessionAssistantMessage {
+            content: vec![SessionAssistantPart {
+                type_: SessionAssistantPartType::Text,
+                text: Some(text.into()),
+                thinking: None,
+                tool_call_id: None,
+                tool_name: None,
+                arguments: None,
+            }],
+            source_messages: vec![view_src(id)],
+        },
+    ))
+}
+
+fn view_assistant_tool(name: &str, args: &str, id: &str) -> SessionThreadViewEntry {
+    let arguments: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(args).unwrap_or_default();
+    SessionThreadViewEntry::Message(SessionThreadViewMessage::Assistant(
+        SessionAssistantMessage {
+            content: vec![SessionAssistantPart {
+                type_: SessionAssistantPartType::ToolCall,
+                text: None,
+                thinking: None,
+                tool_call_id: Some("c1".into()),
+                tool_name: Some(name.into()),
+                arguments: Some(arguments),
+            }],
+            source_messages: vec![view_src(id)],
+        },
+    ))
+}
+
+fn view_tool_result(name: &str, content: &str, id: &str) -> SessionThreadViewEntry {
+    SessionThreadViewEntry::Message(SessionThreadViewMessage::ToolResult(
+        SessionToolResultMessage {
+            tool_call_id: "c1".into(),
+            tool_name: Some(name.into()),
+            content: content.into(),
+            is_error: None,
+            source_messages: vec![view_src(id)],
+        },
+    ))
+}
+
+/// Realistic post-compact typed session view (bands = empty sources).
+fn realistic_post_compact_view() -> SessionThreadView {
+    SessionThreadView {
+        thread_id: "t".into(),
+        entries: vec![
+            view_band("[context · brief]\nSession goals and constraints."),
+            view_band("[context · detailed]\nTurn-by-turn compressed history."),
+            view_band("[context · smooth]\nNarrative bridge into the live tail."),
+            view_user("please investigate area 9", "u1"),
+            view_assistant_tool("bash", r#"{"cmd":"ls"}"#, "a1"),
+            view_tool_result("bash", "file_a\nfile_b", "tr1"),
+            view_user("[runtime note] cwd switched", "rn1"),
+            SessionThreadViewEntry::Runtime(SessionThreadViewRuntimeEntry::ModelChange(
+                SessionModelChangeEntry {
+                    provider: "xai".into(),
+                    model_id: "grok-4".into(),
+                    source_messages: vec![view_src("mc1")],
+                },
+            )),
+            view_user("live-2", "u2"),
+            view_assistant_text("a2", "a2"),
+        ],
+    }
+}
+
+fn realistic_kinds(view: &SessionThreadView) -> SourceKindIndex {
+    SourceKindIndex::assume_sourced_users_are_prompts(view)
+        .with("rn1", lhc::messages::MessageKind::RuntimeNote)
+}
+
+fn writeback_fixture() -> (Vec<ConversationItem>, Vec<ConversationItem>) {
+    let mut u0 = ConversationItem::user("old-0");
+    u0.set_prompt_index(0);
+    let mut u1 = ConversationItem::user("please investigate area 9");
+    u1.set_prompt_index(1);
+    let mut u2 = ConversationItem::user("live-2");
+    u2.set_prompt_index(2);
+    // Causally coherent with the LHC view's `[tool call · bash]` /
+    // `[tool result · bash]` — native assistant must name the tool.
+    let tool_asst = ConversationItem::assistant_tool_calls(vec![ToolCall {
+        id: "c1".into(),
+        name: "bash".into(),
+        arguments: "{\"cmd\":\"ls\"}".into(),
+    }]);
+    let native = vec![
+        ConversationItem::system("sys"),
+        u0,
+        ConversationItem::assistant("a0"),
+        u1,
+        tool_asst,
+        ConversationItem::tool_result("c1", "file_a\nfile_b"),
+        ConversationItem::assistant("done looking"),
+        u2,
+        ConversationItem::assistant("a2"),
+    ];
+    let view = realistic_post_compact_view();
+    let kinds = realistic_kinds(&view);
+    let body = build_writeback_conversation(&native, &view, &kinds).expect("writeback body");
+    (native, body)
+}
+
+const WB_BAND_SUMMARY_NEEDLE: &str = "[context · brief]";
+
+/// Gate property: write-back twice with the same ctx → byte-identical body + keys.
+#[test]
+fn writeback_body_is_fixpoint_through_replace_history() {
+    let root = TempDir::new().unwrap();
+    let sid = "cert-wb-fixpoint";
+    let (native, body1) = writeback_fixture();
+    let view = realistic_post_compact_view();
+    let kinds = realistic_kinds(&view);
+    let body2 = build_writeback_conversation(&body1, &view, &kinds).expect("second writeback");
+    let fp = |items: &[ConversationItem]| {
+        items
+            .iter()
+            .map(|i| {
+                let kind = match i {
+                    ConversationItem::System(_) => "system",
+                    ConversationItem::User(u) if u.synthetic_reason.is_some() => "user_meta",
+                    ConversationItem::User(_) => "user",
+                    ConversationItem::Assistant(a) if !a.tool_calls.is_empty() => "assistant_tools",
+                    ConversationItem::Assistant(_) => "assistant",
+                    ConversationItem::ToolResult(_) => "tool_result",
+                    ConversationItem::Reasoning(_) => "reasoning",
+                    ConversationItem::BackendToolCall(_) => "backend_tool_call",
+                };
+                let tools = match i {
+                    ConversationItem::Assistant(a) => a
+                        .tool_calls
+                        .iter()
+                        .map(|t| format!("{}:{}", t.id, t.name))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    ConversationItem::ToolResult(tr) => tr.tool_call_id.clone(),
+                    _ => String::new(),
+                };
+                format!(
+                    "{}:{:?}:{}:{}",
+                    kind,
+                    match i {
+                        ConversationItem::User(u) => u.prompt_index,
+                        _ => None,
+                    },
+                    tools,
+                    i.text_content()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("||")
+    };
+    assert_eq!(
+        fp(&body1),
+        fp(&body2),
+        "build_writeback_conversation must be a fixpoint"
+    );
+    assert_eq!(native_prompt_indices(&body1), vec![1, 2]);
+
+    let handle = spawn_capture(sid, Some("/tmp"), &native, Some(root.path()), None).unwrap();
+    let _ = wait_events(&handle, 1);
+    handle.replace_history(&body1);
+    handle.flush_blocking();
+    let once = wait_events(&handle, 1);
+    let once_keys = keys(&once);
+    handle.replace_history(&body2);
+    handle.flush_blocking();
+    thread::sleep(Duration::from_millis(150));
+    let again = handle.list_events_blocking().unwrap();
+    assert_eq!(
+        keys(&again),
+        once_keys,
+        "fixpoint body must not re-key on second replace"
+    );
+    handle.shutdown_blocking();
+}
+
+/// (1) Prune-shaped replace of a post-write-back body emits nothing.
+/// Would fail if prune-shaped replace started minting new keys for survivors.
+#[test]
+fn writeback_prune_shaped_replace_emits_nothing() {
+    let root = TempDir::new().unwrap();
+    let sid = "cert-wb-prune";
+    let (native, body) = writeback_fixture();
+    let handle = spawn_capture(sid, Some("/tmp"), &native, Some(root.path()), None).unwrap();
+    let _seeded = wait_events(&handle, 1);
+    handle.replace_history(&body);
+    handle.flush_blocking();
+    let after_wb = wait_events(&handle, 1);
+    let before_keys = keys(&after_wb);
+    let before_len = after_wb.len();
+
+    // Prune-shaped: drop band meta + earlier turns; keep system + live tail.
+    let pruned: Vec<_> = body
+        .iter()
+        .filter(|i| match i {
+            ConversationItem::User(u) if u.synthetic_reason.is_none() => {
+                i.text_content().contains("live-2")
+            }
+            ConversationItem::Assistant(_) => i.text_content().contains("a2"),
+            ConversationItem::System(_) => true,
+            _ => false,
+        })
+        .cloned()
+        .collect();
+    assert!(
+        pruned.len() < body.len(),
+        "fixture must actually prune ({} vs {})",
+        pruned.len(),
+        body.len()
+    );
+    for _ in 0..3 {
+        handle.replace_history(&pruned);
+    }
+    handle.flush_blocking();
+    thread::sleep(Duration::from_millis(150));
+    let after = handle.list_events_blocking().unwrap();
+    assert_eq!(
+        after.len(),
+        before_len,
+        "prune-shaped write-back path must add zero events"
+    );
+    assert_eq!(keys(&after), before_keys);
+    handle.shutdown_blocking();
+}
+
+/// (2) Genuine compact write-back records the band summary exactly once.
+/// Would fail on zero (summary lost) or twice (tee double-fire / re-key).
+#[test]
+fn writeback_genuine_compact_summary_records_exactly_once() {
+    let root = TempDir::new().unwrap();
+    let sid = "cert-wb-summary-once";
+    let (native, body) = writeback_fixture();
+    let handle = spawn_capture(sid, Some("/tmp"), &native, Some(root.path()), None).unwrap();
+    let before = wait_events(&handle, 1);
+    let before_keys = keys(&before);
+
+    handle.replace_history(&body);
+    handle.flush_blocking();
+    let after = wait_events(&handle, before.len() + 1);
+    let new_keys: BTreeSet<_> = keys(&after).difference(&before_keys).cloned().collect();
+    assert!(
+        !new_keys.is_empty(),
+        "genuine write-back must record something"
+    );
+    let summary_hits: Vec<_> = after
+        .iter()
+        .filter(|e| {
+            e.text_payload()
+                .is_some_and(|p| p.text.contains(WB_BAND_SUMMARY_NEEDLE))
+        })
+        .collect();
+    assert_eq!(
+        summary_hits.len(),
+        1,
+        "band summary must appear exactly once, got {}",
+        summary_hits.len()
+    );
+    assert!(
+        new_keys.contains(summary_hits[0].idempotency_key()),
+        "summary must be among the newly recorded keys"
+    );
+    handle.shutdown_blocking();
+}
+
+/// (3) Repeated write-backs of an unchanged body record nothing.
+/// Would fail if survivors were re-keyed on each replace.
+#[test]
+fn writeback_repeated_unchanged_body_records_nothing() {
+    let root = TempDir::new().unwrap();
+    let sid = "cert-wb-repeat";
+    let (native, body) = writeback_fixture();
+    let handle = spawn_capture(sid, Some("/tmp"), &native, Some(root.path()), None).unwrap();
+    let _ = wait_events(&handle, 1);
+    handle.replace_history(&body);
+    handle.flush_blocking();
+    let once = wait_events(&handle, 1);
+    let once_keys = keys(&once);
+    let once_len = once.len();
+
+    for _ in 0..4 {
+        handle.replace_history(&body);
+    }
+    handle.flush_blocking();
+    thread::sleep(Duration::from_millis(150));
+    let again = handle.list_events_blocking().unwrap();
+    assert_eq!(again.len(), once_len);
+    assert_eq!(keys(&again), once_keys);
+    handle.shutdown_blocking();
+}
+
+/// (4) Crash mid-write-back must not double-record on retry.
+/// Arms a crash after **one novel (Recorded)** event of the replace is
+/// committed — not after the preserved system message (which is dedup-skipped).
+/// Would fail if a partial apply + retry minted a second summary key.
+#[test]
+fn writeback_crash_mid_replace_no_double_on_retry() {
+    let root = TempDir::new().unwrap();
+    let sid = "cert-wb-crash";
+    let (native, body) = writeback_fixture();
+    let handle = spawn_capture(sid, Some("/tmp"), &native, Some(root.path()), None).unwrap();
+    let seeded = wait_events(&handle, 1);
+    let seeded_keys = keys(&seeded);
+    let seeded_len = seeded.len();
+
+    // Partial apply: crash after the first *novel* event (band summary) lands.
+    handle.arm_crash_mid_replace(1);
+    handle.replace_history(&body);
+    // Worker exits on mid-replace crash; wait for registry clear.
+    wait_registry_gone(sid);
+    thread::sleep(Duration::from_millis(200));
+
+    // Discriminating observation: mid-apply crash must have committed the
+    // novel band summary (not merely died before any new Recorded event).
+    let probe = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+    thread::sleep(Duration::from_millis(100));
+    let partial = probe.list_events_blocking().unwrap();
+    let summary_count = |ev: &[EventRecord]| {
+        ev.iter()
+            .filter(|e| {
+                e.text_payload()
+                    .is_some_and(|p| p.text.contains(WB_BAND_SUMMARY_NEEDLE))
+            })
+            .count()
+    };
+    assert_eq!(
+        summary_count(&partial),
+        1,
+        "mid-apply crash must leave exactly one novel band summary committed \
+         (arming after the dedup-skipped system message is a vacuous no-op)"
+    );
+    assert!(
+        partial.len() > seeded_len,
+        "partial apply must grow past bootstrap seed"
+    );
+    probe.shutdown_blocking();
+    wait_registry_gone(sid);
+
+    // Host already holds the write-back body; reopen and apply again.
+    let handle2 = spawn_capture(sid, Some("/tmp"), &body, Some(root.path()), None).unwrap();
+    handle2.flush_blocking();
+    let mut after_retry = wait_events(&handle2, seeded_len);
+    for _ in 0..40 {
+        thread::sleep(Duration::from_millis(50));
+        let cur = handle2.list_events_blocking().unwrap();
+        if cur.len() == after_retry.len() && cur.len() > seeded_len {
+            after_retry = cur;
+            break;
+        }
+        after_retry = cur;
+    }
+    assert_eq!(
+        summary_count(&after_retry),
+        1,
+        "after crash+retry summary must appear exactly once"
+    );
+    let keys_once = keys(&after_retry);
+    assert!(seeded_keys.is_subset(&keys_once));
+
+    handle2.replace_history(&body);
+    handle2.flush_blocking();
+    thread::sleep(Duration::from_millis(150));
+    let again = handle2.list_events_blocking().unwrap();
+    assert_eq!(
+        summary_count(&again),
+        1,
+        "second write-back must not double summary"
+    );
+    assert_eq!(keys(&again), keys_once);
+    handle2.shutdown_blocking();
+}
+
+/// Q4 — live-tail kinds round-trip: `runtime_note`, `user_prompt`,
+/// `tool_call`, `tool_result`, `assistant_text` keep their event kinds after
+/// write-back. Would fail if the translator flattened tools/notes to the
+/// wrong kind.
+#[test]
+fn writeback_live_tail_kinds_round_trip() {
+    let root = TempDir::new().unwrap();
+    let sid = "cert-wb-tail-kinds";
+    const NOTE: &str = "task-completed synthetic wake";
+    let mut real = ConversationItem::user("real-prompt");
+    real.set_prompt_index(0);
+    let native = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user_meta(NOTE),
+        real,
+        ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: "c1".into(),
+            name: "bash".into(),
+            arguments: "{\"cmd\":\"ls\"}".into(),
+        }]),
+        ConversationItem::tool_result("c1", "file_a"),
+        ConversationItem::assistant("done"),
+    ];
+    let handle = spawn_capture(sid, Some("/tmp"), &native, Some(root.path()), None).unwrap();
+    let seeded = wait_events(&handle, 5);
+    let kind_count = |ev: &[EventRecord], kind: &str| {
+        ev.iter()
+            .filter(|e| e.event_kind().as_str() == kind)
+            .count()
+    };
+    assert!(
+        kind_count(&seeded, "runtime_note") >= 1,
+        "bootstrap records runtime_note"
+    );
+    assert!(
+        kind_count(&seeded, "user_prompt") >= 1,
+        "bootstrap records user_prompt"
+    );
+    assert!(
+        kind_count(&seeded, "tool_call") >= 1,
+        "bootstrap records tool_call"
+    );
+    assert!(
+        kind_count(&seeded, "tool_result") >= 1,
+        "bootstrap records tool_result"
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (view, kinds) = rt
+        .block_on(handle.get_classify_context())
+        .expect("classify context");
+    let body = build_writeback_conversation(&native, &view, &kinds).expect("writeback");
+    assert!(
+        body.iter()
+            .any(|i| matches!(i, ConversationItem::ToolResult(_))),
+        "write-back body must conserve ToolResult"
+    );
+    assert!(
+        body.iter().any(|i| matches!(
+            i,
+            ConversationItem::Assistant(a) if !a.tool_calls.is_empty()
+        )),
+        "write-back body must conserve assistant tool_calls"
+    );
+    assert!(
+        body.iter().any(|i| {
+            matches!(i, ConversationItem::User(u) if u.synthetic_reason.is_some())
+                && i.text_content().contains(NOTE)
+        }),
+        "runtime note must remain user_meta"
+    );
+    assert_eq!(native_prompt_indices(&body), vec![0]);
+
+    handle.replace_history(&body);
+    handle.flush_blocking();
+    thread::sleep(Duration::from_millis(150));
+    let after = handle.list_events_blocking().unwrap();
+    let note_as_prompt = after.iter().any(|e| {
+        e.event_kind().as_str() == "user_prompt"
+            && e.text_payload().is_some_and(|p| p.text.contains(NOTE))
+    });
+    assert!(
+        !note_as_prompt,
+        "write-back must not promote runtime_note → user_prompt"
+    );
+    assert!(
+        kind_count(&after, "tool_call") >= 1,
+        "tool_call must survive write-back"
+    );
+    assert!(
+        kind_count(&after, "tool_result") >= 1,
+        "tool_result must survive write-back"
+    );
+    assert!(
+        kind_count(&after, "user_prompt") >= 1,
+        "user_prompt must survive write-back"
+    );
+    handle.shutdown_blocking();
+}
+
+/// Q1 — whole-index failure aborts serve (Native) and write-back (Err).
+/// Per-entry unknown still classifies synthetic (separate test in serving).
+#[test]
+fn classify_whole_index_failure_fails_open_no_substitution_no_writeback() {
+    let _g = env_lock();
+    let root = TempDir::new().unwrap();
+    let sid = "cert-q1-index-fail";
+    let native = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user("hello"),
+    ];
+    let handle = spawn_capture(sid, Some("/tmp"), &native, Some(root.path()), None).unwrap();
+    let _ = wait_events(&handle, 1);
+
+    set_force_classify_list_failure(true);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let decision = rt.block_on(serve_request_context(sid, &native));
+    set_compact_mode_for_test(Some(CompactMode::Replace));
+    let wb = rt.block_on(grok_lhc_host::replace_compact_for_writeback(sid));
+    set_compact_mode_for_test(None);
+    set_force_classify_list_failure(false);
+    assert!(
+        matches!(
+            decision,
+            ServeDecision::Native {
+                reason: "get_classify_context_failed"
+            }
+        ),
+        "whole-index failure must fail open to Native, got {decision:?}"
+    );
+    assert!(
+        wb.is_err(),
+        "whole-index failure must abort write-back, got {wb:?}"
+    );
+
+    handle.shutdown_blocking();
+}
+
+/// H6 (adapter-reachable): production [`replace_compact_for_writeback`] is the
+/// compact+view fetch path. Deleting / no-op'ing it fails this test (N2).
+#[test]
+fn writeback_replace_compact_for_writeback_is_production_path() {
+    let _g = env_lock();
+    let root = TempDir::new().unwrap();
+    let sid = "cert-wb-replace-path";
+    let (native, _) = writeback_fixture();
+    let sampler = Arc::new(MockLhcInferenceSampler::new());
+    let handle =
+        spawn_capture(sid, Some("/tmp"), &native, Some(root.path()), Some(sampler)).unwrap();
+    let _ = wait_events(&handle, 1);
+
+    reset_compact_call_counters();
+    set_compact_mode_for_test(Some(CompactMode::Replace));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let writeback = rt
+        .block_on(grok_lhc_host::replace_compact_for_writeback(sid))
+        .expect("replace_compact_for_writeback must succeed under Replace mode");
+    set_compact_mode_for_test(None);
+
+    assert_eq!(
+        replace_call_count(),
+        1,
+        "production replace_compact_for_writeback must count the compact attempt"
+    );
+    assert!(
+        !writeback.view.entries.is_empty(),
+        "production path must return a post-compact session view"
+    );
+    // Prove the view is usable by the shared write-back translator.
+    let _body = build_writeback_conversation(&native, &writeback.view, &writeback.kinds)
+        .expect("session view from production path must translate");
+    handle.shutdown_blocking();
+}
+
+/// N3 reachability: public SDK + deterministic callbacks + tight ViewCompactParams
+/// + multi-turn seed **can** emit typed bands. Contrasts with production
+/// `LhcSession::compact` (`params: None`) which does not force bands on the
+/// write-back fixture. If this fails, the Chunk 3 harness brief in FORK.md
+/// needs revision.
+#[tokio::test(flavor = "current_thread")]
+async fn n3_deterministic_callbacks_with_tight_params_can_emit_typed_bands() {
+    use lhc::create_deterministic_inference_callbacks;
+    use lhc::init_lhc;
+    use lhc::intake_stream::MessageEventInput;
+    use lhc::shared_tech::derivation::{SdkConfig, SdkMode};
+    use lhc::shared_tech::errors::OpResult;
+    use lhc::shared_tech::view::{
+        PartialViewProfilePercentages, SessionThreadViewEntry, SessionThreadViewMessage,
+        ViewCompactParams,
+    };
+    use lhc::thread_view::CompactOpts;
+    use lhc::threads::{NewThreadInput, ThreadRef};
+    use serde_json::{Map, json};
+
+    fn ev(kind: &str, payload: Map<String, serde_json::Value>, key: &str) -> MessageEventInput {
+        MessageEventInput {
+            event_kind: kind.into(),
+            idempotency_key: Some(key.into()),
+            actor: "grok".into(),
+            harness: "n3-probe".into(),
+            payload,
+            extra: Map::new(),
+        }
+    }
+
+    let root = TempDir::new().unwrap();
+    let registry = root.path().join("registry.sqlite");
+    let path = root.path().join("t.sqlite");
+    let path_str = path.to_string_lossy().into_owned();
+    let sdk = init_lhc(SdkConfig {
+        inference_callbacks: Some(create_deterministic_inference_callbacks()),
+        inference: None,
+        mode: SdkMode::Manual,
+        clock: None,
+        guards: None,
+        tool_result: None,
+        lease: None,
+        chunk_policy: None,
+        view: None,
+    });
+    let created = sdk
+        .threads
+        .new_thread(NewThreadInput {
+            file_path: path_str.clone(),
+            title: None,
+            cwd: None,
+            registry_path: Some(registry.to_string_lossy().into_owned()),
+        })
+        .await;
+    assert!(created.is_ok(), "{created:?}");
+
+    let blob = "word ".repeat(200);
+    for turn in 0..12 {
+        let batch = vec![
+            ev(
+                "user_prompt",
+                {
+                    let mut m = Map::new();
+                    m.insert("text".into(), json!(format!("turn {turn} {blob}")));
+                    m
+                },
+                &format!("u{turn}"),
+            ),
+            ev(
+                "assistant_text",
+                {
+                    let mut m = Map::new();
+                    m.insert("text".into(), json!(format!("answer {turn} {blob}")));
+                    m
+                },
+                &format!("a{turn}"),
+            ),
+            ev("turn_end", Map::new(), &format!("e{turn}")),
+        ];
+        let r = sdk
+            .intake_stream
+            .message_events(ThreadRef::file_path(&path_str), &batch)
+            .await;
+        assert!(r.is_ok(), "turn {turn}: {r:?}");
+    }
+    let _ = sdk.work.drain(ThreadRef::file_path(&path_str), None).await;
+
+    let band_count = |v: &lhc::shared_tech::view::SessionThreadView| {
+        v.entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    SessionThreadViewEntry::Message(SessionThreadViewMessage::User(u))
+                        if u.source_messages.is_empty()
+                )
+            })
+            .count()
+    };
+
+    // Production-shaped call: params None — must not be relied on for bands.
+    let _ = sdk
+        .thread_view
+        .compact(
+            ThreadRef::file_path(&path_str),
+            CompactOpts {
+                profile: None,
+                params: None,
+                signal: None,
+            },
+        )
+        .await;
+    let v_none = sdk
+        .thread_view
+        .get_session_thread_view(ThreadRef::file_path(&path_str))
+        .await;
+    let OpResult::Ok { value: view_none } = v_none else {
+        panic!("view after params=None: {v_none:?}");
+    };
+    let bands_none = band_count(&view_none);
+
+    let params = ViewCompactParams {
+        lower_bound: Some(400.0),
+        percentages: Some(PartialViewProfilePercentages {
+            full: Some(25.0),
+            smooth: Some(25.0),
+            detailed: Some(25.0),
+            brief: Some(25.0),
+        }),
+    };
+    let c = sdk
+        .thread_view
+        .compact(
+            ThreadRef::file_path(&path_str),
+            CompactOpts {
+                profile: None,
+                params: Some(params),
+                signal: None,
+            },
+        )
+        .await;
+    assert!(c.is_ok(), "tight-params compact failed: {c:?}");
+    let v = sdk
+        .thread_view
+        .get_session_thread_view(ThreadRef::file_path(&path_str))
+        .await;
+    let OpResult::Ok { value: view } = v else {
+        panic!("view after tight params: {v:?}");
+    };
+    let bands = band_count(&view);
+    assert!(
+        bands > 0,
+        "deterministic cbs + multi-turn + tight ViewCompactParams must emit          typed bands (empty source_messages); got 0 (params=None yielded {bands_none})"
+    );
+}
+
+/// Banded LHC-ahead crash window (adapter-reachable).
+///
+/// Uses deterministic callbacks + multi-turn seed + tight `ViewCompactParams`
+/// to emit typed bands, then applies write-back via `replace_history` while
+/// native is still the old body (LHC ahead / native behind). Retry must not
+/// double-record band summary text.
+///
+/// Would fail if the second `replace_history` minted a second summary key.
+#[test]
+fn writeback_crash_between_lhc_compact_and_native_replace_is_transient() {
+    use lhc::create_deterministic_inference_callbacks;
+    use lhc::init_lhc;
+    use lhc::intake_stream::MessageEventInput;
+    use lhc::shared_tech::derivation::{SdkConfig, SdkMode};
+    use lhc::shared_tech::errors::OpResult;
+    use lhc::shared_tech::view::{
+        PartialViewProfilePercentages, SessionThreadViewEntry, SessionThreadViewMessage,
+        ViewCompactParams,
+    };
+    use lhc::thread_view::CompactOpts;
+    use lhc::threads::{NewThreadInput, ThreadRef};
+    use serde_json::{Map, json};
+
+    let _g = env_lock();
+    let root = TempDir::new().unwrap();
+    let sid = "cert-wb-lhc-ahead";
+    std::fs::create_dir_all(root.path().join("threads")).unwrap();
+
+    let registry = root.path().join("registry.sqlite");
+    let path = thread_file_path(root.path(), sid);
+    let path_str = path.to_string_lossy().into_owned();
+    let registry_str = registry.to_string_lossy().into_owned();
+
+    let band_texts = {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            fn ev(
+                kind: &str,
+                payload: Map<String, serde_json::Value>,
+                key: &str,
+            ) -> MessageEventInput {
+                MessageEventInput {
+                    event_kind: kind.into(),
+                    idempotency_key: Some(key.into()),
+                    actor: "grok".into(),
+                    harness: "n3-banded".into(),
+                    payload,
+                    extra: Map::new(),
+                }
+            }
+
+            let sdk = init_lhc(SdkConfig {
+                inference_callbacks: Some(create_deterministic_inference_callbacks()),
+                inference: None,
+                mode: SdkMode::Manual,
+                clock: None,
+                guards: None,
+                tool_result: None,
+                lease: None,
+                chunk_policy: None,
+                view: None,
+            });
+            assert!(
+                sdk.threads
+                    .new_thread(NewThreadInput {
+                        file_path: path_str.clone(),
+                        title: None,
+                        cwd: None,
+                        registry_path: Some(registry_str.clone()),
+                    })
+                    .await
+                    .is_ok()
+            );
+            let blob = "word ".repeat(200);
+            for turn in 0..12 {
+                let batch = vec![
+                    ev(
+                        "user_prompt",
+                        {
+                            let mut m = Map::new();
+                            m.insert("text".into(), json!(format!("turn {turn} {blob}")));
+                            m
+                        },
+                        &format!("u{turn}"),
+                    ),
+                    ev(
+                        "assistant_text",
+                        {
+                            let mut m = Map::new();
+                            m.insert("text".into(), json!(format!("answer {turn} {blob}")));
+                            m
+                        },
+                        &format!("a{turn}"),
+                    ),
+                    ev("turn_end", Map::new(), &format!("e{turn}")),
+                ];
+                assert!(
+                    sdk.intake_stream
+                        .message_events(ThreadRef::file_path(&path_str), &batch)
+                        .await
+                        .is_ok()
+                );
+            }
+            let _ = sdk.work.drain(ThreadRef::file_path(&path_str), None).await;
+            let params = ViewCompactParams {
+                lower_bound: Some(400.0),
+                percentages: Some(PartialViewProfilePercentages {
+                    full: Some(25.0),
+                    smooth: Some(25.0),
+                    detailed: Some(25.0),
+                    brief: Some(25.0),
+                }),
+            };
+            let compact = sdk
+                .thread_view
+                .compact(
+                    ThreadRef::file_path(&path_str),
+                    CompactOpts {
+                        profile: None,
+                        params: Some(params),
+                        signal: None,
+                    },
+                )
+                .await;
+            assert!(compact.is_ok(), "banded compact failed: {compact:?}");
+            let view_pre = sdk
+                .thread_view
+                .get_session_thread_view(ThreadRef::file_path(&path_str))
+                .await;
+            let OpResult::Ok { value: banded_view } = view_pre else {
+                panic!("session view after banded compact: {view_pre:?}");
+            };
+            let texts: Vec<String> = banded_view
+                .entries
+                .iter()
+                .filter_map(|e| match e {
+                    SessionThreadViewEntry::Message(SessionThreadViewMessage::User(u))
+                        if u.source_messages.is_empty() =>
+                    {
+                        Some(u.content.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                !texts.is_empty(),
+                "typed bands required for LHC-ahead window; got 0 empty-source Users"
+            );
+            // Drain/close before capture opens the same sqlite files.
+            sdk.drain_settled(ThreadRef::file_path(&path_str)).await;
+            texts
+        })
+    };
+
+    // Native still pre-compact (replace never ran).
+    let mut old_native = vec![ConversationItem::system("sys")];
+    for i in 0..3 {
+        let mut u = ConversationItem::user(format!("turn {i} stale-native"));
+        u.set_prompt_index(i);
+        old_native.push(u);
+        old_native.push(ConversationItem::assistant(format!("a{i}")));
+    }
+    let handle = spawn_capture(sid, Some("/tmp"), &old_native, Some(root.path()), None)
+        .expect("spawn on pre-banded thread");
+    handle.flush_blocking();
+    thread::sleep(Duration::from_millis(100));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (rt_view, rt_kinds) = rt
+        .block_on(handle.get_classify_context())
+        .expect("classify context through capture");
+    let body = build_writeback_conversation(&old_native, &rt_view, &rt_kinds)
+        .expect("write-back from banded view");
+    let meta_with_band = body
+        .iter()
+        .filter(|i| {
+            matches!(i, ConversationItem::User(u) if u.synthetic_reason.is_some())
+                && band_texts.iter().any(|b| i.text_content().contains(b))
+        })
+        .count();
+    assert!(
+        meta_with_band >= 1,
+        "write-back body must include band user_meta from empty-source entries"
+    );
+
+    handle.replace_history(&body);
+    handle.flush_blocking();
+    thread::sleep(Duration::from_millis(150));
+    let once = handle.list_events_blocking().unwrap();
+    let once_keys = keys(&once);
+    let summary_hits = |ev: &[EventRecord]| {
+        ev.iter()
+            .filter(|e| {
+                e.text_payload()
+                    .is_some_and(|p| band_texts.iter().any(|b| p.text.contains(b)))
+            })
+            .count()
+    };
+    let hits1 = summary_hits(&once);
+    assert!(
+        hits1 >= 1,
+        "first write-back after LHC-ahead compact must record band summary text"
+    );
+
+    handle.replace_history(&body);
+    handle.flush_blocking();
+    thread::sleep(Duration::from_millis(150));
+    let again = handle.list_events_blocking().unwrap();
+    assert_eq!(
+        summary_hits(&again),
+        hits1,
+        "retry after LHC-ahead window must not double-record band summaries"
+    );
+    assert_eq!(keys(&again), once_keys);
+    handle.shutdown_blocking();
+}
+
+/// Write-back through the native compaction replace path decreases
+/// `get_estimated_total_tokens()` (the accounting self-correct claim).
+#[tokio::test(flavor = "multi_thread")]
+async fn writeback_replace_decreases_estimated_total_tokens() {
+    let (native, body) = writeback_fixture();
+    // Inflate the native body so the compacted write-back is unambiguously smaller.
+    let mut fat = native;
+    fat.push(ConversationItem::user("x".repeat(40_000)));
+    fat.push(ConversationItem::assistant("y".repeat(40_000)));
+    let before_est = estimate_conversation_tokens(&fat);
+    let after_est = estimate_conversation_tokens(&body);
+    assert!(
+        after_est < before_est,
+        "fixture invalid: write-back ({after_est}) not smaller than native ({before_est})"
+    );
+
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let token = CancellationToken::new();
+    let config = SamplingConfig {
+        base_url: "https://api.example.com".into(),
+        model: "test-model".into(),
+        max_completion_tokens: None,
+        temperature: None,
+        top_p: None,
+        api_backend: Default::default(),
+        extra_headers: Default::default(),
+        query_params: Default::default(),
+        env_http_headers: Default::default(),
+        context_window: std::num::NonZeroU64::new(128_000).unwrap(),
+        reasoning_effort: None,
+        stream_tool_calls: None,
+    };
+    let handle = ChatStateActor::spawn(fat, config, Box::new(NullChatPersistence), event_tx, token);
+    let _ = handle.get_conversation().await;
+    let tokens_before = handle.get_estimated_total_tokens().await;
+    handle.replace_conversation_for_compaction(body);
+    let tokens_after = handle.get_estimated_total_tokens().await;
+    assert!(
+        tokens_after < tokens_before,
+        "get_estimated_total_tokens must decrease after write-back replace \
+         (before={tokens_before}, after={tokens_after})"
+    );
+}
+
 // ── Chunk 2: inference / serving / compact / watchdog ─────────────────
 
-/// Mock sampler is injectable at spawn (hook-2 argument widen) and satisfies
-/// the ModelCall contract (text + provenance model + request_messages).
+/// Sampler passed to spawn_capture is registered under the session id.
 #[tokio::test(flavor = "multi_thread")]
 async fn chunk2_mock_sampler_registered_at_spawn() {
-    use grok_lhc_host::{LhcInferenceOp, LhcInferenceSampler};
+    use grok_lhc_host::LhcInferenceSampler;
     let sid = "cert-chunk2-mock-sampler";
     let root = TempDir::new().unwrap();
     let mock: Arc<dyn LhcInferenceSampler> = Arc::new(MockLhcInferenceSampler::new());
@@ -1187,8 +2302,18 @@ async fn chunk2_mock_sampler_registered_at_spawn() {
         Some(Arc::clone(&mock)),
     )
     .unwrap();
+    assert!(
+        inference_sampler_registered(sid),
+        "spawn_capture must register the sampler"
+    );
     let sample = mock
-        .sample(LhcInferenceOp::SmoothPrompt, "ping".into())
+        .sample(
+            LhcInferenceRequest::SmoothPrompt {
+                text: "ping".into(),
+                max_output_tokens: 64,
+            },
+            CancellationToken::new(),
+        )
         .await
         .expect("mock sample");
     assert!(sample.text.contains("smooth_prompt"));
@@ -1202,24 +2327,83 @@ async fn chunk2_mock_sampler_registered_at_spawn() {
     .await
     .unwrap();
     wait_registry_gone(sid);
+    assert!(!inference_sampler_registered(sid));
 }
 
-/// Serving fails open when capture is inactive.
+/// Counting sampler exercises every op + target token forwarding via callbacks.
+#[tokio::test(flavor = "multi_thread")]
+async fn chunk2_inference_all_ops_via_counting_double() {
+    use grok_lhc_host::{
+        LhcInferenceOp, inference_callbacks_for_session, register_inference_sampler,
+        unregister_inference_sampler,
+    };
+    use lhc::shared_tech::{
+        CompressDetailedTurnInput, SmoothPromptInput, SummarizeChunkBriefInput,
+        SummarizeToolResultInput,
+    };
+    let sid = "cert-chunk2-count-ops";
+    let counter = Arc::new(CountingLhcInferenceSampler::new());
+    register_inference_sampler(sid, counter.clone());
+    let cbs = inference_callbacks_for_session(sid);
+    let _ = (cbs.smooth_prompt)(SmoothPromptInput { text: "a".into() }).await;
+    let _ = (cbs.summarize_tool_result)(SummarizeToolResultInput {
+        tool_name: "bash".into(),
+        content: "out".into(),
+        outcome: None,
+        target_tokens: Some(256),
+        operation_class: None,
+        response_shape: None,
+        prompt_mode: None,
+        facts: None,
+    })
+    .await;
+    let _ = (cbs.compress_detailed_turn)(CompressDetailedTurnInput {
+        dialogue_text: "d".into(),
+        input_tokens: 10,
+        target_min_tokens: 1,
+        target_aim_tokens: 2,
+        target_max_tokens: 128,
+    })
+    .await;
+    let _ = (cbs.summarize_chunk_brief)(SummarizeChunkBriefInput {
+        text: "b".into(),
+        input_tokens: 10,
+        target_min_tokens: 1,
+        target_aim_tokens: 2,
+        target_max_tokens: 64,
+    })
+    .await;
+    let recorded = counter.call_ops();
+    assert_eq!(
+        recorded,
+        vec![
+            LhcInferenceOp::SmoothPrompt,
+            LhcInferenceOp::SummarizeToolResult,
+            LhcInferenceOp::CompressDetailedTurn,
+            LhcInferenceOp::SummarizeChunkBrief,
+        ]
+    );
+    let tokens: Vec<u32> = counter
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, t)| *t)
+        .collect();
+    assert_eq!(tokens[1], 256);
+    assert_eq!(tokens[2], 128);
+    assert_eq!(tokens[3], 64);
+    unregister_inference_sampler(sid);
+}
+
+/// Serving fails open when capture is inactive (no env re-read required).
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)]
 async fn chunk2_serve_fail_open_when_inactive() {
-    let _g = env_lock();
-    let prev = std::env::var_os("GROK_LHC");
-    unsafe { std::env::remove_var("GROK_LHC") };
     let native = vec![ConversationItem::user("keep-me")];
-    let decision = serve_request_context("no-such-session", native.clone()).await;
+    let decision = serve_request_context("no-such-session", &native).await;
     let (items, substituted) = apply_serve_decision(native, decision);
     assert!(!substituted);
     assert_eq!(items.len(), 1);
-    match prev {
-        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
-        None => unsafe { std::env::remove_var("GROK_LHC") },
-    }
 }
 
 /// Live capture → get_llm_request_context → substitute preserves system prefix.
@@ -1250,7 +2434,7 @@ async fn chunk2_serve_substitutes_from_live_context() {
         ConversationItem::system("host-system"),
         ConversationItem::user("stale-native"),
     ];
-    let decision = serve_request_context(sid, native.clone()).await;
+    let decision = serve_request_context(sid, &native).await;
     let (items, substituted) = apply_serve_decision(native, decision);
     assert!(
         substituted,
@@ -1259,6 +2443,59 @@ async fn chunk2_serve_substitutes_from_live_context() {
     assert!(matches!(&items[0], ConversationItem::System(_)));
     assert!(!body_has_tool_cycle(&items));
 
+    tokio::task::spawn_blocking(move || handle.shutdown_blocking())
+        .await
+        .unwrap();
+    wait_registry_gone(sid);
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC") },
+    }
+    match prev_root {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC_ROOT", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC_ROOT") },
+    }
+}
+
+/// Serving times out to native when the capture worker is blocked.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn chunk2_serve_timeout_falls_open_on_blocked_worker() {
+    let _g = env_lock();
+    let root = TempDir::new().unwrap();
+    let sid = "cert-chunk2-serve-timeout";
+    let prev = std::env::var_os("GROK_LHC");
+    let prev_root = std::env::var_os("GROK_LHC_ROOT");
+    unsafe {
+        std::env::set_var("GROK_LHC", "1");
+        std::env::set_var("GROK_LHC_ROOT", root.path());
+    }
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+    let (release_tx, release_rx) = oneshot::channel();
+    let handle_block = handle.clone();
+    tokio::task::spawn_blocking(move || {
+        let entered = handle_block.block_worker(release_rx);
+        let _ = entered.blocking_recv();
+    })
+    .await
+    .unwrap();
+    let native = vec![ConversationItem::user("blocked")];
+    let started = std::time::Instant::now();
+    let decision = serve_request_context(sid, &native).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "serve must not hang indefinitely"
+    );
+    assert!(
+        matches!(
+            decision,
+            ServeDecision::Native {
+                reason: "get_classify_context_timeout"
+            }
+        ),
+        "expected timeout native, got {decision:?}"
+    );
+    let _ = release_tx.send(());
     tokio::task::spawn_blocking(move || handle.shutdown_blocking())
         .await
         .unwrap();
@@ -1289,13 +2526,73 @@ fn chunk2_compact_modes_mutually_exclusive() {
     set_compact_mode_for_test(None);
 }
 
+/// Bridge state machine: exactly one LHC attempt per event shape.
+#[test]
+fn chunk2_compact_bridge_one_attempt_per_event() {
+    // success
+    let mut ok = CompactEventBridge::new(CompactMode::Replace);
+    assert!(ok.should_attempt_replace());
+    ok.record_replace_result(true);
+    assert!(!ok.should_attempt_replace());
+    assert_eq!(ok.lhc_attempts(), 1);
+    assert!(ok.lhc_wrote());
+
+    // first-fails → sticky fail-open (native); no second attempt
+    let mut fo = CompactEventBridge::new(CompactMode::Replace);
+    fo.record_replace_result(false);
+    assert!(fo.fail_open());
+    assert!(!fo.should_attempt_replace());
+    assert_eq!(fo.lhc_attempts(), 1);
+    assert!(matches!(
+        fo.choke_action(),
+        grok_lhc_host::CompactChokeAction::RunNative
+    ));
+
+    // both-fail shape is the same sticky machine (caller must not re-enter)
+    let mut both = CompactEventBridge::new(CompactMode::Replace);
+    both.record_replace_result(false);
+    assert!(!both.should_attempt_replace());
+}
+
+/// Shadow preview is counted once when invoked.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn chunk2_shadow_preview_is_counted() {
+    let _g = env_lock();
+    reset_compact_call_counters();
+    set_compact_mode_for_test(Some(CompactMode::Shadow));
+    let root = TempDir::new().unwrap();
+    let sid = "cert-chunk2-shadow";
+    let prev = std::env::var_os("GROK_LHC");
+    let prev_root = std::env::var_os("GROK_LHC_ROOT");
+    unsafe {
+        std::env::set_var("GROK_LHC", "1");
+        std::env::set_var("GROK_LHC_ROOT", root.path());
+    }
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+    // Give open time.
+    thread::sleep(Duration::from_millis(100));
+    shadow_preview_compact(sid).await;
+    assert_eq!(preview_call_count(), 1);
+    assert_eq!(replace_call_count(), 0);
+    set_compact_mode_for_test(None);
+    tokio::task::spawn_blocking(move || handle.shutdown_blocking())
+        .await
+        .unwrap();
+    wait_registry_gone(sid);
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC") },
+    }
+    match prev_root {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC_ROOT", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC_ROOT") },
+    }
+}
+
 /// Mid-tool-cycle native body is replaced wholesale (never hybrid).
 #[test]
 fn chunk2_mid_tool_cycle_all_lhc_or_native() {
-    use lhc::shared_tech::view::{
-        LlmRequestContext, LlmRequestContextMessage, LlmRequestContextPart,
-        LlmRequestContextPartType, LlmRequestContextRole,
-    };
     use xai_grok_sampling_types::ToolCall;
     let native = vec![
         ConversationItem::system("sys"),
@@ -1307,17 +2604,15 @@ fn chunk2_mid_tool_cycle_all_lhc_or_native() {
         }]),
     ];
     assert!(body_has_tool_cycle(&native[1..]));
-    let ctx = LlmRequestContext {
+    let view = SessionThreadView {
         thread_id: "t".into(),
-        messages: vec![LlmRequestContextMessage {
-            role: LlmRequestContextRole::User,
-            content: vec![LlmRequestContextPart {
-                type_: LlmRequestContextPartType::Text,
-                text: "run".into(),
-            }],
-        }],
+        entries: vec![view_user("run", "u")],
     };
-    match decide_substitution(&native, &ctx) {
+    match decide_substitution(
+        &native,
+        &view,
+        &SourceKindIndex::assume_sourced_users_are_prompts(&view),
+    ) {
         ServeDecision::Substitute { items } => {
             assert!(!body_has_tool_cycle(&items));
             assert!(matches!(&items[0], ConversationItem::System(_)));
@@ -1326,28 +2621,18 @@ fn chunk2_mid_tool_cycle_all_lhc_or_native() {
     }
 }
 
-/// Out-of-runtime watchdog: if the async guard body hangs synchronously,
-/// a peer thread trips before the tokio timeout can (closes Chunk 1 #2).
-#[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)]
-async fn chunk2_async_guard_out_of_runtime_watchdog() {
-    use std::sync::atomic::{AtomicBool, Ordering};
+/// Out-of-thread watchdog: suspect body runs on a worker thread; controller
+/// uses wall-clock recv_timeout. Limitation #2 remains documented as open in
+/// FORK.md until CI proves hang detection.
+#[test]
+fn chunk2_async_guard_out_of_thread_watchdog() {
     let _g = env_lock();
     let root = TempDir::new().unwrap();
     let sid = "cert-chunk2-watchdog";
-    let done = Arc::new(AtomicBool::new(false));
-    let done_w = Arc::clone(&done);
-    let watchdog = thread::spawn(move || {
-        for _ in 0..100 {
-            if done_w.load(Ordering::SeqCst) {
-                return;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        panic!("out-of-runtime watchdog: async tee guard hung (>5s)");
-    });
-    tokio::time::timeout(Duration::from_secs(10), async {
-        with_lhc_env(root.path(), || {
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let root_path = root.path().to_path_buf();
+    thread::spawn(move || {
+        with_lhc_env(&root_path, || {
             let tee = tee_chat_persistence(sid, "/tmp", &[], Box::new(NullChatPersistence), None);
             for _ in 0..100 {
                 if capture_active(sid) {
@@ -1359,9 +2644,441 @@ async fn chunk2_async_guard_out_of_runtime_watchdog() {
             drop(tee);
             wait_registry_gone(sid);
         });
-    })
-    .await
-    .expect("tee install blocked the current-thread runtime");
-    done.store(true, Ordering::SeqCst);
-    watchdog.join().expect("watchdog thread");
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("out-of-thread watchdog: tee path hung (>10s)");
+}
+
+// ── Chunk 2 G1: hook-4 equivalence instrumentation ───────────────────
+
+/// Text-only window: both divergence counters stay silent when native == served
+/// (substituted). Compared-turn counter advances.
+#[test]
+fn equiv_text_only_window_both_silent() {
+    let _g = env_lock();
+    reset_equivalence_counters();
+    let body = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user("hi"),
+        ConversationItem::assistant("hello"),
+    ];
+    let report = compare_serve_equivalence(&body, &body);
+    assert!(!report.structural_divergence);
+    assert!(!report.informational_divergence);
+    let obs = observe_serve_equivalence("equiv-text", Some(0), false, true, &body, &body);
+    assert!(obs.compared);
+    assert!(!obs.fallback);
+    assert_eq!(structural_hit_count(), 0);
+    assert_eq!(informational_hit_count(), 0);
+    assert_eq!(serve_compared_turns(), 1);
+    assert_eq!(serve_fallback_turns(), 0);
+    let snap = equivalence_snapshot();
+    assert_eq!(snap.turns_served_and_compared, 1);
+    assert_eq!(snap.turns_fallen_back, 0);
+    assert_eq!(snap.structural_divergences, 0);
+    assert_eq!(snap.informational_divergences, 0);
+}
+
+/// Tool-using window: structural fires; informational silent when projection matches.
+#[test]
+fn equiv_tool_window_structural_only() {
+    let _g = env_lock();
+    reset_equivalence_counters();
+    let native = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user("run"),
+        ConversationItem::Assistant(xai_grok_sampling_types::AssistantItem {
+            content: "calling".into(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: "{\"cmd\":\"ls\"}".into(),
+            }],
+            model_id: None,
+            model_fingerprint: None,
+            reasoning_effort: None,
+        }),
+        ConversationItem::tool_result("c1", "file_a"),
+    ];
+    // Served side already in LHC text shape (what faithful serving produces).
+    let served = project_conversation_canonical(&native)
+        .into_iter()
+        .map(|p| match p.role {
+            "system" => ConversationItem::system(p.text),
+            "user" => ConversationItem::user(p.text),
+            "assistant" => ConversationItem::assistant(p.text),
+            other => panic!("unexpected role {other}"),
+        })
+        .collect::<Vec<_>>();
+    let report = compare_serve_equivalence(&native, &served);
+    assert!(
+        report.structural_divergence,
+        "tool window must be structurally divergent"
+    );
+    assert!(
+        !report.informational_divergence,
+        "faithful tool projection must be informationally equal — got diff at {:?}",
+        report.first_info_diff_index
+    );
+    let obs = observe_serve_equivalence("equiv-tools", Some(1), false, true, &native, &served);
+    assert!(obs.compared);
+    assert_eq!(structural_hit_count(), 1);
+    assert_eq!(informational_hit_count(), 0);
+    assert_eq!(serve_compared_turns(), 1);
+}
+
+/// S3 — native provider-raw vs **real** `decide_substitution` translator path.
+/// Cosmetic pretty-vs-compact ⇒ both channels silent.
+#[test]
+fn equiv_tool_arg_cosmetic_formatting_silent_different_paths() {
+    let _g = env_lock();
+    reset_equivalence_counters();
+    const PRETTY: &str = "{\n  \"cmd\": \"ls\",\n  \"timeout_ms\": 5000\n}";
+    const COMPACT: &str = r#"{"cmd":"ls","timeout_ms":5000}"#;
+    assert_ne!(PRETTY, COMPACT);
+    let native = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user("run"),
+        ConversationItem::Assistant(xai_grok_sampling_types::AssistantItem {
+            content: "".into(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: PRETTY.into(),
+            }],
+            model_id: None,
+            model_fingerprint: None,
+            reasoning_effort: None,
+        }),
+    ];
+    let view = SessionThreadView {
+        thread_id: "t".into(),
+        entries: vec![
+            view_user("run", "u"),
+            view_assistant_tool("bash", COMPACT, "a"),
+        ],
+    };
+    let kinds = SourceKindIndex::assume_sourced_users_are_prompts(&view);
+    let served = match decide_substitution(&native, &view, &kinds) {
+        ServeDecision::Substitute { items } => items,
+        ServeDecision::Native { reason } => panic!("expected substitute, got {reason}"),
+    };
+    match served
+        .iter()
+        .find(|i| matches!(i, ConversationItem::Assistant(_)))
+    {
+        Some(ConversationItem::Assistant(a)) => {
+            assert!(
+                !a.tool_calls.is_empty(),
+                "translator must conserve tool_calls"
+            );
+            assert_eq!(a.tool_calls[0].arguments.as_ref(), COMPACT);
+        }
+        other => panic!("expected translated Assistant with tools, got {other:?}"),
+    }
+    let report = compare_serve_equivalence(&native, &served);
+    assert!(!report.structural_divergence);
+    assert!(
+        !report.informational_divergence,
+        "cosmetic JSON via translator must be silent — diff at {:?}",
+        report.first_info_diff_index
+    );
+    let obs = observe_serve_equivalence("equiv-tool-fmt", Some(4), true, true, &native, &served);
+    assert!(obs.compared);
+    assert_eq!(informational_hit_count(), 0);
+}
+
+/// S3 — real argument change: native vs translator-built substitute.
+#[test]
+fn equiv_tool_arg_real_change_informational_different_paths() {
+    let _g = env_lock();
+    reset_equivalence_counters();
+    let native = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user("run"),
+        ConversationItem::Assistant(xai_grok_sampling_types::AssistantItem {
+            content: "".into(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: r#"{"cmd":"ls"}"#.into(),
+            }],
+            model_id: None,
+            model_fingerprint: None,
+            reasoning_effort: None,
+        }),
+    ];
+    let view = SessionThreadView {
+        thread_id: "t".into(),
+        entries: vec![
+            view_user("run", "u"),
+            view_assistant_tool("bash", r#"{"cmd":"pwd"}"#, "a"),
+        ],
+    };
+    let kinds = SourceKindIndex::assume_sourced_users_are_prompts(&view);
+    let served = match decide_substitution(&native, &view, &kinds) {
+        ServeDecision::Substitute { items } => items,
+        ServeDecision::Native { reason } => panic!("expected substitute, got {reason}"),
+    };
+    let report = compare_serve_equivalence(&native, &served);
+    assert!(report.informational_divergence);
+    assert!(report.structural_divergence);
+    let obs = observe_serve_equivalence("equiv-tool-arg", Some(5), true, true, &native, &served);
+    assert!(obs.compared);
+    assert_eq!(informational_hit_count(), 1);
+}
+
+/// S3 — swapped tool name through translator registers structurally.
+#[test]
+fn equiv_swapped_tool_call_registers_structurally() {
+    let _g = env_lock();
+    reset_equivalence_counters();
+    let native = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user("run"),
+        ConversationItem::Assistant(xai_grok_sampling_types::AssistantItem {
+            content: "".into(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: r#"{"cmd":"ls"}"#.into(),
+            }],
+            model_id: None,
+            model_fingerprint: None,
+            reasoning_effort: None,
+        }),
+    ];
+    let view = SessionThreadView {
+        thread_id: "t".into(),
+        entries: vec![
+            view_user("run", "u"),
+            view_assistant_tool("python", r#"{"cmd":"ls"}"#, "a"),
+        ],
+    };
+    let kinds = SourceKindIndex::assume_sourced_users_are_prompts(&view);
+    let served = match decide_substitution(&native, &view, &kinds) {
+        ServeDecision::Substitute { items } => items,
+        ServeDecision::Native { reason } => panic!("expected substitute, got {reason}"),
+    };
+    let report = compare_serve_equivalence(&native, &served);
+    assert!(
+        report.structural_divergence,
+        "swapped tool name via translator must register structurally"
+    );
+    let obs = observe_serve_equivalence("equiv-tool-swap", Some(6), true, true, &native, &served);
+    assert!(obs.compared);
+    assert_eq!(structural_hit_count(), 1);
+}
+
+/// S2 — object key reorder silent (instrument sorted-key canonicalize).
+#[test]
+fn equiv_tool_arg_object_key_reorder_silent() {
+    let _g = env_lock();
+    reset_equivalence_counters();
+    let native = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user("run"),
+        ConversationItem::Assistant(xai_grok_sampling_types::AssistantItem {
+            content: "".into(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: r#"{"a":1,"b":2}"#.into(),
+            }],
+            model_id: None,
+            model_fingerprint: None,
+            reasoning_effort: None,
+        }),
+    ];
+    let view = SessionThreadView {
+        thread_id: "t".into(),
+        entries: vec![
+            view_user("run", "u"),
+            view_assistant_tool("bash", r#"{"b":2,"a":1}"#, "a"),
+        ],
+    };
+    let kinds = SourceKindIndex::assume_sourced_users_are_prompts(&view);
+    let served = match decide_substitution(&native, &view, &kinds) {
+        ServeDecision::Substitute { items } => items,
+        ServeDecision::Native { reason } => panic!("expected substitute, got {reason}"),
+    };
+    let report = compare_serve_equivalence(&native, &served);
+    assert!(!report.structural_divergence);
+    assert!(!report.informational_divergence);
+}
+
+/// S2 — array element reorder divergent.
+#[test]
+fn equiv_tool_arg_array_reorder_divergent() {
+    let _g = env_lock();
+    reset_equivalence_counters();
+    let native = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user("run"),
+        ConversationItem::Assistant(xai_grok_sampling_types::AssistantItem {
+            content: "".into(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: r#"{"xs":[1,2]}"#.into(),
+            }],
+            model_id: None,
+            model_fingerprint: None,
+            reasoning_effort: None,
+        }),
+    ];
+    let view = SessionThreadView {
+        thread_id: "t".into(),
+        entries: vec![
+            view_user("run", "u"),
+            view_assistant_tool("bash", r#"{"xs":[2,1]}"#, "a"),
+        ],
+    };
+    let kinds = SourceKindIndex::assume_sourced_users_are_prompts(&view);
+    let served = match decide_substitution(&native, &view, &kinds) {
+        ServeDecision::Substitute { items } => items,
+        ServeDecision::Native { reason } => panic!("expected substitute, got {reason}"),
+    };
+    let report = compare_serve_equivalence(&native, &served);
+    assert!(report.informational_divergence);
+    assert!(report.structural_divergence);
+}
+
+/// Informational counter fires on a real content mismatch (text-only window).
+#[test]
+fn equiv_informational_fires_on_content_mismatch() {
+    let _g = env_lock();
+    reset_equivalence_counters();
+    let native = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user("alpha"),
+    ];
+    let served = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user("beta"),
+    ];
+    let report = compare_serve_equivalence(&native, &served);
+    assert!(report.structural_divergence);
+    assert!(report.informational_divergence);
+    let obs = observe_serve_equivalence("equiv-mismatch", Some(2), true, true, &native, &served);
+    assert!(obs.compared);
+    assert_eq!(informational_hit_count(), 1);
+    assert_eq!(serve_compared_turns(), 1);
+}
+
+/// L4 — post-write-back native (collapsed bands) vs serving (N band items):
+/// structural may fire; informational must stay silent when band text matches.
+#[test]
+fn equiv_post_writeback_band_collapse_informational_silent() {
+    let _g = env_lock();
+    reset_equivalence_counters();
+    let (native_pre, writeback) = writeback_fixture();
+    let view = realistic_post_compact_view();
+    let kinds = realistic_kinds(&view);
+    let served = match decide_substitution(&native_pre, &view, &kinds) {
+        ServeDecision::Substitute { items } => items,
+        ServeDecision::Native { reason } => panic!("expected substitute, got {reason}"),
+    };
+    let report = compare_serve_equivalence(&writeback, &served);
+    assert!(
+        report.structural_divergence,
+        "collapsed vs N-band representation must remain structural"
+    );
+    assert!(
+        !report.informational_divergence,
+        "band collapse must not poison informational evidence — diff at {:?}",
+        report.first_info_diff_index
+    );
+    let obs = observe_serve_equivalence("equiv-wb-bands", Some(3), true, true, &writeback, &served);
+    assert!(obs.compared);
+    assert_eq!(informational_hit_count(), 0);
+    assert_eq!(serve_compared_turns(), 1);
+}
+
+/// Q3 — missing band vs write-back must fire informational (not just structural).
+/// Would fail if band collapse projected a constant token.
+#[test]
+fn equiv_band_collapse_missing_band_is_informational() {
+    let writeback = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user_meta(
+            "[context · brief]\nA\n\n[context · detailed]\nB\n\n[context · smooth]\nC",
+        ),
+        ConversationItem::user("live"),
+    ];
+    let served = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user_meta("[context · brief]\nA"),
+        ConversationItem::user_meta("[context · smooth]\nC"),
+        ConversationItem::user("live"),
+    ];
+    let report = compare_serve_equivalence(&writeback, &served);
+    assert!(
+        report.informational_divergence,
+        "missing band must register informational divergence"
+    );
+}
+
+/// Q3 — reordered bands must fire informational divergence.
+#[test]
+fn equiv_band_collapse_reordered_bands_is_informational() {
+    let writeback = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user_meta(
+            "[context · brief]\nA\n\n[context · detailed]\nB\n\n[context · smooth]\nC",
+        ),
+        ConversationItem::user("live"),
+    ];
+    let served = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user_meta("[context · detailed]\nB"),
+        ConversationItem::user_meta("[context · brief]\nA"),
+        ConversationItem::user_meta("[context · smooth]\nC"),
+        ConversationItem::user("live"),
+    ];
+    let report = compare_serve_equivalence(&writeback, &served);
+    assert!(
+        report.informational_divergence,
+        "reordered bands must register informational divergence"
+    );
+}
+
+/// K1 — fail-open must not count as compared / zero-divergence evidence.
+#[test]
+fn equiv_fail_open_turn_not_counted_as_compared() {
+    let _g = env_lock();
+    reset_equivalence_counters();
+    let body = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user("keep-native"),
+    ];
+    // Fail-open: served == native, but substituted=false.
+    let obs = observe_serve_equivalence("equiv-fallback", Some(0), false, false, &body, &body);
+    assert!(!obs.compared, "fail-open must not be a compared turn");
+    assert!(obs.fallback);
+    assert!(!obs.structural_divergence);
+    assert!(!obs.informational_divergence);
+    assert_eq!(
+        structural_hit_count(),
+        0,
+        "fail-open must not increment structural"
+    );
+    assert_eq!(
+        informational_hit_count(),
+        0,
+        "fail-open must not increment informational"
+    );
+    assert_eq!(
+        serve_compared_turns(),
+        0,
+        "fail-open must not be recorded as compared"
+    );
+    assert_eq!(serve_fallback_turns(), 1);
+    let snap = equivalence_snapshot();
+    assert_eq!(snap.turns_served_and_compared, 0);
+    assert_eq!(snap.turns_fallen_back, 1);
+    assert_eq!(snap.structural_divergences, 0);
+    assert_eq!(snap.informational_divergences, 0);
 }

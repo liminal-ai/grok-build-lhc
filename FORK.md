@@ -30,57 +30,108 @@ unchanged until enabled. Chunk 3 (product wiring / live cert) remains.
 
 | # | File | Lines | Purpose | Patch |
 |---|------|-------|---------|-------|
-| 1 | `crates/codegen/xai-grok-shell/Cargo.toml` | `LHC-HOOK 1/5` | dependency on `grok-lhc-host` | 0001 |
-| 2 | `crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs` | `LHC-HOOK 2/5` | wrap persistence in the LHC capture tee (+ inference sampler) | 0001 |
-| 3 | `crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs` | `LHC-HOOK 3/5` | model / thinking-level change tee | 0001 |
-| 4 | `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs` | `LHC-HOOK 4/5` | substitute LHC request context after `build_request` | 0001 |
-| 5 | `crates/codegen/xai-grok-shell/src/session/compaction.rs` | `LHC-HOOK 5/5` | compact bridge (shadow / replace) | 0001 |
-| — | root `Cargo.toml` | workspace-members entry `crates/lhc/grok-lhc-host` (no marker — auto-generated/sorted; asserted in `scripts/check-lhc-hooks.sh`) | adapter workspace membership | 0001 |
+| 1 | `crates/codegen/xai-grok-shell/Cargo.toml` | `LHC-HOOK 1/6` | dependency on `grok-lhc-host` | _(regen after commit)_ |
+| 2 | `crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs` | `LHC-HOOK 2/6` | wrap persistence in the LHC capture tee (+ inference sampler) | _(regen)_ |
+| 3 | `crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs` | `LHC-HOOK 3/6` | model / thinking-level change tee | _(regen)_ |
+| 4 | `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs` | `LHC-HOOK 4/6` | substitute LHC request context after `build_request` | _(regen)_ |
+| 5 | `crates/codegen/xai-grok-shell/src/session/compaction.rs` | `LHC-HOOK 5/6` | compact bridge decision (LHC I/O at writer choke) | _(regen)_ |
+| 6 | `crates/codegen/xai-grok-shell/src/session/mod.rs` | `LHC-HOOK 6/6` | `mod lhc_inference` declaration | _(regen)_ |
+| 6b | `crates/codegen/xai-grok-shell/src/session/lhc_inference.rs` | new file (shell-local LHC inference transport) | _(regen)_ |
+| — | root `Cargo.toml` | workspace-members entry `crates/lhc/grok-lhc-host` (no marker — auto-generated/sorted; asserted in `scripts/check-lhc-hooks.sh`) | adapter workspace membership | _(regen)_ |
 
 Rules: hooks are 1–5 line additive insertions marked
 `// LHC-HOOK <n>/<total>: <purpose>`; the sentinel total in
 `scripts/check-lhc-hooks.sh` and this table change in the same commit as any
-hook; each hook is regenerated into `patches/` in that same commit.
+hook; each hook is regenerated into `patches/` after commit (Lee). Patch
+`0001` currently covers only the Chunk 1 hooks — do not claim it covers 4–6.
 
 Carve-out (post-`cargo fmt` numstat vs `origin/main` / pre-hook tree):
 
 | Hook file | `git diff --numstat` |
 |---|---|
-| `spawn.rs` (hook 2) | `+24 / -3` |
+| `spawn.rs` (hook 2) | `+19 / -3` |
 | `model_switch.rs` (hook 3) | `+9 / -0` |
-| `turn.rs` (hook 4) | `+25 / -0` |
-| `compaction.rs` (hook 5) | `+46 / -0` |
+| `turn.rs` (hook 4) | `+48 / -0` |
+| `compaction.rs` (hook 5) | `+181 / -1` |
+| `mod.rs` (hook 6) | `+2 / -0` |
+| `lhc_inference.rs` (new) | `+222 / -0` |
+| `rewind_cross_compaction_tests.rs` (H3 regression) | `+224 / -0` |
 
-Hook 2 hoists `ChannelChatPersistence::new(...)` to a `let` and wraps with
-`tee_chat_persistence(..., sampler)`. Hook 3 forwards previous model /
-thinking level. Hook 4 substitutes LHC request context after `build_request`.
-Hook 5 bridges auto-compact (shadow preview / replace suppress). Counts above
-are the durable, CI-canonical figures; they exceed the nominal 1–5-line
-additive budget once rustfmt expands the call sites.
+Hook 2 wraps persistence with `tee_chat_persistence(..., sampler)`. Hook 3
+forwards previous model / thinking level. Hook 4 substitutes LHC request
+context after `build_request` (gated on `any_capture_active` then
+`capture_active` — no registry mutex when LHC is off) and runs
+**instrumented-redundant** equivalence observation (G1; see MAPPING.md).
+Hook 5 is the auto-compact / writer choke; Replace-mode write-back lands
+here via `replace_conversation_for_compaction`. Hook 6 declares the
+shell-local inference transport module.
+
+### Full-conversation consumers that ride native state (do not hook)
+
+After Replace write-back, native conversation **is** the LHC-compacted body,
+so these readers are expected to see the LHC view without dedicated hooks.
+Recorded so nobody rediscovers them as missing touchpoints:
+
+| Consumer | Location | Notes |
+|---|---|---|
+| `/btw` recap | `.../session/acp_session_impl/recap.rs` | Reads native conversation |
+| Memory flush | `.../session/acp_session_impl/memory_dream.rs` | Reads native conversation |
+
+**Chunk 3 live certification must:**
+
+1. Run an explicit `/btw` check and an explicit memory-flush check on a
+   **compacted** session, confirming both receive the LHC body and behave
+   coherently. If either misbehaves, reopen as its own decision.
+2. **G2:** capture the real body the shell write-back delivers from an
+   actual Replace compaction (item shapes, ordering, system prefix,
+   `prompt_index` markers) and diff it against the certification fixtures
+   in `grok-lhc-host` (`realistic_post_compact_ctx` / `writeback_fixture`).
+   Regenerate fixtures if the live body differs.
 
 Layer 3 of `scripts/check-lhc-hooks.sh` runs both `golden_smoke` and
 `certification` under `--features test-util` and asserts a nonzero test count
 for each.
 
-### Accepted limitations (Chunk 1 acceptance, orchestrator ruling)
+### Scheduled verification (not permanent acceptance)
 
-Two verifier findings were adjudicated as accepted rather than fixed. Both are
-test-sensitivity gaps, not product defects; both are recorded so a later
-maintainer does not mistake them for oversights.
+These are test-sensitivity / harness gaps, not closed product defects. Each
+has a **named Chunk 3 live-cert checkpoint**. Do not treat them as forever
+waived.
 
-1. **The hook-2 / hook-3 session-id coupling is verified by inspection, not by
-   a test.** If `model_switch.rs` ever passed a different id than `spawn.rs`
-   registered, every model change would be silently discarded and no test in
-   `grok-lhc-host` would fail. The coupling is a property of two call sites in
-   `xai-grok-shell`, so the adapter's own suite structurally cannot observe
-   it; a test would have to live in the core crate, i.e. a fourth core
-   touchpoint. Both ids are `session_id.0.as_ref()` / `session_info.id.0.as_ref()`
-   — the same ACP id — confirmed independently by both verifiers. **If you
-   ever change either hook's arguments, re-check this by hand.**
-2. **The async-convention guards catch panicking blocks, not silent ones.**
-   Closed in Chunk 2 by `chunk2_async_guard_out_of_runtime_watchdog`: a peer
-   thread panics if the tee install/drop path has not completed within 5s,
-   even when the current-thread runtime cannot advance a `tokio::time::timeout`.
+| Blind spot | What verifies it | Checkpoint |
+|---|---|---|
+| **Hook-2 / hook-3 session-id coupling** — today only by inspection (`session_id.0.as_ref()` at both sites). A mismatched id would silently drop model changes with no adapter-suite failure. | Live cert: drive a model/thinking change on a captured session and assert the change event lands in that session's LHC thread (proves the registered id matches the tee). Same checkpoint as write-back body capture. | **Chunk 3 live cert** (with G2) |
+| **Async guards catch panicking but not silent blocks** — `chunk2_async_guard_out_of_thread_watchdog` is the corrected attempt; treat as open until CI proves a hang fails fast. | Re-run / strengthen the out-of-thread watchdog under Chunk 3 CI; hang must fail the test within the watchdog budget. | **Chunk 3 live cert / CI** |
+| **G2 live write-back body harness** — fixtures today mirror the realistic post-compact *view* shape; end-to-end shell Replace write-back capture was deferred. | **Mandatory:** run an actual Replace compaction through the shell write-back path; capture item shapes, ordering, system prefix, and `prompt_index` markers; diff against `realistic_post_compact_view` / `writeback_fixture`. If the live body differs, **regenerate fixtures from the real body and re-run the gate**. | **Chunk 3 live cert** |
+| **Banded LHC-ahead crash window (shell kill)** — adapter half is covered by `writeback_crash_between_lhc_compact_and_native_replace_is_transient` (deterministic cbs + tight `ViewCompactParams` + multi-turn seed → typed bands → write-back retry idempotent). Remaining: live shell Replace choke kill **before** `replace_conversation_for_compaction`. | Live cert: kill at the shell choke; reopen old native; confirm same idempotency. | **Chunk 3 live cert** (shell kill only) |
+
+Also at that same Chunk 3 checkpoint: `/btw` + memory-flush on a compacted
+session (see full-conversation consumers above), and hook-4 equivalence
+informational divergence must stay zero (else first finding → Lee).
+
+### Obstruction (Lee) — banded LHC-ahead crash window — DISCHARGED (adapter)
+
+**Round 9 finding:** deterministic callbacks alone are **not** enough on the
+production choke (`LhcSession::compact` uses `params: None` + Mock sampler +
+short fixture → successful no-op, zero empty-source bands). Bands become
+reachable when the test drives the **public SDK** with all three of:
+
+1. `create_deterministic_inference_callbacks()`
+2. multi-turn seed (≥12 closed turns with enough tokens)
+3. tight `ViewCompactParams` (`lower_bound: Some(400.0)` + band percentages)
+
+**Adapter discharge:** certification
+`writeback_crash_between_lhc_compact_and_native_replace_is_transient` now
+does that, opens capture on the banded thread with an old native body
+(native replace never ran), write-back once + retry, asserts band summary
+text is not double-recorded. Probe:
+`n3_deterministic_callbacks_with_tight_params_can_emit_typed_bands`.
+
+**Still Chunk 3 (shell only):** kill the live Replace choke after LHC
+compact commits and **before** `replace_conversation_for_compaction`, then
+reopen the real host with old native and confirm the same idempotency.
+The production choke still uses `params: None`; live Replace must produce
+bands under real budgets for that kill test to be meaningful.
 
 ## Upstream model (read before your first sync)
 
@@ -140,5 +191,10 @@ Chunk 1 means the first real upstream sync already has a proven fallback.)
 - `GROK_LHC=1` or `true` enables capture at session spawn; unset / anything
   else leaves the host bit-identical (tee not installed).
 - `GROK_LHC_ROOT` overrides the LHC storage root (default `~/.lhc`) for tests.
-- `GROK_LHC_COMPACT=replace` (with `GROK_LHC` on) selects replace-mode compact;
-  otherwise compact is shadow when LHC is on.
+- `GROK_LHC_COMPACT=replace` alone does **not** enable Replace. Requires also
+  `GROK_LHC_COMPACT_EXPERIMENTAL=1`. Without it, mode stays Shadow.
+  When Replace is active, successful compact **writes back** into native
+  state (`replace_conversation_for_compaction`) — ruled architecture, not a
+  workaround (see `crates/lhc/grok-lhc-host/MAPPING.md`).
+- `GROK_LHC_INFERENCE_MODEL` selects a dedicated non-main model slug for LHC
+  ModelCall; unset → session model with refreshed credentials per call.

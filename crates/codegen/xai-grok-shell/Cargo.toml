@@ -130,7 +130,7 @@ xai-agent-lifecycle = { workspace = true }
 xai-interjection-core = { workspace = true }
 xai-grok-sandbox = { path = "../xai-grok-sandbox", default-features = false }
 xai-chat-state = { path = "../xai-chat-state" }
-# LHC-HOOK 1/5: dependency on grok-lhc-host adapter
+# LHC-HOOK 1/6: dependency on grok-lhc-host adapter
 grok-lhc-host = { path = "../../lhc/grok-lhc-host" }
 xai-grok-compaction = { path = "../../common/xai-grok-compaction" }
 xai-grok-sampler = { path = "../xai-grok-sampler" }

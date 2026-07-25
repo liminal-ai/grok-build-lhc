@@ -11,7 +11,7 @@ fail=0
 # Every core touchpoint carries a `LHC-HOOK <n>/<total>` marker. The
 # expected total lives here and in FORK.md's touchpoint inventory — update
 # BOTH in the same commit as any hook change.
-EXPECTED_HOOKS=5
+EXPECTED_HOOKS=6
 actual=$(grep -rl "LHC-HOOK" crates bin prod 2>/dev/null \
   | grep -v "^crates/lhc/" | xargs -r grep -o "LHC-HOOK [0-9]*/[0-9]*" | wc -l)
 if [ "$actual" -ne "$EXPECTED_HOOKS" ]; then
@@ -47,14 +47,40 @@ else
   fail=1
 fi
 
+# ── Layer 2b: formatting gates ─────────────────────────────────────────
+# Named acceptance gates. A tripwire that does not run fmt --check cannot
+# report on it (same blind spot that hid a red --lib suite until --lib
+# was added). Both invocations must stay here.
+if cargo fmt -p xai-grok-shell --check >/dev/null 2>&1; then
+  echo "ok fmt: xai-grok-shell --check"
+else
+  echo "TRIPWIRE fmt: cargo fmt -p xai-grok-shell --check failed"
+  cargo fmt -p xai-grok-shell --check 2>&1 | head -40
+  fail=1
+fi
+if cargo fmt --manifest-path crates/lhc/grok-lhc-host/Cargo.toml --check >/dev/null 2>&1; then
+  echo "ok fmt: grok-lhc-host --check"
+else
+  echo "TRIPWIRE fmt: cargo fmt --manifest-path crates/lhc/grok-lhc-host --check failed"
+  cargo fmt --manifest-path crates/lhc/grok-lhc-host/Cargo.toml --check 2>&1 | head -40
+  fail=1
+fi
+
 # ── Layer 3: golden smoke + certification ──────────────────────────────
 # Both integration binaries, with --features test-util so certification is
 # not silently skipped (A4). Assert a nonzero test count for each.
 run_lhc_test_bin() {
   local bin="$1"
   local label="$2"
+  # bin="--lib" selects the unit-test binary; anything else is an integration
+  # binary. The --lib arm exists because this script once ran only the
+  # integration binaries and reported ALL TRIPWIRES GREEN over a RED unit
+  # suite (Chunk 2 gate re-run) — unit tests in src/ were structurally
+  # invisible to the gate. Do not remove it.
+  local sel
+  if [ "$bin" = "--lib" ]; then sel=(--lib); else sel=(--test "$bin"); fi
   if out=$(cargo test -q --manifest-path crates/lhc/grok-lhc-host/Cargo.toml \
-      --features test-util --test "$bin" -- --nocapture 2>&1); then
+      --features test-util "${sel[@]}" -- --nocapture 2>&1); then
     n=$(printf '%s\n' "$out" | sed -n 's/.*running \([0-9][0-9]*\) tests.*/\1/p' | tail -1)
     if [ -z "$n" ] || [ "$n" -le 0 ]; then
       echo "$out" | tail -20
@@ -70,6 +96,7 @@ run_lhc_test_bin() {
 }
 
 if [ -d crates/lhc/grok-lhc-host/tests/goldens ]; then
+  run_lhc_test_bin --lib "unit (lib)" || fail=1
   run_lhc_test_bin golden_smoke "golden smoke" || fail=1
   run_lhc_test_bin certification "certification" || fail=1
 else
