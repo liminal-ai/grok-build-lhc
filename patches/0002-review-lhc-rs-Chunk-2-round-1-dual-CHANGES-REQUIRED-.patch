@@ -1,0 +1,408 @@
+From 9d7922adbdd0b95351fcae49fcc2f204bccd0eb7 Mon Sep 17 00:00:00 2001
+From: Lee Moore <lee.g.moore@gmail.com>
+Date: Sat, 25 Jul 2026 13:50:13 +0000
+Subject: [PATCH 2/4] =?UTF-8?q?review(lhc-rs):=20Chunk=202=20round=201=20?=
+ =?UTF-8?q?=E2=80=94=20dual=20CHANGES=20REQUIRED;=20two=20items=20escalate?=
+ =?UTF-8?q?d?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Both verifiers independently found the compaction bridge broken in ways a
+green suite (43 certification + 5 golden, tripwire 5/5) could not see.
+
+Dispatched now (independent of Lee's ruling): E0 two undeclared core
+touchpoints (lhc_inference.rs + session/mod.rs:331 — unmarked, absent from
+FORK.md's 'every owned core line'; placement ruled acceptable, the silence was
+not; renumber to n/6); E1 replace_compact runs twice per logical event and the
+bridge's fail-open verdict is silently reverted by run_compact_only, so native
+never compacts after announcing it would; E2 disabled path clones the whole
+conversation and emits a WARN every turn for users who never enabled LHC;
+E3 inference uses the primary model not a dedicated one, snapshots credentials
+at spawn (native compaction re-resolves because tokens expire), has no
+cancellation, discards all LHC target fields, and string-matches errors;
+E4 hook 4 awaits the capture worker with no timeout on the request path;
+E5 tests asserting constants against themselves — including the ONLY
+prompt_index test, while translated messages are built with
+ConversationItem::user which carries no prompt_index at all;
+E6 no test invokes either compact path; E7 fmt red.
+
+ESCALATED to Lee (stop line 2 — both need new core touchpoints or move a host
+contract, neither is decide-and-proceed):
+1. Serving coverage: /btw recap sends 'the parent session's full context' as
+   an independent request bypassing hook 4, as does memory-flush. Verified in
+   recap.rs:9,36,108. Partial serving diverges intermittently.
+2. Replace-mode accounting: hook 5 suppresses the native writer, which was the
+   only thing that ever lowered total_tokens — so the threshold stays tripped,
+   LHC compacts every turn forever, /context climbs past 100%, and hook 4's
+   fail-open path sends an oversized native body. The two hooks are
+   individually defensible and jointly broken.
+
+Replace mode is to be treated as unreachable pending that ruling.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ crates/codegen/xai-grok-shell/Cargo.toml      |   2 +-
+ .../src/agent/handlers/model_switch.rs        |   2 +-
+ .../src/session/acp_session_impl/spawn.rs     |  16 +-
+ .../src/session/acp_session_impl/turn.rs      |  25 +++
+ .../xai-grok-shell/src/session/compaction.rs  |  46 ++++++
+ .../src/session/lhc_inference.rs              | 146 ++++++++++++++++++
+ .../codegen/xai-grok-shell/src/session/mod.rs |   1 +
+ 7 files changed, 235 insertions(+), 3 deletions(-)
+ create mode 100644 crates/codegen/xai-grok-shell/src/session/lhc_inference.rs
+
+diff --git a/crates/codegen/xai-grok-shell/Cargo.toml b/crates/codegen/xai-grok-shell/Cargo.toml
+index a064f20..766c129 100644
+--- a/crates/codegen/xai-grok-shell/Cargo.toml
++++ b/crates/codegen/xai-grok-shell/Cargo.toml
+@@ -130,7 +130,7 @@ xai-agent-lifecycle = { workspace = true }
+ xai-interjection-core = { workspace = true }
+ xai-grok-sandbox = { path = "../xai-grok-sandbox", default-features = false }
+ xai-chat-state = { path = "../xai-chat-state" }
+-# LHC-HOOK 1/3: dependency on grok-lhc-host adapter
++# LHC-HOOK 1/5: dependency on grok-lhc-host adapter
+ grok-lhc-host = { path = "../../lhc/grok-lhc-host" }
+ xai-grok-compaction = { path = "../../common/xai-grok-compaction" }
+ xai-grok-sampler = { path = "../xai-grok-sampler" }
+diff --git a/crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs b/crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs
+index c7d8e02..c2354e8 100644
+--- a/crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs
++++ b/crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs
+@@ -230,7 +230,7 @@ pub(crate) async fn apply(
+         model_id.0.as_ref(),
+         applied_effort.map(|eff| eff.to_string()),
+     );
+-    // LHC-HOOK 3/3: model / thinking-level change tee
++    // LHC-HOOK 3/5: model / thinking-level change tee
+     grok_lhc_host::capture_model_or_thinking_change(
+         session_id.0.as_ref(),
+         previous_model_id.as_ref(),
+diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs
+index cc6187f..6fcd696 100644
+--- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs
++++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs
+@@ -441,12 +441,26 @@ pub(crate) async fn spawn_session_actor(
+         conversation.clone(),
+         chat_state_sampling_config,
+         actor_pruning_config,
+-        // LHC-HOOK 2/3: wrap persistence in the LHC capture tee
++        // LHC-HOOK 2/5: wrap persistence in the LHC capture tee (+ inference sampler)
+         grok_lhc_host::tee_chat_persistence(
+             session_info.id.0.as_ref(),
+             session_info.cwd.as_ref(),
+             &conversation,
+             chat_persistence,
++            match crate::session::lhc_inference::ShellLhcInferenceSampler::from_config(
++                sampling_config.clone(),
++                session_info.id.0.to_string(),
++                std::time::Duration::from_secs(60),
++            ) {
++                Ok(s) => Some(s.into_arc()),
++                Err(err) => {
++                    tracing::warn!(
++                        %err,
++                        "LHC: inference sampler unavailable; capture continues without ModelCall"
++                    );
++                    None
++                }
++            },
+         ),
+         chat_state_event_tx,
+         tokio_util::sync::CancellationToken::new(),
+diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
+index 6c02f44..1c3821f 100644
+--- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
++++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
+@@ -2117,7 +2117,32 @@ impl SessionActor {
+                 })),
+             );
+             let mut request = request;
++            // LHC-HOOK 4/5: substitute LHC request context (all-LHC or all-native)
++            {
++                let native_items = std::mem::take(&mut request.items);
++                let tools_before = request.tools.len();
++                let decision = grok_lhc_host::serve_request_context(
++                    self.session_info.id.0.as_ref(),
++                    native_items.clone(),
++                )
++                .await;
++                let (items, substituted) =
++                    grok_lhc_host::apply_serve_decision(native_items, decision);
++                request.items = items;
++                debug_assert_eq!(
++                    request.tools.len(),
++                    tools_before,
++                    "LHC serving must not alter tools"
++                );
++                if substituted {
++                    tracing::debug!(
++                        session_id = %self.session_info.id,
++                        "LHC serving: substituted conversation body"
++                    );
++                }
++            }
+             request.x_grok_session_id = Some(self.session_info.id.to_string());
++            // prompt_index is actor state — stamped after substitution (preserved).
+             request.x_grok_turn_idx =
+                 Some(self.chat_state_handle.get_prompt_index().await.to_string());
+             request.x_grok_agent_id = Some(xai_grok_telemetry::id::agent_id());
+diff --git a/crates/codegen/xai-grok-shell/src/session/compaction.rs b/crates/codegen/xai-grok-shell/src/session/compaction.rs
+index 3fac8e5..ca267b7 100644
+--- a/crates/codegen/xai-grok-shell/src/session/compaction.rs
++++ b/crates/codegen/xai-grok-shell/src/session/compaction.rs
+@@ -601,6 +601,9 @@ impl SessionActor {
+         self: &Arc<Self>,
+         user_context: Option<String>,
+     ) -> Result<(), acp::Error> {
++        if self.lhc_replace_suppresses_native_writer().await {
++            return Ok(());
++        }
+         self.record_compaction_variant();
+         let total_tokens = self.chat_state_handle.get_total_tokens().await;
+         tracing::Span::current().record("pre_tokens", total_tokens as i64);
+@@ -1838,6 +1841,35 @@ impl SessionActor {
+         let estimated_total = self.chat_state_handle.get_estimated_total_tokens().await;
+         estimated_total > context_window
+     }
++    /// LHC compact bridge (hook 5): shadow previews; replace suppresses native.
++    /// Returns `true` when the native writer may proceed.
++    async fn lhc_compact_bridge_allow_native(&self) -> bool {
++        match grok_lhc_host::resolve_compact_mode() {
++            grok_lhc_host::CompactMode::Off => true,
++            grok_lhc_host::CompactMode::Shadow => {
++                grok_lhc_host::shadow_preview_compact(self.session_info.id.0.as_ref()).await;
++                true
++            }
++            grok_lhc_host::CompactMode::Replace => {
++                if grok_lhc_host::replace_compact(self.session_info.id.0.as_ref()).await {
++                    false
++                } else {
++                    // Fail-open: native resumes.
++                    true
++                }
++            }
++        }
++    }
++
++    /// Choke point for every native compact writer (auto, preflight, manual,
++    /// model-switch, error-recovery). Replace mode must not hybrid-write.
++    async fn lhc_replace_suppresses_native_writer(&self) -> bool {
++        matches!(
++            grok_lhc_host::resolve_compact_mode(),
++            grok_lhc_host::CompactMode::Replace
++        ) && grok_lhc_host::replace_compact(self.session_info.id.0.as_ref()).await
++    }
++
+     /// Pre-sampling compaction check. Uses `get_estimated_total_tokens()`
+     /// (exact prior count + byte-estimate of items since last response) so
+     /// tool results are accounted for. Returns `None` when `is_flushing`.
+@@ -1883,6 +1915,9 @@ impl SessionActor {
+                 "Forced auto-compact trigger (debug): model={model}, \
+                  {percentage}% full ({estimated_total}/{cw} tokens)",
+             );
++            if !self.lhc_compact_bridge_allow_native().await {
++                return None;
++            }
+             return Some(AutoCompactTriggerInfo {
+                 tokens_used: estimated_total,
+                 context_window: cw,
+@@ -1897,6 +1932,10 @@ impl SessionActor {
+                 trigger_info.tokens_used,
+                 trigger_info.context_window,
+             );
++            // LHC-HOOK 5/5: compact bridge — shadow previews; replace suppresses native
++            if !self.lhc_compact_bridge_allow_native().await {
++                return None;
++            }
+             return Some(trigger_info);
+         }
+         None
+@@ -1969,6 +2008,10 @@ impl SessionActor {
+             cfg.context_window.get(),
+             trigger_info.percentage,
+         );
++        // Same compact bridge as pre-sampling (hook 5) — never hybrid writers.
++        if !self.lhc_compact_bridge_allow_native().await {
++            return Ok(());
++        }
+         if let Err(e) = self.run_compact_only(trigger_info).await {
+             tracing::error!(error = %e, "Model-switch compaction failed");
+             if Self::is_auth_compact_error(&e) {
+@@ -2008,6 +2051,9 @@ impl SessionActor {
+         self: &Arc<Self>,
+         trigger_info: AutoCompactTriggerInfo,
+     ) -> Result<(), acp::Error> {
++        if self.lhc_replace_suppresses_native_writer().await {
++            return Ok(());
++        }
+         use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
+         self.record_compaction_variant();
+         let tokens_before = self.chat_state_handle.get_total_tokens().await;
+diff --git a/crates/codegen/xai-grok-shell/src/session/lhc_inference.rs b/crates/codegen/xai-grok-shell/src/session/lhc_inference.rs
+new file mode 100644
+index 0000000..4c2945d
+--- /dev/null
++++ b/crates/codegen/xai-grok-shell/src/session/lhc_inference.rs
+@@ -0,0 +1,146 @@
++//! Shell-side [`grok_lhc_host::LhcInferenceSampler`] — dedicated non-main model.
++//!
++//! Mirrors the compaction transport shape (`ShellCompactionSampler` /
++//! `generate_session_compact`): builds a short conversation and collects a
++//! completion. Runs on the session's aux/compaction model identity when
++//! available; falls back to the primary model slug with a distinct req id.
++
++use std::sync::Arc;
++use std::time::Duration;
++
++use grok_lhc_host::{
++    InferenceRequestMessage, InferenceRequestRole, LhcInferenceError, LhcInferenceErrorKind,
++    LhcInferenceFuture, LhcInferenceOp, LhcInferenceSample, LhcInferenceSampler,
++};
++use xai_grok_sampling_types::{ConversationItem, ConversationRequest};
++
++use crate::sampling::Client as OaiCompatClient;
++use crate::sampling::SamplerConfig;
++
++/// Inference sampler wired at LHC tee/open (hook 2).
++pub struct ShellLhcInferenceSampler {
++    client: OaiCompatClient,
++    model: String,
++    session_id: String,
++    timeout: Duration,
++}
++
++impl ShellLhcInferenceSampler {
++    pub fn new(
++        client: OaiCompatClient,
++        model: String,
++        session_id: String,
++        timeout: Duration,
++    ) -> Self {
++        Self {
++            client,
++            model,
++            session_id,
++            timeout,
++        }
++    }
++
++    /// Build from a sampler config (dedicated non-main / session model).
++    pub fn from_config(
++        config: SamplerConfig,
++        session_id: impl Into<String>,
++        timeout: Duration,
++    ) -> Result<Self, String> {
++        let model = config.model.clone();
++        let client = OaiCompatClient::new(config).map_err(|e| e.to_string())?;
++        Ok(Self::new(client, model, session_id.into(), timeout))
++    }
++
++    pub fn into_arc(self) -> Arc<dyn LhcInferenceSampler> {
++        Arc::new(self)
++    }
++}
++
++impl LhcInferenceSampler for ShellLhcInferenceSampler {
++    fn sample(&self, op: LhcInferenceOp, user_text: String) -> LhcInferenceFuture {
++        let client = self.client.clone();
++        let model = self.model.clone();
++        let session_id = self.session_id.clone();
++        let timeout = self.timeout;
++        let label = op.as_prompt_label().to_string();
++        Box::pin(async move {
++            let system = format!(
++                "You are a Grok Build helper performing `{label}` for long-horizon context. \
++                 Reply with only the transformed text, no preamble."
++            );
++            let request_messages = vec![
++                InferenceRequestMessage {
++                    role: InferenceRequestRole::System,
++                    content: system.clone(),
++                },
++                InferenceRequestMessage {
++                    role: InferenceRequestRole::User,
++                    content: user_text.clone(),
++                },
++            ];
++            let request = ConversationRequest {
++                items: vec![
++                    ConversationItem::system(system),
++                    ConversationItem::user(user_text),
++                ],
++                tools: vec![],
++                hosted_tools: vec![],
++                tool_choice: None,
++                model: Some(model.clone()),
++                temperature: Some(0.0),
++                max_output_tokens: Some(2048),
++                top_p: None,
++                x_grok_conv_id: Some(format!("lhc-inf-{session_id}")),
++                x_grok_req_id: Some(format!("xai-lhc-{}-{}", label, uuid::Uuid::new_v4())),
++                x_grok_session_id: Some(session_id),
++                x_grok_turn_idx: None,
++                x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
++                x_grok_deployment_id: None,
++                x_grok_user_id: None,
++                trace: None,
++                prompt_cache_key: None,
++                reasoning_effort: None,
++                json_schema: None,
++            };
++            let fut = client.conversation_collect(request);
++            match tokio::time::timeout(timeout, fut).await {
++                Ok(Ok(response)) => {
++                    let text = response.assistant_text();
++                    if text.trim().is_empty() {
++                        return Err(LhcInferenceError {
++                            kind: LhcInferenceErrorKind::Refusal,
++                            detail: "empty assistant text".into(),
++                            request_messages: Some(request_messages),
++                        });
++                    }
++                    Ok(LhcInferenceSample {
++                        text,
++                        model,
++                        prompt_label: label,
++                        request_messages,
++                    })
++                }
++                Ok(Err(err)) => {
++                    let detail = err.to_string();
++                    let kind = if detail.contains("401") || detail.contains("403") {
++                        LhcInferenceErrorKind::Refusal
++                    } else if detail.to_lowercase().contains("cancel") {
++                        LhcInferenceErrorKind::Cancelled
++                    } else {
++                        LhcInferenceErrorKind::Transport
++                    };
++                    Err(LhcInferenceError {
++                        kind,
++                        detail,
++                        request_messages: Some(request_messages),
++                    })
++                }
++                Err(_) => Err(LhcInferenceError {
++                    kind: LhcInferenceErrorKind::Timeout,
++                    detail: format!("inference timed out after {timeout:?}"),
++                    request_messages: Some(request_messages),
++                }),
++            }
++        })
++    }
++}
+diff --git a/crates/codegen/xai-grok-shell/src/session/mod.rs b/crates/codegen/xai-grok-shell/src/session/mod.rs
+index 2ec442a..a2e7095 100644
+--- a/crates/codegen/xai-grok-shell/src/session/mod.rs
++++ b/crates/codegen/xai-grok-shell/src/session/mod.rs
+@@ -328,6 +328,7 @@ pub mod helpers;
+ pub(crate) mod image_describe;
+ pub(crate) mod image_normalize;
+ pub mod inference_metrics;
++pub(crate) mod lhc_inference;
+ pub use xai_grok_shared::session::info;
+ pub mod managed_mcp;
+ pub(crate) mod mcp_descriptors;
+-- 
+2.43.0
+
