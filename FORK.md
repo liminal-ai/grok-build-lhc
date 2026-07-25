@@ -31,10 +31,10 @@ remain.
 
 | # | File | Lines | Purpose | Patch |
 |---|------|-------|---------|-------|
-| 1 | `crates/codegen/xai-grok-shell/Cargo.toml` | `LHC-HOOK 1/3` | dependency on `grok-lhc-host` | pending regen |
-| 2 | `crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs` | `LHC-HOOK 2/3` | wrap persistence in the LHC capture tee | pending regen |
-| 3 | `crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs` | `LHC-HOOK 3/3` | model / thinking-level change tee | pending regen |
-| — | root `Cargo.toml` | workspace-members entry `crates/lhc/grok-lhc-host` (no marker — auto-generated/sorted; asserted in `scripts/check-lhc-hooks.sh`) | adapter workspace membership | pending regen |
+| 1 | `crates/codegen/xai-grok-shell/Cargo.toml` | `LHC-HOOK 1/3` | dependency on `grok-lhc-host` | 0001 |
+| 2 | `crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs` | `LHC-HOOK 2/3` | wrap persistence in the LHC capture tee | 0001 |
+| 3 | `crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs` | `LHC-HOOK 3/3` | model / thinking-level change tee | 0001 |
+| — | root `Cargo.toml` | workspace-members entry `crates/lhc/grok-lhc-host` (no marker — auto-generated/sorted; asserted in `scripts/check-lhc-hooks.sh`) | adapter workspace membership | 0001 |
 
 Rules: hooks are 1–5 line additive insertions marked
 `// LHC-HOOK <n>/<total>: <purpose>`; the sentinel total in
