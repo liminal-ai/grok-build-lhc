@@ -1,0 +1,193 @@
+[
+  {
+    "eventKind": "runtime_note",
+    "idempotencyKey": "grok:golden-session:g0:b04f5bf4d6b98b499f63544a074aabe0ae8af19b26f71bae7e96c05e85e1d93b:0:runtime_note",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "text": "be helpful"
+    }
+  },
+  {
+    "eventKind": "user_prompt",
+    "idempotencyKey": "grok:golden-session:g0:3387020f39b36151db06222da2f5325bd8adb83357d70736d7311f8baa32051d:0:user_prompt",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "text": "hello world"
+    }
+  },
+  {
+    "eventKind": "user_prompt",
+    "idempotencyKey": "grok:golden-session:g0:c80ee1e68bc0f579024451869b34597a5f03ff78fd20a545abac45d4a011df49:0:user_prompt",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "text": "see attached\n[image:https://example.com/a.png]"
+    }
+  },
+  {
+    "eventKind": "runtime_note",
+    "idempotencyKey": "grok:golden-session:g0:a0ba029dafb7b1003591cd5ff16d909249b0be93cf322fbf6b7442c63446e873:0:runtime_note",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "text": "continue"
+    }
+  },
+  {
+    "eventKind": "turn_end",
+    "idempotencyKey": "grok:golden-session:g0:0b80ca6e89b75152ab4acfb69eb19a17f285c00effafb7fb154ef9ba06161500:0:turn_end:pre_synthetic",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {}
+  },
+  {
+    "eventKind": "runtime_note",
+    "idempotencyKey": "grok:golden-session:g0:0b80ca6e89b75152ab4acfb69eb19a17f285c00effafb7fb154ef9ba06161500:0:runtime_note",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "text": "task done"
+    }
+  },
+  {
+    "eventKind": "assistant_thinking",
+    "idempotencyKey": "grok:golden-session:g0:a102ee0d8db200a0222e405c1519726b3fb8418bc0c0373903fc4ef439a08b3c:0:assistant_thinking",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "text": "pondering"
+    }
+  },
+  {
+    "eventKind": "assistant_text",
+    "idempotencyKey": "grok:golden-session:g0:5d8dd1fc69ee26411145a3c312cf5402c22caaff4f9abe2c66413f46f9671a12:0:assistant_text",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "text": "calling tool"
+    }
+  },
+  {
+    "eventKind": "tool_call",
+    "idempotencyKey": "grok:golden-session:g0:5d8dd1fc69ee26411145a3c312cf5402c22caaff4f9abe2c66413f46f9671a12:0:tool_call:call-1",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "toolCallId": "call-1",
+      "toolName": "read_file",
+      "arguments": {
+        "path": "a.txt"
+      }
+    }
+  },
+  {
+    "eventKind": "tool_result",
+    "idempotencyKey": "grok:golden-session:g0:8a66e47a581806bf9173dcbd8cea2622b5d4ae0b773c5d86e2c1b3fc730c5b62:0:tool_result:call-1",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "toolCallId": "call-1",
+      "content": "file contents"
+    }
+  },
+  {
+    "eventKind": "tool_call",
+    "idempotencyKey": "grok:golden-session:g0:c0ca9d650780b3e6fd17218041f12a653acf2d126b1129d287bae307d174e52a:0:tool_call:ws_golden_1",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "toolCallId": "ws_golden_1",
+      "toolName": "web_search",
+      "arguments": {
+        "type": "search",
+        "query": "capybara",
+        "sources": []
+      }
+    }
+  },
+  {
+    "eventKind": "tool_result",
+    "idempotencyKey": "grok:golden-session:g0:c0ca9d650780b3e6fd17218041f12a653acf2d126b1129d287bae307d174e52a:0:tool_result:ws_golden_1",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "toolCallId": "ws_golden_1",
+      "content": "{\"status\":\"Completed\",\"action\":{\"type\":\"search\",\"query\":\"capybara\",\"sources\":[]}}"
+    }
+  },
+  {
+    "eventKind": "tool_call",
+    "idempotencyKey": "grok:golden-session:g0:eec7ff6b1884698f8e14d3a4d63b3378ec56be0839c31b39d7c9c4e9b2a5e256:0:tool_call:xs_golden_1",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "toolCallId": "xs_golden_1",
+      "toolName": "x_search",
+      "arguments": {
+        "input": "from:xai"
+      }
+    }
+  },
+  {
+    "eventKind": "tool_result",
+    "idempotencyKey": "grok:golden-session:g0:eec7ff6b1884698f8e14d3a4d63b3378ec56be0839c31b39d7c9c4e9b2a5e256:0:tool_result:xs_golden_1",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "toolCallId": "xs_golden_1",
+      "content": "{\"status\":\"server_executed\",\"callId\":\"call_xs_1\",\"input\":\"from:xai\"}"
+    }
+  },
+  {
+    "eventKind": "tool_call",
+    "idempotencyKey": "grok:golden-session:g0:44b205e770bdfc529c1e83ce67432a76729113b0bacc37005de6e4ee28b8c162:0:tool_call:ci_golden_1",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "toolCallId": "ci_golden_1",
+      "toolName": "code_interpreter",
+      "arguments": {
+        "code": "print(1+1)",
+        "containerId": "ctr_1"
+      }
+    }
+  },
+  {
+    "eventKind": "tool_result",
+    "idempotencyKey": "grok:golden-session:g0:44b205e770bdfc529c1e83ce67432a76729113b0bacc37005de6e4ee28b8c162:0:tool_result:ci_golden_1",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "toolCallId": "ci_golden_1",
+      "content": "{\"status\":\"Completed\",\"outputs\":[{\"type\":\"logs\",\"logs\":\"2\\n\"}]}",
+      "isError": false
+    }
+  },
+  {
+    "eventKind": "assistant_text",
+    "idempotencyKey": "grok:golden-session:g0:f49001089384c398279e27f766a1a98293c75021cb774db712659e318869ffa8:0:assistant_text",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "text": "done"
+    }
+  },
+  {
+    "eventKind": "turn_end",
+    "idempotencyKey": "grok:golden-session:g0:f49001089384c398279e27f766a1a98293c75021cb774db712659e318869ffa8:0:turn_end",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {}
+  },
+  {
+    "eventKind": "runtime_note",
+    "idempotencyKey": "grok:golden-session:g0:6f684dd91f09e667a34b3cf16c91afe1bb7d502bd4f14b979896d9f766a74d1c:0:runtime_note",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "text": "/tmp/moved"
+    }
+  }
+]

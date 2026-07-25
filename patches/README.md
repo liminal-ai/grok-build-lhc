@@ -10,6 +10,9 @@ is not guaranteed): fresh clone of new upstream -> re-add `crates/lhc/` ->
 `git am patches/*.patch` -> `scripts/check-lhc-hooks.sh`. The full drill is
 in /FORK.md.
 
-Series (none yet — Chunk 0 makes zero core touches):
-- 0001 (lands with Chunk 1): root Cargo.toml workspace-members entry for
-  `crates/lhc/grok-lhc-host` + the persistence-tee hook.
+Series (Chunk 1 — **patches pending regeneration** after the orchestrator
+commits; run `git format-patch` per FORK.md / this note):
+- 0001: root `Cargo.toml` workspace-members entry for
+  `crates/lhc/grok-lhc-host` + shell `Cargo.toml` dependency hook (1/3)
+- 0002: persistence-tee hook in `spawn.rs` (2/3)
+- 0003: model/thinking-level change tee in `model_switch.rs` (3/3)

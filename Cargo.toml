@@ -81,6 +81,7 @@ members = [
     "crates/common/xai-tool-runtime",
     "crates/common/xai-tool-types",
     "crates/common/xai-tracing",
+    "crates/lhc/grok-lhc-host",
     "prod/mc/cli-chat-proxy-types",
     "third_party/dagre_rust",
     "third_party/graphlib_rust",

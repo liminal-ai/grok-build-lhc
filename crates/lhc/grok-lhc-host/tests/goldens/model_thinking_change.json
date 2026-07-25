@@ -1,0 +1,22 @@
+[
+  {
+    "eventKind": "model_change",
+    "idempotencyKey": "grok:golden-session:model_change:0:model-a:model-b",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "previousModel": "model-a",
+      "newModel": "model-b"
+    }
+  },
+  {
+    "eventKind": "thinking_level_change",
+    "idempotencyKey": "grok:golden-session:thinking_level_change:1:none:high",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "previousLevel": "none",
+      "newLevel": "high"
+    }
+  }
+]

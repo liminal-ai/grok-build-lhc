@@ -11,7 +11,7 @@ fail=0
 # Every core touchpoint carries a `LHC-HOOK <n>/<total>` marker. The
 # expected total lives here and in FORK.md's touchpoint inventory — update
 # BOTH in the same commit as any hook change.
-EXPECTED_HOOKS=0
+EXPECTED_HOOKS=3
 actual=$(grep -rl "LHC-HOOK" crates bin prod 2>/dev/null \
   | grep -v "^crates/lhc/" | xargs -r grep -o "LHC-HOOK [0-9]*/[0-9]*" | wc -l)
 if [ "$actual" -ne "$EXPECTED_HOOKS" ]; then
@@ -20,6 +20,16 @@ if [ "$actual" -ne "$EXPECTED_HOOKS" ]; then
   fail=1
 else
   echo "ok sentinel: $actual/$EXPECTED_HOOKS LHC-HOOK markers"
+fi
+
+# Root Cargo.toml is auto-generated/sorted — no LHC-HOOK comment allowed.
+# Dedicated named assertion for the workspace-members entry (FORK.md).
+if grep -q '"crates/lhc/grok-lhc-host"' Cargo.toml; then
+  echo "ok workspace-member: crates/lhc/grok-lhc-host"
+else
+  echo "TRIPWIRE workspace-member: missing crates/lhc/grok-lhc-host in root Cargo.toml"
+  echo "  Re-add in sort order (after crates/common/*, before prod/*). See FORK.md."
+  fail=1
 fi
 
 # ── Layer 2: compile ───────────────────────────────────────────────────
@@ -37,16 +47,31 @@ else
   fail=1
 fi
 
-# ── Layer 3: golden smoke ──────────────────────────────────────────────
-# Capture/rebuild golden transcripts are a Chunk 1 certification artifact;
-# until they exist this layer reports SKIP loudly rather than passing silently.
-if [ -d crates/lhc/grok-lhc-host/tests/goldens ]; then
-  if cargo test -q --manifest-path crates/lhc/grok-lhc-host/Cargo.toml 2>&1 | tail -3; then
-    echo "ok golden smoke"
-  else
-    echo "TRIPWIRE golden smoke: capture/rebuild goldens failed"
-    fail=1
+# ── Layer 3: golden smoke + certification ──────────────────────────────
+# Both integration binaries, with --features test-util so certification is
+# not silently skipped (A4). Assert a nonzero test count for each.
+run_lhc_test_bin() {
+  local bin="$1"
+  local label="$2"
+  if out=$(cargo test -q --manifest-path crates/lhc/grok-lhc-host/Cargo.toml \
+      --features test-util --test "$bin" -- --nocapture 2>&1); then
+    n=$(printf '%s\n' "$out" | sed -n 's/.*running \([0-9][0-9]*\) tests.*/\1/p' | tail -1)
+    if [ -z "$n" ] || [ "$n" -le 0 ]; then
+      echo "$out" | tail -20
+      echo "TRIPWIRE $label: expected running N tests with N>0, got '${n:-none}'"
+      return 1
+    fi
+    echo "ok $label: running $n tests"
+    return 0
   fi
+  echo "$out" | tail -20
+  echo "TRIPWIRE $label: failed"
+  return 1
+}
+
+if [ -d crates/lhc/grok-lhc-host/tests/goldens ]; then
+  run_lhc_test_bin golden_smoke "golden smoke" || fail=1
+  run_lhc_test_bin certification "certification" || fail=1
 else
   echo "SKIP golden smoke: no goldens yet (armed by Chunk 1 certification)"
 fi

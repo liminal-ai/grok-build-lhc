@@ -434,13 +434,20 @@ pub(crate) async fn spawn_session_actor(
         hard_clear_age_turns: session_pruning_config.hard_clear_age_turns,
     };
     let (chat_state_event_tx, chat_state_event_rx) = mpsc::unbounded_channel();
+    let chat_persistence = Box::new(super::chat_persistence::ChannelChatPersistence::new(
+        persistence.tx.clone(),
+    ));
     let chat_state_handle = xai_chat_state::ChatStateActor::spawn_with_pruning(
         conversation.clone(),
         chat_state_sampling_config,
         actor_pruning_config,
-        Box::new(super::chat_persistence::ChannelChatPersistence::new(
-            persistence.tx.clone(),
-        )),
+        // LHC-HOOK 2/3: wrap persistence in the LHC capture tee
+        grok_lhc_host::tee_chat_persistence(
+            session_info.id.0.as_ref(),
+            session_info.cwd.as_ref(),
+            &conversation,
+            chat_persistence,
+        ),
         chat_state_event_tx,
         tokio_util::sync::CancellationToken::new(),
     );

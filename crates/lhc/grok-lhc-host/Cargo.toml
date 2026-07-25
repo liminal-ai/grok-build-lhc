@@ -5,10 +5,27 @@ edition = "2024"
 description = "LHC host adapter for Grok Build — capture tee, compact bridge, request-context serving (fork-only crate)"
 publish = false
 
+[features]
+default = []
+# Enables blocking test helpers (flush_blocking, poison, crash_kill).
+# Required by the certification integration test (integration tests do not
+# see the library's `cfg(test)`).
+test-util = []
+
+[[test]]
+name = "certification"
+required-features = ["test-util"]
+
 [dependencies]
 lhc = { path = "../vendor/long-horizon-context/packages/lhc-rs" }
+xai-chat-state = { path = "../../codegen/xai-chat-state" }
+xai-grok-sampling-types = { path = "../../codegen/xai-grok-sampling-types" }
+blake3 = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
+tracing = { workspace = true }
 
-# Standalone during Chunk 0: deliberately NOT a member of the auto-generated
-# root workspace (zero core touches). Patch 0001 adds the members entry when
-# the first hook lands (Chunk 1) — see FORK.md, "Cargo.toml conflict rule".
-[workspace]
+[dev-dependencies]
+rusqlite = { version = "0.37", features = ["bundled"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }

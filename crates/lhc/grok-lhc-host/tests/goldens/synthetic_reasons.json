@@ -1,0 +1,172 @@
+[
+  {
+    "eventKind": "runtime_note",
+    "idempotencyKey": "grok:synth-session:g0:91ab464fd6942e03dc1dcc8d4081efc16fe11428ca213215797a85c3b93dd977:0:runtime_note",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "text": "synthetic-0"
+    }
+  },
+  {
+    "eventKind": "runtime_note",
+    "idempotencyKey": "grok:synth-session:g0:f551b33544070288c03f10511a8c2f9603ad86b44665cb3c8b285763922b9102:0:runtime_note",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "text": "synthetic-1"
+    }
+  },
+  {
+    "eventKind": "runtime_note",
+    "idempotencyKey": "grok:synth-session:g0:f768d21f1dd413d6488cb72cfcc5c6fc05d59a024db0e1683065057c2e4c066b:0:runtime_note",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "text": "synthetic-2"
+    }
+  },
+  {
+    "eventKind": "runtime_note",
+    "idempotencyKey": "grok:synth-session:g0:b710febde9f9f41c6aa22dee8d223c608c05fd505b30eabba821e4bce1b721ef:0:runtime_note",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "text": "synthetic-3"
+    }
+  },
+  {
+    "eventKind": "runtime_note",
+    "idempotencyKey": "grok:synth-session:g0:a5388040341aeeac062b4d3e33ecf4178a1db1c0cf92a00577dab291f581a1f6:0:runtime_note",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "text": "synthetic-4"
+    }
+  },
+  {
+    "eventKind": "runtime_note",
+    "idempotencyKey": "grok:synth-session:g0:82ad870cf081e499954527b20e921d4ca6ee93fe060a80c4a7ff9f006c5c1b06:0:runtime_note",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "text": "synthetic-5"
+    }
+  },
+  {
+    "eventKind": "turn_end",
+    "idempotencyKey": "grok:synth-session:g0:ba702cb74fd1de6d1277a59c5ce0db8b43390100e68f3972bee616009458b8b3:0:turn_end:pre_synthetic",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {}
+  },
+  {
+    "eventKind": "runtime_note",
+    "idempotencyKey": "grok:synth-session:g0:ba702cb74fd1de6d1277a59c5ce0db8b43390100e68f3972bee616009458b8b3:0:runtime_note",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "text": "synthetic-6"
+    }
+  },
+  {
+    "eventKind": "turn_end",
+    "idempotencyKey": "grok:synth-session:g0:80996f6bc65ec417a479c0408bd1535162192c35367de6f67e1847b701582c3f:0:turn_end:pre_synthetic",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {}
+  },
+  {
+    "eventKind": "runtime_note",
+    "idempotencyKey": "grok:synth-session:g0:80996f6bc65ec417a479c0408bd1535162192c35367de6f67e1847b701582c3f:0:runtime_note",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "text": "synthetic-7"
+    }
+  },
+  {
+    "eventKind": "turn_end",
+    "idempotencyKey": "grok:synth-session:g0:6d6c29432b0508b530ef4e791af5e712419d1aedd852faace008ac5dcfd52805:0:turn_end:pre_synthetic",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {}
+  },
+  {
+    "eventKind": "runtime_note",
+    "idempotencyKey": "grok:synth-session:g0:6d6c29432b0508b530ef4e791af5e712419d1aedd852faace008ac5dcfd52805:0:runtime_note",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "text": "synthetic-8"
+    }
+  },
+  {
+    "eventKind": "runtime_note",
+    "idempotencyKey": "grok:synth-session:g0:e8eac632130052962e5e7cf23025a20ba806e10c2fbc93dae5abaf58807c2c9e:0:runtime_note",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "text": "synthetic-9"
+    }
+  },
+  {
+    "eventKind": "turn_end",
+    "idempotencyKey": "grok:synth-session:g0:3fd091eb610dcb5b1413a830c1e4e0dbbb3b826a0ba293bfbd63fe9725094a7c:0:turn_end:pre_synthetic",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {}
+  },
+  {
+    "eventKind": "runtime_note",
+    "idempotencyKey": "grok:synth-session:g0:3fd091eb610dcb5b1413a830c1e4e0dbbb3b826a0ba293bfbd63fe9725094a7c:0:runtime_note",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "text": "synthetic-10"
+    }
+  },
+  {
+    "eventKind": "turn_end",
+    "idempotencyKey": "grok:synth-session:g0:db1a1babf4de7184c85502a35ae9906cf8bb1b0cd20db33c3d58f5d3d6c0d90d:0:turn_end:pre_synthetic",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {}
+  },
+  {
+    "eventKind": "runtime_note",
+    "idempotencyKey": "grok:synth-session:g0:db1a1babf4de7184c85502a35ae9906cf8bb1b0cd20db33c3d58f5d3d6c0d90d:0:runtime_note",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "text": "synthetic-11"
+    }
+  },
+  {
+    "eventKind": "runtime_note",
+    "idempotencyKey": "grok:synth-session:g0:a2811127b8c74ef435e0b82e3979786ff2a0e563e32520094830ebd7560dbe70:0:runtime_note",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "text": "synthetic-12"
+    }
+  },
+  {
+    "eventKind": "runtime_note",
+    "idempotencyKey": "grok:synth-session:g0:04d95428fda78107700a83a6e071ecd585f92369ca2c5ada57077877d99ce829:0:runtime_note",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "text": "synthetic-13"
+    }
+  },
+  {
+    "eventKind": "runtime_note",
+    "idempotencyKey": "grok:synth-session:g0:5116ac83497863e2ece01193d3e6d86b2dd8e4d2b148da490f838b1fd4252661:0:runtime_note",
+    "actor": "grok",
+    "harness": "grok-build",
+    "payload": {
+      "text": "synthetic-14"
+    }
+  }
+]

@@ -7,14 +7,17 @@ record, with banded compaction replacing native auto-compact — full history
 preserved and rebuildable at full fidelity. Working branch and default
 branch: `lhc`. `main` tracks upstream, untouched.
 
-Status: Chunk 0 (fork scaffolding) of the 3-chunk integration
+Status: Chunk 1 (packaging, session identity, event capture) of the 3-chunk
+integration
 (`long-horizon-context/docs/lhc-rs-port/phase3-grok-build-integration-brief.md`).
-Nothing runs yet; no core file is modified yet.
+Capture is gated off by default (`GROK_LHC`); host behavior is unchanged until
+enabled. Chunks 2–3 (inference adapter / compact bridge / product wiring)
+remain.
 
 ## Layout
 
 - `crates/lhc/grok-lhc-host/` — the adapter crate (capture mapping, compact
-  bridge, ModelCall). Fork-only; standalone workspace during Chunk 0.
+  bridge, ModelCall). Fork-only; workspace member from Chunk 1.
 - `crates/lhc/vendor/long-horizon-context/` — submodule, pinned to certified
   commits of the `lhc-rs-port` branch only (Phase 2 acceptance `358c8d1` or
   later). Never copy the port in; bump the pin and record it here.
@@ -28,12 +31,59 @@ Nothing runs yet; no core file is modified yet.
 
 | # | File | Lines | Purpose | Patch |
 |---|------|-------|---------|-------|
-| — | none yet | — | Chunk 0 makes zero core touches | — |
+| 1 | `crates/codegen/xai-grok-shell/Cargo.toml` | `LHC-HOOK 1/3` | dependency on `grok-lhc-host` | pending regen |
+| 2 | `crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs` | `LHC-HOOK 2/3` | wrap persistence in the LHC capture tee | pending regen |
+| 3 | `crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs` | `LHC-HOOK 3/3` | model / thinking-level change tee | pending regen |
+| — | root `Cargo.toml` | workspace-members entry `crates/lhc/grok-lhc-host` (no marker — auto-generated/sorted; asserted in `scripts/check-lhc-hooks.sh`) | adapter workspace membership | pending regen |
 
 Rules: hooks are 1–5 line additive insertions marked
 `// LHC-HOOK <n>/<total>: <purpose>`; the sentinel total in
 `scripts/check-lhc-hooks.sh` and this table change in the same commit as any
 hook; each hook is regenerated into `patches/` in that same commit.
+
+Carve-out (Chunk 1, post-`cargo fmt` numstat vs pre-hook tree):
+
+| Hook file | `git diff --numstat` |
+|---|---|
+| `spawn.rs` (hook 2) | `+10 / -3` |
+| `model_switch.rs` (hook 3) | `+9 / -0` |
+
+Hook 2 hoists `ChannelChatPersistence::new(...)` to a `let` (preserving that
+expression) and wraps with a formatted multi-line `tee_chat_persistence(...)`.
+Hook 3 adds one capture line for `previous_reasoning_effort` plus a formatted
+`capture_model_or_thinking_change(...)` call so the host's previous model /
+thinking level are forwarded (no fabricated `"unknown"`). Both exceed the
+nominal 1–5-line additive budget once rustfmt expands the call sites; the
+counts above are the durable, CI-canonical figures.
+
+Layer 3 of `scripts/check-lhc-hooks.sh` runs both `golden_smoke` and
+`certification` under `--features test-util` and asserts a nonzero test count
+for each.
+
+### Accepted limitations (Chunk 1 acceptance, orchestrator ruling)
+
+Two verifier findings were adjudicated as accepted rather than fixed. Both are
+test-sensitivity gaps, not product defects; both are recorded so a later
+maintainer does not mistake them for oversights.
+
+1. **The hook-2 / hook-3 session-id coupling is verified by inspection, not by
+   a test.** If `model_switch.rs` ever passed a different id than `spawn.rs`
+   registered, every model change would be silently discarded and no test in
+   `grok-lhc-host` would fail. The coupling is a property of two call sites in
+   `xai-grok-shell`, so the adapter's own suite structurally cannot observe
+   it; a test would have to live in the core crate, i.e. a fourth core
+   touchpoint. Both ids are `session_id.0.as_ref()` / `session_info.id.0.as_ref()`
+   — the same ACP id — confirmed independently by both verifiers. **If you
+   ever change either hook's arguments, re-check this by hand.**
+2. **The async-convention guards catch panicking blocks, not silent ones.**
+   `tee_from_async_context_does_not_block_or_panic` and its `Drop` counterpart
+   wrap a `tokio::time::timeout`, but the awaited body contains no suspension
+   point — so a *synchronous* block (`JoinHandle::join()`,
+   `std::sync::mpsc::recv()`) hangs the test instead of failing it. The guards
+   still detect such a regression, just as a hang rather than a fast failure.
+   The defect that actually shipped (`blocking_recv` on the production path)
+   panics and is caught. Closing this properly needs an out-of-runtime
+   watchdog; carried into Chunk 2.
 
 ## Upstream model (read before your first sync)
 
@@ -82,3 +132,9 @@ Rehearse this once before Chunk 3 sign-off (brief, Chunk 0 certification).
 - Timestamps passed into LHC public APIs must be canonical
   `YYYY-MM-DDTHH:MM:SS(.mmm)Z` (Amendment D ceiling).
 - Do not set `SdkConfig.clock` in production (cross-port provenance parity).
+
+## Gating
+
+- `GROK_LHC=1` or `true` enables capture at session spawn; unset / anything
+  else leaves the host bit-identical (tee not installed).
+- `GROK_LHC_ROOT` overrides the LHC storage root (default `~/.lhc`) for tests.
