@@ -119,7 +119,12 @@ implausibly large, upstream reset. Do not merge. Instead:
 4. `scripts/check-lhc-hooks.sh` — green means the fork is whole.
 5. Force-update `origin/lhc`; keep the old tree until green.
 
-Rehearse this once before Chunk 3 sign-off (brief, Chunk 0 certification).
+**Rehearsed 2026-07-25 at Chunk 1** (fork `9ea06ea`), against the raw upstream
+tip `6e38642` — a tree with no `crates/lhc/` at all. `git am` applied cleanly;
+all three sentinels and the workspace entry were restored. Commands and the
+full record are in `patches/README.md`. Re-rehearse whenever a hook changes.
+(The Chunk 0 brief required this once before Chunk 3 sign-off; doing it at
+Chunk 1 means the first real upstream sync already has a proven fallback.)
 
 ## Never run
 
