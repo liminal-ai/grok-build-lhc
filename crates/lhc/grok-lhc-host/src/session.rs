@@ -297,6 +297,14 @@ impl LhcSession {
         }
     }
 
+    /// View derivation / visibility status (`lhc.thread_view.status`).
+    pub async fn get_view_status(&self) -> Result<lhc::shared_tech::view::ViewStatus, String> {
+        match self.lhc.thread_view.status(self.thread_ref.clone()).await {
+            OpResult::Ok { value } => Ok(value),
+            OpResult::Err { error } => Err(error.reason),
+        }
+    }
+
     pub async fn close(self) {
         self.lhc.drain_settled(self.thread_ref.clone()).await;
     }

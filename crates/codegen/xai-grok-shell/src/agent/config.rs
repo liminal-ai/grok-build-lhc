@@ -1442,6 +1442,9 @@ pub struct Config {
     pub subagents: crate::config::SubagentsConfig,
     #[serde(default, skip_serializing)]
     pub memory: crate::config::MemoryConfig,
+    /// `[lhc]` — Long Horizon Context (off by default; env wins over file).
+    #[serde(default, skip_serializing)]
+    pub lhc: crate::config::LhcConfig,
     #[serde(default, skip_serializing)]
     pub compaction: CompactionConfig,
     #[serde(default, skip_serializing)]
@@ -1832,6 +1835,7 @@ impl Default for Config {
             disabled_mcp_tools: std::collections::HashMap::new(),
             subagents: crate::config::SubagentsConfig::default(),
             memory: crate::config::MemoryConfig::default(),
+            lhc: crate::config::LhcConfig::default(),
             compaction: CompactionConfig::default(),
             managed_mcps: crate::config::ManagedMcpsConfig::default(),
             auth: None,
@@ -2208,6 +2212,9 @@ impl Config {
             ctx.remote_settings,
         );
         self.memory_config = if mem.enabled { Some(mem) } else { None };
+        // LHC: env > [lhc] config > default off. Fills unset GROK_LHC* env
+        // vars only for non-default sources (defaults must not leak into env).
+        self.lhc = crate::config::LhcConfig::resolve_and_apply(ctx.raw_config);
         self.disable_web_search = self.disable_web_search || ctx.disable_web_search;
         self.todo_gate = ctx.todo_gate;
         self.laziness_debug_log = ctx.laziness_debug_log.map(std::path::Path::to_path_buf);

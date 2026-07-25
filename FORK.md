@@ -7,11 +7,17 @@ record, with banded compaction replacing native auto-compact — full history
 preserved and rebuildable at full fidelity. Working branch and default
 branch: `lhc`. `main` tracks upstream, untouched.
 
-Status: Chunk 2 (inference adapter, request-context serving, compact bridge)
-of the 3-chunk integration
+Status: Chunk 3A (product wiring — config, `/lhc` status/repair, rollout
+safety) of the 3-chunk integration
 (`long-horizon-context/docs/lhc-rs-port/phase3-grok-build-integration-brief.md`).
-Capture and serving are gated off by default (`GROK_LHC`); host behavior is
-unchanged until enabled. Chunk 3 (product wiring / live cert) remains.
+Capture and serving are gated off by default (`GROK_LHC` / `[lhc]`). A resolving
+capture tee is always installed so mid-session `/lhc on` (A5) can attach. When
+a session has no worker, its persist path takes **no registry mutex** — even if
+other sessions are actively capturing — via a per-session generation-cached
+binding (`aa1_disabled_persist_takes_no_registry_lock_while_other_session_active`).
+Steady state: one generation atomic compare; mutex only when registration
+actually changes. No I/O, no spawn, no SQLite on that path. Chunk 3B (live
+certification) remains.
 
 ## Layout
 
@@ -38,6 +44,19 @@ unchanged until enabled. Chunk 3 (product wiring / live cert) remains.
 | 6 | `crates/codegen/xai-grok-shell/src/session/mod.rs` | `LHC-HOOK 6/6` | `mod lhc_inference` declaration | _(regen)_ |
 | 6b | `crates/codegen/xai-grok-shell/src/session/lhc_inference.rs` | new file (shell-local LHC inference transport) | _(regen)_ |
 | — | root `Cargo.toml` | workspace-members entry `crates/lhc/grok-lhc-host` (no marker — auto-generated/sorted; asserted in `scripts/check-lhc-hooks.sh`) | adapter workspace membership | _(regen)_ |
+
+### Chunk 3A authorized touchpoints (not LHC-HOOK markers)
+
+These are Phase-3-brief “status/inspect/repair / config” surfaces. They are
+**not** runtime hooks 1–6 and do **not** change `EXPECTED_HOOKS`. Sentinel
+stays at 6. Include them in `patches/` regen after commit (Lee) so history-
+reset recovery restores the slash/config wiring.
+
+| # | File | Purpose |
+|---|---|---|
+| C3A-1 | `.../session/slash_commands.rs` | `BuiltinAction::Lhc` + `/lhc` parser + telemetry/mutating arms |
+| C3A-2 | `.../session/acp_session_impl/slash_exec.rs` | `/lhc` handler (status/health/repair/on/off) |
+| C3A-3 | `.../config/mod.rs` + `agent/config.rs` | `[lhc]` `LhcConfig` + `resolve_and_apply` in runtime resolution |
 
 Rules: hooks are 1–5 line additive insertions marked
 `// LHC-HOOK <n>/<total>: <purpose>`; the sentinel total in
@@ -189,12 +208,39 @@ Chunk 1 means the first real upstream sync already has a proven fallback.)
 ## Gating
 
 - `GROK_LHC=1` or `true` enables capture at session spawn; unset / anything
-  else leaves the host bit-identical (tee not installed).
-- `GROK_LHC_ROOT` overrides the LHC storage root (default `~/.lhc`) for tests.
+  else leaves the host bit-identical (tee not installed). `[lhc] enabled =
+  true` in config.toml also enables when env is unset (env wins when set).
+- `GROK_LHC_ROOT` / `[lhc].root` overrides the LHC storage root (default
+  `~/.lhc`) for tests.
 - `GROK_LHC_COMPACT=replace` alone does **not** enable Replace. Requires also
-  `GROK_LHC_COMPACT_EXPERIMENTAL=1`. Without it, mode stays Shadow.
-  When Replace is active, successful compact **writes back** into native
-  state (`replace_conversation_for_compaction`) — ruled architecture, not a
-  workaround (see `crates/lhc/grok-lhc-host/MAPPING.md`).
-- `GROK_LHC_INFERENCE_MODEL` selects a dedicated non-main model slug for LHC
-  ModelCall; unset → session model with refreshed credentials per call.
+  `GROK_LHC_COMPACT_EXPERIMENTAL=1` (or `[lhc] compact_experimental = true`).
+  Without it, mode stays Shadow. When Replace is active, successful compact
+  **writes back** into native state (`replace_conversation_for_compaction`) —
+  ruled architecture, not a workaround (see
+  `crates/lhc/grok-lhc-host/MAPPING.md`).
+- `GROK_LHC_INFERENCE_MODEL` / `[lhc].inference_model` selects a dedicated
+  non-main model slug for LHC ModelCall; unset → session model with refreshed
+  credentials per call.
+- `/lhc` slash command: status / health / repair / per-session on / off.
+
+## Rollback runbook (Chunk 3A)
+
+A fresh agent can disable LHC without losing the fork:
+
+1. **Immediate (this session):** `/lhc off` — stops capture; active context
+   engine becomes **native**. LHC SQLite is kept; native conversation is not
+   rewritten by this step.
+2. **Process-wide:** unset `GROK_LHC` (and remove `[lhc] enabled = true` from
+   config.toml if present). Restart the shell. Spawn installs only a resolving
+   tee that no-ops via `any_capture_active` (no worker, no SQLite) — host
+   behavior matches pre-LHC.
+3. **After a Replace compact:** native RAM/persisted body may already be the
+   LHC-compacted conversation. Full pre-compact native body is **not**
+   guaranteed in RAM; LHC thread SQLite retains full event history.
+   Recoverability of older native files → confirm in Chunk 3B live cert.
+4. **Verify afterward:** `/lhc` reports off + native engine; `scripts/check-
+   lhc-hooks.sh` green; no `GROK_LHC` in the environment for the next
+   session.
+5. **Optional cleanup (explicit):** `/lhc repair` then `/lhc repair confirm
+   delete-thread-db` — deletes only LHC SQLite for that session. Never
+   automatic.

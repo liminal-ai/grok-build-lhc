@@ -115,6 +115,14 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         resolve: |_args| BuiltinAction::ContextInfo,
     },
     BuiltinCommand {
+        name: "lhc",
+        description: "LHC status, health, repair, and per-session on/off",
+        argument_hint: Some("[status|health|repair|repair confirm <id>|on|off]"),
+        aliases: &[],
+        gate: BuiltinGate::AlwaysOn,
+        resolve: |args| parse_lhc_action(args),
+    },
+    BuiltinCommand {
         name: "hooks-trust",
         description: "Trust this project for hook execution",
         argument_hint: None,
@@ -817,6 +825,10 @@ pub(super) enum BuiltinAction {
     FlushMemory,
     Dream,
     ContextInfo,
+    /// Chunk 3A — LHC status / health / repair / per-session toggle.
+    Lhc {
+        op: LhcSlashOp,
+    },
     HooksTrust,
     HooksList,
     HooksAdd {
@@ -875,6 +887,42 @@ pub(super) enum BuiltinAction {
     },
 }
 
+/// Subcommands for [`BuiltinAction::Lhc`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LhcSlashOp {
+    Status,
+    Health,
+    Repair,
+    RepairConfirm { id: String },
+    On,
+    Off,
+}
+
+fn parse_lhc_action(args: &str) -> BuiltinAction {
+    let trimmed = args.trim();
+    let op = if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("status") {
+        LhcSlashOp::Status
+    } else if trimmed.eq_ignore_ascii_case("health") {
+        LhcSlashOp::Health
+    } else if trimmed.eq_ignore_ascii_case("repair") {
+        LhcSlashOp::Repair
+    } else if let Some(rest) = trimmed
+        .strip_prefix("repair confirm ")
+        .or_else(|| trimmed.strip_prefix("repair confirm\t"))
+    {
+        LhcSlashOp::RepairConfirm {
+            id: rest.trim().to_string(),
+        }
+    } else if trimmed.eq_ignore_ascii_case("on") || trimmed.eq_ignore_ascii_case("enable") {
+        LhcSlashOp::On
+    } else if trimmed.eq_ignore_ascii_case("off") || trimmed.eq_ignore_ascii_case("disable") {
+        LhcSlashOp::Off
+    } else {
+        LhcSlashOp::Status
+    };
+    BuiltinAction::Lhc { op }
+}
+
 impl BuiltinAction {
     pub(crate) fn command_name(&self) -> &'static str {
         match self {
@@ -883,6 +931,7 @@ impl BuiltinAction {
             BuiltinAction::FlushMemory => "flush",
             BuiltinAction::Dream => "dream",
             BuiltinAction::ContextInfo => "context",
+            BuiltinAction::Lhc { .. } => "lhc",
             BuiltinAction::HooksTrust => "hooks-trust",
             BuiltinAction::HooksList => "hooks-list",
             BuiltinAction::HooksAdd { .. } => "hooks-add",
@@ -918,6 +967,7 @@ impl BuiltinAction {
             BuiltinAction::FlushMemory => false,
             BuiltinAction::Dream => false,
             BuiltinAction::ContextInfo => false,
+            BuiltinAction::Lhc { op } => !matches!(op, LhcSlashOp::Status),
             BuiltinAction::HooksTrust => false,
             BuiltinAction::HooksList => false,
             BuiltinAction::HooksAdd { .. } => true,

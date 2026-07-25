@@ -1,4 +1,7 @@
-//! Feature gate: LHC capture is off unless `GROK_LHC` is `1` or `true`.
+//! Feature gate: LHC capture is off unless `GROK_LHC` is truthy.
+//!
+//! Truthy set matches [`crate::runtime_config`] (`1` / `true` / `on`,
+//! case-insensitive) so resolve and gate cannot disagree (Y7).
 
 /// Return whether LHC capture should be installed for a new session.
 ///
@@ -8,7 +11,7 @@ pub fn is_enabled() -> bool {
     match std::env::var("GROK_LHC") {
         Ok(v) => {
             let v = v.trim();
-            v == "1" || v.eq_ignore_ascii_case("true")
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
         }
         Err(_) => false,
     }

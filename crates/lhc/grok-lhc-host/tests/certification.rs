@@ -6,17 +6,20 @@ use std::thread;
 use std::time::Duration;
 
 use grok_lhc_host::{
-    CaptureHandle, CompactEventBridge, CompactMode, CountingLhcInferenceSampler,
-    LhcInferenceRequest, MockLhcInferenceSampler, ServeDecision, SourceKindIndex,
-    apply_serve_decision, body_has_tool_cycle, build_writeback_conversation, capture_active,
-    capture_model_or_thinking_change, compare_serve_equivalence, decide_substitution,
-    encode_session_id_for_path, equivalence_snapshot, inference_sampler_registered,
-    informational_hit_count, is_enabled, lookup_session, native_prompt_indices,
-    observe_serve_equivalence, paths_disagree, preview_call_count, project_conversation_canonical,
-    replace_call_count, reset_compact_call_counters, reset_equivalence_counters,
-    resolve_compact_mode, serve_compared_turns, serve_fallback_turns, serve_request_context,
+    CaptureHandle, CompactEventBridge, CompactMode, ContextEngine, CountingLhcInferenceSampler,
+    LhcFileConfig, LhcInferenceRequest, MockLhcInferenceSampler, ServeDecision, SourceKindIndex,
+    apply_resolved_config, apply_serve_decision, body_has_tool_cycle, build_writeback_conversation,
+    capture_active, capture_model_or_thinking_change, clear_last_serve_outcome,
+    compare_serve_equivalence, decide_substitution, encode_session_id_for_path,
+    equivalence_snapshot, execute_repair, format_status_report, health_check,
+    inference_sampler_registered, informational_hit_count, is_enabled, last_serve_outcome,
+    lookup_session, native_prompt_indices, observe_serve_equivalence, paths_disagree, plan_repair,
+    preview_call_count, project_conversation_canonical, replace_call_count,
+    reset_compact_call_counters, reset_equivalence_counters, resolve_compact_mode,
+    resolve_lhc_config, serve_compared_turns, serve_fallback_turns, serve_request_context,
     set_compact_mode_for_test, set_force_classify_list_failure, shadow_preview_compact,
-    shutdown_session, spawn_capture, structural_hit_count, tee_chat_persistence, thread_file_path,
+    shutdown_session, spawn_capture, status_report, structural_hit_count, tee_chat_persistence,
+    thread_file_path,
 };
 use lhc::intake_stream::{BatchEventOutcome, BatchSkipReason, EventRecord};
 use lhc::shared_tech::view::{
@@ -3081,4 +3084,574 @@ fn equiv_fail_open_turn_not_counted_as_compared() {
     assert_eq!(snap.turns_fallen_back, 1);
     assert_eq!(snap.structural_divergences, 0);
     assert_eq!(snap.informational_divergences, 0);
+}
+
+// ── Chunk 3A: config / status / health / mid-session opt-in ─────────────
+
+#[test]
+fn chunk3a_config_env_wins_over_file_enabled() {
+    let _g = env_lock();
+    let prev = std::env::var_os("GROK_LHC");
+    unsafe { std::env::set_var("GROK_LHC", "0") };
+    let r = resolve_lhc_config(&LhcFileConfig {
+        enabled: Some(true),
+        ..Default::default()
+    });
+    assert!(!r.enabled.value, "env 0 must beat config enabled=true");
+    assert_eq!(r.enabled.source, grok_lhc_host::ConfigSource::Env);
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC") },
+    }
+}
+
+#[test]
+fn chunk3a_config_file_enables_when_env_unset() {
+    let _g = env_lock();
+    let prev = std::env::var_os("GROK_LHC");
+    unsafe { std::env::remove_var("GROK_LHC") };
+    let r = resolve_lhc_config(&LhcFileConfig {
+        enabled: Some(true),
+        ..Default::default()
+    });
+    assert!(r.enabled.value);
+    assert_eq!(r.enabled.source, grok_lhc_host::ConfigSource::ConfigFile);
+    // apply must set env so is_enabled() sees it
+    apply_resolved_config(&r);
+    assert!(is_enabled());
+    unsafe { std::env::remove_var("GROK_LHC") };
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC") },
+    }
+}
+
+#[test]
+fn chunk3a_status_off_reports_native_engine() {
+    let _g = env_lock();
+    let prev = std::env::var_os("GROK_LHC");
+    unsafe { std::env::remove_var("GROK_LHC") };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let r = rt.block_on(status_report("chunk3a-status-off"));
+    assert!(!r.enabled);
+    assert_eq!(r.context_engine, ContextEngine::Native);
+    let text = format_status_report(&r);
+    assert!(text.contains("Active context engine:** native"));
+    assert!(text.contains("off"));
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC") },
+    }
+}
+
+#[test]
+fn chunk3a_status_on_healthy_store() {
+    let _g = env_lock();
+    let root = TempDir::new().unwrap();
+    let prev = std::env::var_os("GROK_LHC");
+    let prev_root = std::env::var_os("GROK_LHC_ROOT");
+    unsafe {
+        std::env::set_var("GROK_LHC", "1");
+        std::env::set_var("GROK_LHC_ROOT", root.path());
+    }
+    let sid = "chunk3a-status-on";
+    clear_last_serve_outcome(sid);
+    let native = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user("hi"),
+    ];
+    let handle = spawn_capture(sid, Some("/tmp"), &native, Some(root.path()), None).unwrap();
+    let _ = wait_events(&handle, 1);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let r = rt.block_on(status_report(sid));
+    assert!(r.enabled);
+    assert!(r.capture_active);
+    // Capture alone must not claim LHC is the active engine (Y2).
+    assert_eq!(r.context_engine, ContextEngine::NoServeTurnYet);
+    assert!(r.event_count.unwrap_or(0) >= 1);
+    assert!(r.health.worker_alive);
+    let h = rt.block_on(health_check(sid));
+    assert!(h.worker_alive);
+    assert!(h.storage_reachable);
+    // After a real serve consult, engine follows the decision.
+    let decision = rt.block_on(serve_request_context(sid, &native));
+    let r2 = rt.block_on(status_report(sid));
+    match decision {
+        ServeDecision::Substitute { .. } => {
+            assert_eq!(r2.context_engine, ContextEngine::Lhc);
+        }
+        ServeDecision::Native { reason } => {
+            assert_eq!(r2.context_engine, ContextEngine::Native);
+            assert_eq!(r2.last_serve_reason, Some(reason));
+        }
+    }
+    shutdown_session(sid);
+    wait_registry_gone(sid);
+    clear_last_serve_outcome(sid);
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC") },
+    }
+    match prev_root {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC_ROOT", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC_ROOT") },
+    }
+}
+
+#[test]
+fn chunk3a_health_broken_missing_root() {
+    let _g = env_lock();
+    let prev = std::env::var_os("GROK_LHC");
+    let prev_root = std::env::var_os("GROK_LHC_ROOT");
+    let missing = std::env::temp_dir().join(format!("lhc-missing-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&missing);
+    unsafe {
+        std::env::set_var("GROK_LHC", "1");
+        std::env::set_var("GROK_LHC_ROOT", &missing);
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let h = rt.block_on(health_check("chunk3a-broken"));
+    assert!(!h.worker_alive);
+    assert!(
+        !h.storage_reachable,
+        "missing root must not report storage_reachable"
+    );
+    assert!(!h.ok, "broken store must not be healthy");
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC") },
+    }
+    match prev_root {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC_ROOT", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC_ROOT") },
+    }
+}
+
+#[test]
+fn chunk3a_mid_session_disable_and_reenable() {
+    let _g = env_lock();
+    let root = TempDir::new().unwrap();
+    let prev = std::env::var_os("GROK_LHC");
+    let prev_root = std::env::var_os("GROK_LHC_ROOT");
+    unsafe {
+        std::env::set_var("GROK_LHC", "1");
+        std::env::set_var("GROK_LHC_ROOT", root.path());
+    }
+    let sid = "chunk3a-mid-toggle";
+    clear_last_serve_outcome(sid);
+    let native = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user("one"),
+    ];
+    let h1 = spawn_capture(sid, Some("/tmp"), &native, Some(root.path()), None).unwrap();
+    let n1 = wait_events(&h1, 1).len();
+    assert!(capture_active(sid));
+    shutdown_session(sid);
+    wait_registry_gone(sid);
+    assert!(!capture_active(sid));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let r_off = rt.block_on(status_report(sid));
+    assert_eq!(r_off.context_engine, ContextEngine::Native);
+    let native2 = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user("one"),
+        ConversationItem::assistant("ack"),
+        ConversationItem::user("two"),
+    ];
+    let h2 = spawn_capture(sid, Some("/tmp"), &native2, Some(root.path()), None).unwrap();
+    let n2 = wait_events(&h2, n1).len();
+    assert!(n2 >= n1, "re-enable must keep prior events (dedup)");
+    assert!(capture_active(sid));
+    let plan = rt.block_on(plan_repair(sid));
+    assert!(!plan.actions.is_empty());
+    let _ = rt.block_on(execute_repair(sid, "noop"));
+    // Confirm without a fresh plan must refuse (Y4).
+    let unbound = rt.block_on(execute_repair(sid, "noop"));
+    assert!(
+        unbound.is_err(),
+        "second confirm without re-display must fail"
+    );
+    shutdown_session(sid);
+    wait_registry_gone(sid);
+    clear_last_serve_outcome(sid);
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC") },
+    }
+    match prev_root {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC_ROOT", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC_ROOT") },
+    }
+}
+
+/// Y1 Probe A — product path: tee installed while LHC-off, then `/lhc on`
+/// (`spawn_capture`) must make subsequent persists reach the event log.
+#[test]
+fn chunk3a_tee_mid_session_on_from_spawned_off() {
+    let _g = env_lock();
+    let root = TempDir::new().unwrap();
+    let prev = std::env::var_os("GROK_LHC");
+    let prev_root = std::env::var_os("GROK_LHC_ROOT");
+    unsafe {
+        std::env::remove_var("GROK_LHC");
+        std::env::set_var("GROK_LHC_ROOT", root.path());
+    }
+    let sid = "chunk3a-probe-a";
+    let (mock, _rx) = xai_chat_state::MockChatPersistence::new();
+    // Spawn-off: resolving tee installed, no worker.
+    let mut tee = tee_chat_persistence(sid, "/tmp", &[], Box::new(mock), None);
+    assert!(!capture_active(sid));
+    tee.persist_message(&ConversationItem::user("before-on"));
+    tee.flush();
+    // Mid-session enable (product `/lhc on` path).
+    unsafe { std::env::set_var("GROK_LHC", "1") };
+    let handle = spawn_capture(
+        sid,
+        Some("/tmp"),
+        &[ConversationItem::user("bootstrap")],
+        Some(root.path()),
+        None,
+    )
+    .unwrap();
+    let n_boot = wait_events(&handle, 1).len();
+    tee.persist_message(&ConversationItem::user("after-on-1"));
+    tee.persist_message(&ConversationItem::user("after-on-2"));
+    tee.flush();
+    let n_after = wait_events(&handle, n_boot + 2).len();
+    assert!(
+        n_after >= n_boot + 2,
+        "Probe A: persists after /lhc on must grow the log (boot={n_boot} after={n_after})"
+    );
+    drop(tee);
+    wait_registry_gone(sid);
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC") },
+    }
+    match prev_root {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC_ROOT", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC_ROOT") },
+    }
+}
+
+/// Y1 Probe B — product path: tee survives `/lhc off` + `/lhc on` and does
+/// not latch permanently stopped; new turns keep appending.
+#[test]
+fn chunk3a_tee_off_then_on_keeps_capturing() {
+    let _g = env_lock();
+    let root = TempDir::new().unwrap();
+    let prev = std::env::var_os("GROK_LHC");
+    let prev_root = std::env::var_os("GROK_LHC_ROOT");
+    unsafe {
+        std::env::set_var("GROK_LHC", "1");
+        std::env::set_var("GROK_LHC_ROOT", root.path());
+    }
+    let sid = "chunk3a-probe-b";
+    assert!(
+        is_enabled(),
+        "Probe B requires GROK_LHC enabled at tee install"
+    );
+    let (mock, _rx) = xai_chat_state::MockChatPersistence::new();
+    let mut tee = tee_chat_persistence(
+        sid,
+        "/tmp",
+        &[ConversationItem::user("boot")],
+        Box::new(mock),
+        None,
+    );
+    let h1 = lookup_session(sid).unwrap_or_else(|| {
+        panic!(
+            "worker at spawn-on (enabled={} root={:?})",
+            is_enabled(),
+            root.path()
+        )
+    });
+    let n1 = wait_events(&h1, 1).len();
+    tee.persist_message(&ConversationItem::user("while-on"));
+    tee.flush();
+    let n2 = wait_events(&h1, n1 + 1).len();
+    assert!(n2 > n1);
+    // `/lhc off` — do not drop the tee (product keeps ChatStateActor persistence).
+    shutdown_session(sid);
+    wait_registry_gone(sid);
+    assert!(!capture_active(sid));
+    // `/lhc on` — same tee object must re-resolve the new handle.
+    let h2 = spawn_capture(
+        sid,
+        Some("/tmp"),
+        &[
+            ConversationItem::user("boot"),
+            ConversationItem::user("while-on"),
+            ConversationItem::user("rebootstrap"),
+        ],
+        Some(root.path()),
+        None,
+    )
+    .expect("re-enable spawn_capture");
+    let n3 = wait_events(&h2, 1).len();
+    tee.persist_message(&ConversationItem::user("after-reenable-1"));
+    tee.persist_message(&ConversationItem::user("after-reenable-2"));
+    tee.flush();
+    let n4 = wait_events(&h2, n3 + 2).len();
+    assert!(
+        n4 >= n3 + 2,
+        "Probe B: off→on must not freeze the tee (n3={n3} n4={n4})"
+    );
+    drop(tee);
+    wait_registry_gone(sid);
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC") },
+    }
+    match prev_root {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC_ROOT", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC_ROOT") },
+    }
+}
+
+/// Y2 — timeout fail-open must label status engine native with that reason.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn chunk3a_status_reports_fail_open_reason_after_timeout() {
+    let _g = env_lock();
+    let root = TempDir::new().unwrap();
+    let sid = "chunk3a-status-timeout";
+    clear_last_serve_outcome(sid);
+    let prev = std::env::var_os("GROK_LHC");
+    let prev_root = std::env::var_os("GROK_LHC_ROOT");
+    unsafe {
+        std::env::set_var("GROK_LHC", "1");
+        std::env::set_var("GROK_LHC_ROOT", root.path());
+    }
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+    let (release_tx, release_rx) = oneshot::channel();
+    let handle_block = handle.clone();
+    tokio::task::spawn_blocking(move || {
+        let entered = handle_block.block_worker(release_rx);
+        let _ = entered.blocking_recv();
+    })
+    .await
+    .unwrap();
+    let native = vec![ConversationItem::user("blocked")];
+    let decision = serve_request_context(sid, &native).await;
+    assert!(matches!(
+        decision,
+        ServeDecision::Native {
+            reason: "get_classify_context_timeout"
+        }
+    ));
+    let r = status_report(sid).await;
+    assert_eq!(r.context_engine, ContextEngine::Native);
+    assert_eq!(r.last_serve_reason, Some("get_classify_context_timeout"));
+    let text = format_status_report(&r);
+    assert!(
+        text.contains("get_classify_context_timeout"),
+        "status must surface fail-open reason: {text}"
+    );
+    assert!(
+        !text.contains("Active context engine:** LHC"),
+        "must not claim LHC after native fail-open: {text}"
+    );
+    let _ = release_tx.send(());
+    tokio::task::spawn_blocking(move || handle.shutdown_blocking())
+        .await
+        .unwrap();
+    wait_registry_gone(sid);
+    clear_last_serve_outcome(sid);
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC") },
+    }
+    match prev_root {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC_ROOT", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC_ROOT") },
+    }
+}
+
+#[test]
+fn chunk3a_off_by_default_noop() {
+    let _g = env_lock();
+    let prev = std::env::var_os("GROK_LHC");
+    unsafe { std::env::remove_var("GROK_LHC") };
+    assert!(!is_enabled());
+    assert!(!capture_active("chunk3a-never"));
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC") },
+    }
+}
+
+#[test]
+fn chunk3a_grok_lhc_on_is_truthy() {
+    let _g = env_lock();
+    let prev = std::env::var_os("GROK_LHC");
+    unsafe { std::env::set_var("GROK_LHC", "on") };
+    assert!(is_enabled(), "GROK_LHC=on must enable (Y7)");
+    let r = resolve_lhc_config(&LhcFileConfig::default());
+    assert!(r.enabled.value);
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC") },
+    }
+}
+
+/// Z1 — `/lhc off` (shutdown) must not keep labeling the engine as LHC.
+#[test]
+fn chunk3a_off_clears_last_serve_engine_label() {
+    let _g = env_lock();
+    let root = TempDir::new().unwrap();
+    let sid = "chunk3a-z1-off-clears";
+    clear_last_serve_outcome(sid);
+    let prev = std::env::var_os("GROK_LHC");
+    let prev_root = std::env::var_os("GROK_LHC_ROOT");
+    unsafe {
+        std::env::set_var("GROK_LHC", "1");
+        std::env::set_var("GROK_LHC_ROOT", root.path());
+    }
+    let native = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user("hi"),
+    ];
+    let handle = spawn_capture(sid, Some("/tmp"), &native, Some(root.path()), None).unwrap();
+    let _ = wait_events(&handle, 1);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let decision = rt.block_on(serve_request_context(sid, &native));
+    if matches!(decision, ServeDecision::Substitute { .. }) {
+        let r = rt.block_on(status_report(sid));
+        assert_eq!(r.context_engine, ContextEngine::Lhc);
+    }
+    shutdown_session(sid);
+    wait_registry_gone(sid);
+    let r_off = rt.block_on(status_report(sid));
+    assert_eq!(
+        r_off.context_engine,
+        ContextEngine::Native,
+        "after /lhc off, engine must be native (not stale LHC)"
+    );
+    assert!(
+        last_serve_outcome(sid).is_none(),
+        "shutdown must evict last-serve outcome"
+    );
+    clear_last_serve_outcome(sid);
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC") },
+    }
+    match prev_root {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC_ROOT", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC_ROOT") },
+    }
+}
+
+/// Z2 — mid-session spawn with sampler registers ModelCall capability.
+#[test]
+fn chunk3a_mid_session_on_registers_sampler() {
+    use grok_lhc_host::LhcInferenceSampler;
+    let _g = env_lock();
+    let root = TempDir::new().unwrap();
+    let sid = "chunk3a-z2-sampler";
+    let prev = std::env::var_os("GROK_LHC");
+    let prev_root = std::env::var_os("GROK_LHC_ROOT");
+    unsafe {
+        std::env::set_var("GROK_LHC", "1");
+        std::env::set_var("GROK_LHC_ROOT", root.path());
+    }
+    let mock: Arc<dyn LhcInferenceSampler> = Arc::new(MockLhcInferenceSampler::new());
+    let handle = spawn_capture(
+        sid,
+        Some("/tmp"),
+        &[ConversationItem::user("boot")],
+        Some(root.path()),
+        Some(mock),
+    )
+    .unwrap();
+    assert!(
+        inference_sampler_registered(sid),
+        "spawn_capture with sampler must register for compact"
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let r = rt.block_on(status_report(sid));
+    assert!(r.inference_compact_available);
+    let text = format_status_report(&r);
+    assert!(
+        text.contains("ModelCall compact:** available"),
+        "status must report compact available: {text}"
+    );
+    drop(handle);
+    shutdown_session(sid);
+    wait_registry_gone(sid);
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC") },
+    }
+    match prev_root {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC_ROOT", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC_ROOT") },
+    }
+}
+
+/// Z3 — stuck worker inspection timeouts must degrade health.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn chunk3a_stuck_worker_health_is_degraded() {
+    let _g = env_lock();
+    let root = TempDir::new().unwrap();
+    let sid = "chunk3a-z3-stuck-health";
+    let prev = std::env::var_os("GROK_LHC");
+    let prev_root = std::env::var_os("GROK_LHC_ROOT");
+    unsafe {
+        std::env::set_var("GROK_LHC", "1");
+        std::env::set_var("GROK_LHC_ROOT", root.path());
+    }
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+    let (release_tx, release_rx) = oneshot::channel();
+    let handle_block = handle.clone();
+    tokio::task::spawn_blocking(move || {
+        let entered = handle_block.block_worker(release_rx);
+        let _ = entered.blocking_recv();
+    })
+    .await
+    .unwrap();
+    let h = health_check(sid).await;
+    assert!(
+        !h.ok,
+        "stuck worker must report degraded health, notes={:?}",
+        h.notes
+    );
+    assert!(
+        h.notes.iter().any(|n| n.contains("timed out")),
+        "notes must mention timeout: {:?}",
+        h.notes
+    );
+    let _ = release_tx.send(());
+    tokio::task::spawn_blocking(move || handle.shutdown_blocking())
+        .await
+        .unwrap();
+    wait_registry_gone(sid);
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC") },
+    }
+    match prev_root {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC_ROOT", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC_ROOT") },
+    }
 }

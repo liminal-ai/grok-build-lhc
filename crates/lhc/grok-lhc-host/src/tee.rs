@@ -1,26 +1,35 @@
 //! `ChatPersistence` tee decorator — the whole Chunk 1 capture hook.
+//!
+//! The tee keeps a **per-session fast binding**: a [`RegistrySnapshot`]
+//! (generation + handle) produced atomically under the registry mutex.
+//! Steady-state persists compare one atomic to the cached generation and use
+//! the cached value — including cached `None` — without taking the registry
+//! mutex (AA1 / L3). When the generation moves, the next persist re-resolves
+//! via [`lookup_session_snapshot`] only — there is no production path that
+//! stamps the cache from a bare `registry_generation()` plus a separate
+//! `lookup_session` (AB1 / AC1).
 
 use std::sync::Arc;
 
 use tokio::sync::oneshot;
-use tracing::warn;
 use xai_chat_state::{ChatPersistence, StrictAppendAck, StrictAppendError};
 use xai_grok_sampling_types::ConversationItem;
 
-use crate::capture::{CaptureHandle, any_capture_active, is_session_registered, spawn_capture};
+use crate::capture::{
+    CaptureHandle, RegistrySnapshot, lookup_session_snapshot, registry_generation, spawn_capture,
+};
 use crate::gating::is_enabled;
 use crate::inference::LhcInferenceSampler;
 
-/// Wrap `inner` with LHC capture when `GROK_LHC` is enabled; otherwise return
-/// `inner` unchanged (no decorator, no LHC instance, no SQLite, no worker).
+/// Wrap `inner` with an LHC-resolving tee.
 ///
-/// `bootstrap` is the in-memory conversation already loaded from
-/// `chat_history.jsonl` (not rewritten). Occurrence indices are seeded from
-/// LHC stored events at open; bootstrap is submitted for LHC dedup (B1).
+/// When `GROK_LHC` is enabled at spawn, also starts the capture worker.
+/// When disabled at spawn, still installs the tee so a later `/lhc on`
+/// (`spawn_capture`) is observed on subsequent persists — without a
+/// seventh runtime hook or mutating `ChatStateActor`'s persistence slot.
 ///
-/// `sampler` is the Chunk 2 inference transport (dedicated non-main model).
-/// Pass `None` only in tests that do not exercise derivation; production
-/// shell always supplies a real [`LhcInferenceSampler`].
+/// Disabled persist path (steady state, any other session's state): one
+/// generation atomic compare; no registry mutex, no SQLite (AA1 / L3).
 pub fn tee_chat_persistence(
     session_id: &str,
     cwd: &str,
@@ -28,65 +37,78 @@ pub fn tee_chat_persistence(
     inner: Box<dyn ChatPersistence>,
     sampler: Option<Arc<dyn LhcInferenceSampler>>,
 ) -> Box<dyn ChatPersistence> {
-    if !is_enabled() {
-        return inner;
-    }
-    let Some(handle) = spawn_capture(session_id, Some(cwd), bootstrap, None, sampler) else {
+    if is_enabled() && spawn_capture(session_id, Some(cwd), bootstrap, None, sampler).is_none() {
         tracing::warn!(
             session_id,
-            "LHC: capture worker failed to start; host continues"
+            "LHC: capture worker failed to start; resolving tee still installed"
         );
-        return inner;
-    };
+    }
     Box::new(LhcTeePersistence {
         inner,
-        handle,
-        capture_stopped: false,
+        session_id: session_id.to_string(),
+        cached: lookup_session_snapshot(session_id),
     })
 }
 
 /// True when a capture worker is registered for `session_id`.
 ///
 /// Post-spawn gating uses registry presence, not a re-read of `GROK_LHC` (F9).
-/// Cheap process-wide atomic first — no registry mutex when LHC is off (L3).
+/// Cheap process-wide atomic first — no registry mutex when LHC is off entirely.
 pub fn capture_active(session_id: &str) -> bool {
-    if !any_capture_active() {
+    if !crate::capture::any_capture_active() {
         return false;
     }
-    is_session_registered(session_id)
+    crate::capture::is_session_registered(session_id)
 }
 
 struct LhcTeePersistence {
     inner: Box<dyn ChatPersistence>,
-    handle: CaptureHandle,
-    /// Set once capture is gone (refused open / crash / shutdown). Skips further
-    /// clone+try_send and logs the transition only once (D3).
-    capture_stopped: bool,
+    session_id: String,
+    /// Last atomic registry snapshot for this session (AB1 / AC1).
+    cached: RegistrySnapshot,
 }
 
 impl LhcTeePersistence {
-    /// Tee into LHC only while the worker channel is live. Non-blocking.
-    fn tee_alive(&mut self) -> bool {
-        if self.capture_stopped {
-            return false;
+    /// Refresh the cached binding from an atomic registry snapshot (AB1).
+    ///
+    /// Production path: only [`lookup_session_snapshot`]. The test-only racy
+    /// branch (AC1) reconstructs the pre-AB1 two-observation call site so the
+    /// suite can fail when that assembly is restored.
+    fn refresh_binding(&mut self) {
+        #[cfg(any(test, feature = "test-util"))]
+        if crate::capture::refresh_binding_racy_for_test() {
+            // Pre-AB1 call site — two separate observations with a window.
+            let handle = crate::capture::lookup_session(&self.session_id);
+            crate::capture::take_and_run_refresh_interleave_hook();
+            let generation = registry_generation();
+            self.cached = RegistrySnapshot::from_parts_for_test(generation, handle);
+            return;
         }
-        if self.handle.is_closed() {
-            warn!(
-                session_id = %self.handle.session_id(),
-                "LHC: capture channel closed; continuing without tee"
-            );
-            self.capture_stopped = true;
-            return false;
+        self.cached = lookup_session_snapshot(&self.session_id);
+        // Test-only fail-safe: interleave after the atomic stamp (no race window).
+        #[cfg(any(test, feature = "test-util"))]
+        crate::capture::take_and_run_refresh_interleave_hook();
+    }
+
+    /// Resolve the live handle for this session, if any.
+    ///
+    /// Steady state: generation atomic only. Mutex only when generation moved.
+    fn with_handle(&mut self, f: impl FnOnce(&CaptureHandle)) {
+        let current = registry_generation();
+        if self.cached.generation() != current {
+            self.refresh_binding();
         }
-        true
+        if let Some(handle) = self.cached.handle()
+            && !handle.is_closed()
+        {
+            f(handle);
+        }
     }
 }
 
 impl ChatPersistence for LhcTeePersistence {
     fn persist_message(&mut self, item: &ConversationItem) {
-        if self.tee_alive() {
-            self.handle.persist(item);
-        }
+        self.with_handle(|h| h.persist(item));
         self.inner.persist_message(item);
     }
 
@@ -94,33 +116,32 @@ impl ChatPersistence for LhcTeePersistence {
         &mut self,
         item: &ConversationItem,
     ) -> oneshot::Receiver<Result<StrictAppendAck, StrictAppendError>> {
-        if self.tee_alive() {
-            self.handle.persist(item);
-        }
+        self.with_handle(|h| h.persist(item));
         self.inner.persist_working_directory_switch_and_ack(item)
     }
 
     fn replace_history(&mut self, items: &[ConversationItem]) {
-        if self.tee_alive() {
-            self.handle.replace_history(items);
-        }
+        self.with_handle(|h| h.replace_history(items));
         self.inner.replace_history(items);
     }
 
     fn flush(&mut self) {
-        if self.tee_alive() {
-            self.handle.flush_async();
-        }
+        self.with_handle(|h| h.flush_async());
         self.inner.flush();
     }
 }
 
 impl Drop for LhcTeePersistence {
     fn drop(&mut self) {
-        // Session teardown signal: actor dropped its ChatPersistence (F4).
-        // Fire-and-forget — never block / never blocking_recv on async runtime.
-        if !self.capture_stopped && !self.handle.is_closed() {
-            self.handle.shutdown_async();
+        // Session teardown: clear last-serve label (Z1) and shut down any live
+        // worker for this session (F4). Fire-and-forget — never block on an
+        // async runtime.
+        crate::serving::clear_last_serve_outcome(&self.session_id);
+        let snap = lookup_session_snapshot(&self.session_id);
+        if let Some(handle) = snap.into_handle()
+            && !handle.is_closed()
+        {
+            handle.shutdown_async();
         }
     }
 }

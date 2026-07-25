@@ -205,9 +205,56 @@ baseline (see above). Must not block the chat-state actor. `dropped_count()` /
 
 ## Gate
 
-`GROK_LHC` is consulted once at tee install (`tee_chat_persistence`).
+`GROK_LHC` is consulted at tee install to decide whether to `spawn_capture`.
+The tee itself is installed **unconditionally** and resolves the live handle
+per persist via `lookup_session` (mid-session `/lhc on` / off→on — A5).
 Post-spawn callbacks use registry presence only — they do not re-read the
 environment.
+
+### Disabled-path law (AA1 / L3)
+
+The tee is installed unconditionally (A5 — mid-session `/lhc on`). Behaviour
+of a session **with no registered worker** on the persist path:
+
+| Property | Guarantee |
+|---|---|
+| I/O / SQLite | none |
+| Registry mutex | **none**, including when other sessions are actively capturing |
+| Worker spawn | none |
+| Steady-state cost | one `registry_generation` atomic compare; cached `None` reused |
+| Re-resolve | mutex taken only when `REGISTRY_GENERATION` moved (register/unregister), including this session's `/lhc on` |
+
+**Why not `any_capture_active` alone:** that counter is process-wide. A disabled
+session B would still call `lookup_session` (and take the global mutex) whenever
+session A had a worker — Chunk 2's L3 defect reintroduced for multisession.
+The tee therefore caches `(generation, Option<CaptureHandle>)` and skips the
+mutex while the generation is unchanged.
+
+**Pinning test:** `aa1_disabled_persist_takes_no_registry_lock_while_other_session_active`
+— asserts `registry_lookup_count()` stays 0 across 1000 persists on disabled B
+while A is active, then proves Y1 (mid-session on for B still captures).
+
+### Refresh snapshot atomicity (AB1 / AC1)
+
+`refresh_binding` must stamp a `(generation, handle)` pair that was true at
+**one** instant. `lookup_session_snapshot` returns a [`RegistrySnapshot`] whose
+fields are private — the tee cache stores that type, so a two-observation
+assembly cannot stamp the cache in production code (compile-time pin).
+Generation is only bumped while the registry mutex is held; the snapshot reads
+both under that lock.
+
+**Unregister during refresh:** with the atomic snapshot, a concurrent
+unregister is either fully before (handle `Some`, older gen → next persist
+re-resolves) or fully after (`None`, new gen). A stale `Some` cannot be stamped
+with a post-unregister generation. `is_closed()` additionally covers a worker
+that has dropped its channel receiver while a Sender `Arc` still exists
+(tokio mpsc closes when the receiver is gone) — that is a channel guarantee,
+not incidental.
+
+**Pinning test:** `ab1_refresh_snapshot_atomic_keeps_mid_session_on` toggles
+the **`refresh_binding` call site** (`set_refresh_binding_racy_for_test`), not
+a helper simulation. Racy call-site assembly loses the post-enable event
+(`events<2`); atomic `lookup_session_snapshot` keeps it (`events>=2`).
 
 ## Chunk 2 — request-context serving (hook 4 in shell `turn.rs`)
 
@@ -572,3 +619,97 @@ together), or one `out.push_str(kind)` site. Three dispositions:
 `Arc<dyn LhcInferenceSampler>` is supplied at `tee_chat_persistence` /
 `spawn_capture`. Trait in `grok-lhc-host`; shell implements
 `ShellLhcInferenceSampler`. Adapter tests use `MockLhcInferenceSampler`.
+
+## Chunk 3A — configuration, status, diagnostics, rollout
+
+### Config precedence
+
+For each `GROK_LHC*` key independently:
+
+1. **Environment variable** if set (including explicit `0` / `false` / `off`)
+2. **`[lhc]` config.toml** (applied only when the section is present)
+3. **Default** — `enabled = false`, root `~/.lhc`, compact `shadow`,
+   equivalence armed, no inference-model override
+
+`LhcConfig::resolve_and_apply` (shell) calls `resolve_lhc_config` +
+`apply_resolved_config`, which **fills unset env vars only** — existing tests
+that set `GROK_LHC*` are unchanged. Default remains **off**.
+
+| TOML field | Env | Notes |
+|---|---|---|
+| `enabled` | `GROK_LHC` | `1`/`true` on; `0`/`false`/`off` force off |
+| `root` | `GROK_LHC_ROOT` | storage root |
+| `compact` | `GROK_LHC_COMPACT` | `shadow` / `replace` |
+| `compact_experimental` | `GROK_LHC_COMPACT_EXPERIMENTAL` | required for Replace |
+| `equivalence` | `GROK_LHC_EQUIVALENCE` | `0`/`false`/`off` disarms |
+| `inference_model` | `GROK_LHC_INFERENCE_MODEL` | ModelCall override |
+
+### Status surface (`/lhc`)
+
+Always-on slash command. Reports **active context engine** (`LHC` vs `native`)
+so users never guess which path built the request. When off: plain message, no
+SQLite I/O. When on: storage path/size, event counts, view status, equivalence
+counters, health.
+
+Subcommands: `status` (default), `health`, `repair`, `repair confirm <id>`,
+`on`, `off`.
+
+### Privacy / redaction / telemetry (A4)
+
+**Checked:** no code path uploads LHC SQLite or thread files. Telemetry uses
+`xai_grok_telemetry::events` / `session_ctx::log_event` for slash usage
+(`SlashCommandUsed`) and counts — **never** conversation content or DB blobs.
+Host has no redaction layer for LHC storage today; LHC stores the same text the
+native conversation already holds on disk (`updates.jsonl` / session files).
+We did **not** invent a new redaction scheme.
+
+### Write-back recoverability (A5)
+
+Chunk 2 Replace write-back **rewrites** the native in-memory conversation (and
+persists via the normal chat-state path). After a successful Replace compact:
+
+| Artifact | Survives? |
+|---|---|
+| Native pre-compaction body in RAM | **No** — replaced |
+| Native session persistence (`updates.jsonl` / session dir) | **Partial** — depends on host persistence of the post-write-back body; prior turns may remain in history files depending on prune policy — **live-cert must confirm** |
+| LHC event log (thread SQLite) | **Yes** — full fidelity; rebuildable |
+| Shadow mode | Native unchanged; LHC preview only |
+
+Turning LHC **off** mid-session (`/lhc off`) stops capture and returns the
+serve path to native; it does **not** undo a prior Replace write-back.
+
+### Migration / discovery (A6)
+
+- Per-session thread file: `{root}/threads/grok-{encoded_session_id}.sqlite`
+- First enable on an existing session: bootstrap submits native history;
+  LHC dedup is the diff engine (no double-record on re-enable).
+- `/lhc on` mid-session: `spawn_capture` with current conversation. The capture
+  tee **resolves its handle per persist** (`lookup_session`), so a worker
+  attached after spawn-off (or after `/lhc off`) is observed without
+  reinstalling the decorator. Product-path certs: `chunk3a_tee_mid_session_on_from_spawned_off`
+  (Probe A) and `chunk3a_tee_off_then_on_keeps_capturing` (Probe B).
+- `/lhc off`: `shutdown_session` (host slash handler).
+- Active context engine in `/lhc` status follows the **last serve turn**
+  (substituted vs fail-open reason), not capture registration alone.
+
+### Adapter-simulated vs host-verified (for 3B)
+
+| Claim | Where verified in 3A |
+|---|---|
+| Config precedence env > file > default | adapter unit (`runtime_config`) + shell `LhcConfig::resolve_and_apply` |
+| Status off = cheap native label | adapter `status::tests` + cert |
+| Health healthy / broken store | adapter cert (schema validated, not filename-inferred) |
+| Mid-session disable + re-enable | adapter cert — **product tee path** (Probes A/B), not handle-only |
+| Status engine = last serve outcome | adapter cert (`chunk3a_status_reports_fail_open_reason_after_timeout`) |
+| Repair confirm bound to displayed plan | adapter unit + cert |
+| `/lhc` slash rendering + BuiltinAction | **host** (compile-exhaustive); live UX → **3B** |
+| Telemetry no SQLite upload | inspection (MAPPING); live → **3B** |
+| Replace recoverability of native files | documented finding; **3B** confirms |
+
+### Carried to Chunk 3B (named checkpoints — do not fix in 3A)
+
+| Item | Checkpoint |
+|---|---|
+| Unknown `/lhc` subcommands fall through to Status; `repair confirm` case-sensitivity asymmetry vs other arms | **3B slash UX** — enumerate unknown → help; normalize confirm case |
+| Status early-return asymmetry (`any_capture_active` process-wide vs `capture_active` session-local) | **3B status** — same session scope on both gates |
+| Latent `unsafe set_var` from `refresh_settings_and_reapply` (`agent_ops.rs`) re-entering `apply_resolved_config` on `/new` with tokio workers live | **3B config refresh** — serialize apply or avoid env mutation under live runtime |

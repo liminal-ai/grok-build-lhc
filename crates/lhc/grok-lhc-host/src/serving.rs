@@ -118,6 +118,57 @@ pub enum ServeDecision {
     Native { reason: &'static str },
 }
 
+/// What the last `serve_request_context` call decided for a session (Y2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastServeOutcome {
+    pub substituted: bool,
+    /// Fail-open reason when `substituted` is false.
+    pub reason: Option<&'static str>,
+}
+
+fn last_serve_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, LastServeOutcome>>
+{
+    static MAP: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, LastServeOutcome>>,
+    > = std::sync::OnceLock::new();
+    MAP.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Record the serve decision used for the last turn of `session_id`.
+pub fn note_last_serve(session_id: &str, decision: &ServeDecision) {
+    let outcome = match decision {
+        ServeDecision::Substitute { .. } => LastServeOutcome {
+            substituted: true,
+            reason: None,
+        },
+        ServeDecision::Native { reason } => LastServeOutcome {
+            substituted: false,
+            reason: Some(*reason),
+        },
+    };
+    if let Ok(mut g) = last_serve_map().lock() {
+        g.insert(session_id.to_string(), outcome);
+    }
+}
+
+/// Last recorded serve outcome for `session_id`, if any turn consulted LHC.
+pub fn last_serve_outcome(session_id: &str) -> Option<LastServeOutcome> {
+    last_serve_map()
+        .lock()
+        .ok()
+        .and_then(|g| g.get(session_id).cloned())
+}
+
+/// Evict the last-serve outcome for `session_id` (Z1).
+///
+/// Called on `/lhc off` and session teardown so status cannot keep claiming
+/// LHC after capture is gone.
+pub fn clear_last_serve_outcome(session_id: &str) {
+    if let Ok(mut g) = last_serve_map().lock() {
+        g.remove(session_id);
+    }
+}
+
 /// Split host-owned leading `System` items from the rest of a native request body.
 pub fn split_system_prefix(
     native: &[ConversationItem],

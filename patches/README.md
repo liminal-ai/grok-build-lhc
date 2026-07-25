@@ -38,7 +38,12 @@ Split it only if a future chunk changes hooks independently.
          crates/codegen/xai-grok-shell/src/session/acp_session_tests/rewind_cross_compaction_tests.rs \
          crates/codegen/xai-grok-shell/src/session/compaction.rs \
          crates/codegen/xai-grok-shell/src/session/lhc_inference.rs \
-         crates/codegen/xai-grok-shell/src/session/mod.rs
+         crates/codegen/xai-grok-shell/src/session/mod.rs \
+         crates/codegen/xai-grok-shell/src/session/slash_commands.rs \
+         crates/codegen/xai-grok-shell/src/session/acp_session_impl/slash_exec.rs \
+         crates/codegen/xai-grok-shell/src/config/mod.rs \
+         crates/codegen/xai-grok-shell/src/config/tests.rs \
+         crates/codegen/xai-grok-shell/src/agent/config.rs
 
 **Regenerate the WHOLE series, not one commit.** This example previously used
 `format-patch -1 <commit>` with only Chunk 1's four paths. Two traps in that:

@@ -1874,5 +1874,93 @@ pub fn remove_hooks_path_from_file(
     )?;
     Ok(())
 }
+/// LHC (Long Horizon Context) configuration (`[lhc]` in config.toml).
+///
+/// Off by default. Precedence for each field (documented in
+/// `crates/lhc/grok-lhc-host/MAPPING.md`):
+/// 1. Environment variable if set (`GROK_LHC`, `GROK_LHC_ROOT`, …)
+/// 2. This config section
+/// 3. Built-in default (enabled = false)
+///
+/// ```toml
+/// [lhc]
+/// enabled = true
+/// root = "/var/lib/lhc"
+/// compact = "shadow"          # or "replace" (needs compact_experimental)
+/// compact_experimental = false
+/// equivalence = true
+/// inference_model = "grok-4"
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct LhcConfig {
+    /// Whether LHC capture/serving should be enabled when env does not say.
+    pub enabled: bool,
+    /// Storage root override (maps to `GROK_LHC_ROOT`).
+    pub root: Option<std::path::PathBuf>,
+    /// Compaction mode: `"shadow"` (default) or `"replace"`.
+    pub compact: Option<String>,
+    /// Gate for Replace mode (maps to `GROK_LHC_COMPACT_EXPERIMENTAL`).
+    pub compact_experimental: bool,
+    /// Equivalence instrumentation (default true; set false to disarm).
+    pub equivalence: Option<bool>,
+    /// Optional inference model override for LHC ModelCall.
+    pub inference_model: Option<String>,
+}
+
+impl LhcConfig {
+    /// Resolve from merged TOML then apply into process env for unset keys.
+    ///
+    /// Env always wins when present. Safe to call from
+    /// [`crate::agent::config::Config::resolve_runtime_fields`].
+    ///
+    /// A malformed `[lhc]` section is **not** silently treated as default-off
+    /// while still attributing provenance to config (Y7): the parse error is
+    /// recorded for `/lhc` status and the section is ignored.
+    pub fn resolve_and_apply(config: &toml::Value) -> Self {
+        let (file, section_ok) = match config.get("lhc") {
+            None => {
+                grok_lhc_host::clear_config_parse_error();
+                (Self::default(), false)
+            }
+            Some(v) => match v.clone().try_into::<Self>() {
+                Ok(f) => {
+                    grok_lhc_host::clear_config_parse_error();
+                    (f, true)
+                }
+                Err(e) => {
+                    let msg = format!("invalid [lhc] section: {e}");
+                    tracing::error!(error = %e, "{msg}");
+                    grok_lhc_host::note_config_parse_error(msg);
+                    (Self::default(), false)
+                }
+            },
+        };
+        let resolved = grok_lhc_host::resolve_lhc_config(&grok_lhc_host::LhcFileConfig {
+            // Only attribute provenance to the file when `[lhc]` parsed cleanly.
+            enabled: if section_ok { Some(file.enabled) } else { None },
+            root: if section_ok { file.root.clone() } else { None },
+            compact: if section_ok {
+                file.compact.clone()
+            } else {
+                None
+            },
+            compact_experimental: if section_ok {
+                Some(file.compact_experimental)
+            } else {
+                None
+            },
+            equivalence: if section_ok { file.equivalence } else { None },
+            inference_model: if section_ok {
+                file.inference_model.clone()
+            } else {
+                None
+            },
+        });
+        grok_lhc_host::apply_resolved_config(&resolved);
+        file
+    }
+}
+
 #[cfg(test)]
 mod tests;

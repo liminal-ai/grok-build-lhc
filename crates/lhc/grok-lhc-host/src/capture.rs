@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(any(test, feature = "test-util"))]
 use std::thread::JoinHandle;
 
@@ -24,6 +24,13 @@ pub const CAPTURE_QUEUE_CAP: usize = 1024;
 
 /// Process-wide count of live capture workers — cheap gate for model-change (A9).
 static ACTIVE_CAPTURES: AtomicUsize = AtomicUsize::new(0);
+
+/// Bumped on every successful register / unregister.
+///
+/// Tees cache `(generation, handle)` so a disabled session can skip the
+/// registry mutex while other sessions are active (AA1). Compare with
+/// [`registry_generation`] before calling [`lookup_session`].
+static REGISTRY_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Test-only: increments on every registry mutex acquisition in [`lookup_session`].
 #[cfg(any(test, feature = "test-util"))]
@@ -61,6 +68,7 @@ enum CaptureCmd {
     ),
     PreviewCompact(oneshot::Sender<Result<lhc::shared_tech::view::PreviewCompactOutcome, String>>),
     Compact(oneshot::Sender<Result<lhc::shared_tech::view::CompactReceipt, String>>),
+    GetViewStatus(oneshot::Sender<Result<lhc::shared_tech::view::ViewStatus, String>>),
     #[cfg(any(test, feature = "test-util"))]
     Poison(oneshot::Sender<()>),
     #[cfg(any(test, feature = "test-util"))]
@@ -258,6 +266,28 @@ impl CaptureHandle {
         rx.await.map_err(|_| "capture worker dropped".to_string())?
     }
 
+    /// List recorded events (status / diagnostics).
+    pub async fn list_events(&self) -> Result<Vec<lhc::intake_stream::EventRecord>, String> {
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .tx
+            .send(CaptureCmd::ListEvents(tx))
+            .await
+            .map_err(|_| "capture worker gone".to_string())?;
+        rx.await.map_err(|_| "capture worker dropped".to_string())?
+    }
+
+    /// LHC view derivation / visibility status.
+    pub async fn get_view_status(&self) -> Result<lhc::shared_tech::view::ViewStatus, String> {
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .tx
+            .send(CaptureCmd::GetViewStatus(tx))
+            .await
+            .map_err(|_| "capture worker gone".to_string())?;
+        rx.await.map_err(|_| "capture worker dropped".to_string())?
+    }
+
     /// Fire-and-forget shutdown — drains then closes (safe from async Drop).
     pub fn shutdown_async(&self) {
         let _ = self.inner.shutdown_tx.send(true);
@@ -407,7 +437,9 @@ impl CaptureHandle {
 }
 
 struct RegistryEntry {
-    weak: Weak<CaptureShared>,
+    /// Strong ref — keeps the worker alive when the tee only resolves per call
+    /// via [`lookup_session`] (Y1). Removed on worker unregister / shutdown.
+    shared: Arc<CaptureShared>,
     worker_id: u64,
 }
 
@@ -425,19 +457,18 @@ fn try_register_session(session_id: &str, shared: &Arc<CaptureShared>) -> bool {
     let Ok(mut map) = registry().lock() else {
         return false;
     };
-    if let Some(entry) = map.get(session_id)
-        && entry.weak.upgrade().is_some()
-    {
+    if map.contains_key(session_id) {
         return false;
     }
     map.insert(
         session_id.to_string(),
         RegistryEntry {
-            weak: Arc::downgrade(shared),
+            shared: Arc::clone(shared),
             worker_id: shared.worker_id,
         },
     );
     ACTIVE_CAPTURES.fetch_add(1, Ordering::Relaxed);
+    REGISTRY_GENERATION.fetch_add(1, Ordering::Release);
     true
 }
 
@@ -451,16 +482,70 @@ fn unregister_worker(session_id: &str, worker_id: u64) {
     ) {
         map.remove(session_id);
         ACTIVE_CAPTURES.fetch_sub(1, Ordering::Relaxed);
+        REGISTRY_GENERATION.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Atomic `(generation, handle)` observed under the registry mutex (AB1 / AC1).
+///
+/// Fields are private: the only production constructor is
+/// [`lookup_session_snapshot`]. The tee cache stores this type so a
+/// two-observation assembly (`lookup_session` + `registry_generation`) cannot
+/// stamp the cache without going through a snapshot (or the test-only
+/// [`RegistrySnapshot::from_parts_for_test`] escape hatch).
+#[derive(Clone)]
+pub struct RegistrySnapshot {
+    generation: u64,
+    handle: Option<CaptureHandle>,
+}
+
+impl RegistrySnapshot {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn handle(&self) -> Option<&CaptureHandle> {
+        self.handle.as_ref()
+    }
+
+    pub fn into_handle(self) -> Option<CaptureHandle> {
+        self.handle
+    }
+
+    /// Test-only: assemble a pair without holding the registry lock.
+    ///
+    /// Used solely to force the pre-AB1 call-site defect in
+    /// `refresh_binding` under [`set_refresh_binding_racy_for_test`].
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn from_parts_for_test(generation: u64, handle: Option<CaptureHandle>) -> Self {
+        Self { generation, handle }
     }
 }
 
 pub fn lookup_session(session_id: &str) -> Option<CaptureHandle> {
+    lookup_session_snapshot(session_id).into_handle()
+}
+
+/// Atomically observe `(generation, handle)` under the registry mutex (AB1).
+///
+/// Generation is only bumped while this same mutex is held, so the pair is a
+/// true snapshot — never a handle from one instant stamped with a generation
+/// from another.
+pub fn lookup_session_snapshot(session_id: &str) -> RegistrySnapshot {
     #[cfg(any(test, feature = "test-util"))]
     REGISTRY_LOOKUPS.fetch_add(1, Ordering::Relaxed);
-    let map = registry().lock().ok()?;
-    let entry = map.get(session_id)?;
-    let inner = entry.weak.upgrade()?;
-    Some(CaptureHandle { inner })
+    let Ok(map) = registry().lock() else {
+        return RegistrySnapshot {
+            generation: REGISTRY_GENERATION.load(Ordering::Acquire),
+            handle: None,
+        };
+    };
+    let handle = map.get(session_id).map(|entry| CaptureHandle {
+        inner: Arc::clone(&entry.shared),
+    });
+    // Still holding the mutex: register/unregister cannot interleave.
+    let generation = REGISTRY_GENERATION.load(Ordering::Relaxed);
+    RegistrySnapshot { generation, handle }
 }
 
 pub fn is_session_registered(session_id: &str) -> bool {
@@ -471,7 +556,16 @@ pub fn any_capture_active() -> bool {
     ACTIVE_CAPTURES.load(Ordering::Relaxed) > 0
 }
 
-/// Test-only: how many times [`lookup_session`] has taken the registry mutex.
+/// Monotonic registry generation — bumped on register / unregister (AA1).
+///
+/// Suitable for the tee's **fast-path compare** only. Do not pair this with a
+/// separately observed handle to stamp the cache — use [`lookup_session_snapshot`].
+#[inline]
+pub fn registry_generation() -> u64 {
+    REGISTRY_GENERATION.load(Ordering::Acquire)
+}
+
+/// Test-only: how many times snapshot/lookup has taken the registry mutex.
 #[cfg(any(test, feature = "test-util"))]
 pub fn registry_lookup_count() -> u64 {
     REGISTRY_LOOKUPS.load(Ordering::Relaxed)
@@ -481,6 +575,42 @@ pub fn registry_lookup_count() -> u64 {
 #[cfg(any(test, feature = "test-util"))]
 pub fn reset_registry_lookup_count() {
     REGISTRY_LOOKUPS.store(0, Ordering::Relaxed);
+}
+
+/// Test-only: when set, [`crate::tee`] `refresh_binding` uses the pre-AB1
+/// two-observation assembly (call site), not a helper simulation.
+#[cfg(any(test, feature = "test-util"))]
+static REFRESH_BINDING_RACY: AtomicBool = AtomicBool::new(false);
+
+#[cfg(any(test, feature = "test-util"))]
+static REFRESH_INTERLEAVE: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+
+/// Test-only: force `refresh_binding` to assemble the cache from two separate
+/// observations with an interleave window (AC1 — pins the call site).
+#[cfg(any(test, feature = "test-util"))]
+pub fn set_refresh_binding_racy_for_test(racy: bool) {
+    REFRESH_BINDING_RACY.store(racy, Ordering::SeqCst);
+}
+
+#[cfg(any(test, feature = "test-util"))]
+pub fn refresh_binding_racy_for_test() -> bool {
+    REFRESH_BINDING_RACY.load(Ordering::SeqCst)
+}
+
+/// Test-only: one-shot hook run in the refresh interleave window.
+#[cfg(any(test, feature = "test-util"))]
+pub fn set_refresh_interleave_hook_for_test(hook: Option<Box<dyn FnOnce() + Send>>) {
+    *REFRESH_INTERLEAVE.lock().unwrap_or_else(|e| e.into_inner()) = hook;
+}
+
+/// Test-only: run and clear the interleave hook.
+#[cfg(any(test, feature = "test-util"))]
+pub fn take_and_run_refresh_interleave_hook() {
+    if let Ok(mut g) = REFRESH_INTERLEAVE.lock()
+        && let Some(hook) = g.take()
+    {
+        hook();
+    }
 }
 
 /// Spawn a dedicated OS thread + tokio runtime owning the LHC session.
@@ -881,6 +1011,10 @@ async fn process_cmd(
         }
         CaptureCmd::Compact(ack) => {
             let _ = ack.send(sess.compact().await);
+            false
+        }
+        CaptureCmd::GetViewStatus(ack) => {
+            let _ = ack.send(sess.get_view_status().await);
             false
         }
         #[cfg(any(test, feature = "test-util"))]

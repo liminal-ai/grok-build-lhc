@@ -80,6 +80,100 @@ impl SessionActor {
                 ok_end_turn(0, None)
             }
             BuiltinAction::ContextInfo => ok_end_turn(0, None),
+            BuiltinAction::Lhc { op } => {
+                use crate::session::slash_commands::LhcSlashOp;
+                let sid = self.session_info.id.0.as_ref();
+                let text = match op {
+                    LhcSlashOp::Status => {
+                        let report = grok_lhc_host::status_report(sid).await;
+                        grok_lhc_host::format_status_report(&report)
+                    }
+                    LhcSlashOp::Health => {
+                        let h = grok_lhc_host::health_check(sid).await;
+                        grok_lhc_host::format_health_report(&h)
+                    }
+                    LhcSlashOp::Repair => {
+                        let plan = grok_lhc_host::plan_repair(sid).await;
+                        grok_lhc_host::format_repair_plan(&plan)
+                    }
+                    LhcSlashOp::RepairConfirm { id } => {
+                        if id.is_empty() {
+                            "Usage: /lhc repair confirm <id>\nRun `/lhc repair` first.".to_owned()
+                        } else {
+                            match grok_lhc_host::execute_repair(sid, &id).await {
+                                Ok(msg) => msg,
+                                Err(e) => format!("Repair failed: {e}"),
+                            }
+                        }
+                    }
+                    LhcSlashOp::Off => {
+                        if grok_lhc_host::capture_active(sid) {
+                            grok_lhc_host::shutdown_session(sid);
+                            "**LHC:** capture stopped for this session.\n\n\
+                             **Active context engine:** native\n\n\
+                             LHC storage is kept on disk. Native conversation is unchanged. \
+                             Subsequent turns use the native request-context path. \
+                             Use `/lhc on` to re-attach."
+                                .to_owned()
+                        } else {
+                            "**LHC:** capture was not active for this session.".to_owned()
+                        }
+                    }
+                    LhcSlashOp::On => {
+                        if grok_lhc_host::capture_active(sid) {
+                            "**LHC:** capture already active for this session.".to_owned()
+                        } else if !grok_lhc_host::is_enabled() {
+                            "**LHC:** process gate is off.\n\n\
+                             Set `GROK_LHC=1` or `[lhc] enabled = true` (then restart / \
+                             reload config) before `/lhc on`."
+                                .to_owned()
+                        } else {
+                            // Mid-session attach: bootstrap from live native history.
+                            // Reconstruct SamplerConfig so ModelCall compaction has
+                            // the same sampler capability as spawn-time tee install (Z2).
+                            let conversation = self.chat_state_handle.get_conversation().await;
+                            let sampling_config = self.reconstruct_full_config().await;
+                            let sampler =
+                                crate::session::lhc_inference::ShellLhcInferenceSampler::new(
+                                    sampling_config,
+                                    self.auth_manager.clone(),
+                                    sid.to_string(),
+                                    std::time::Duration::from_secs(60),
+                                )
+                                .into_arc();
+                            match grok_lhc_host::spawn_capture(
+                                sid,
+                                Some(self.session_info.cwd.as_ref()),
+                                &conversation,
+                                None,
+                                Some(sampler),
+                            ) {
+                                Some(_) => {
+                                    let compact_line =
+                                        if grok_lhc_host::inference_sampler_registered(sid) {
+                                            "**ModelCall compact:** available (sampler registered)."
+                                        } else {
+                                            "**ModelCall compact:** unavailable — sampler did not \
+                                         register; start a new session to restore compaction."
+                                        };
+                                    format!(
+                                        "**LHC:** capture started for this session.\n\n\
+                                         Existing native history was submitted as bootstrap \
+                                         (dedup prevents double-record on re-enable).\n\n\
+                                         **Active context engine:** (no serve turn yet) — the \
+                                         next model turn records whether LHC substituted or \
+                                         fail-opened to native.\n\n\
+                                         {compact_line}"
+                                    )
+                                }
+                                None => "**LHC:** failed to start capture (see logs).".to_owned(),
+                            }
+                        }
+                    }
+                };
+                self.send_host_turn_slash_command_output(&text).await;
+                ok_end_turn(0, None)
+            }
             BuiltinAction::HooksTrust => {
                 let msg = match Self::do_hooks_trust_project(&self.session_info.cwd) {
                     Ok(root) => {
