@@ -6,8 +6,10 @@ use std::thread;
 use std::time::Duration;
 
 use grok_lhc_host::{
-    CaptureHandle, capture_active, capture_model_or_thinking_change, encode_session_id_for_path,
-    is_enabled, lookup_session, paths_disagree, shutdown_session, spawn_capture,
+    CaptureHandle, CompactMode, MockLhcInferenceSampler, ServeDecision, apply_serve_decision,
+    body_has_tool_cycle, capture_active, capture_model_or_thinking_change, decide_substitution,
+    encode_session_id_for_path, is_enabled, lookup_session, paths_disagree, resolve_compact_mode,
+    serve_request_context, set_compact_mode_for_test, shutdown_session, spawn_capture,
     tee_chat_persistence, thread_file_path,
 };
 use lhc::intake_stream::{BatchEventOutcome, BatchSkipReason, EventRecord};
@@ -89,7 +91,7 @@ fn disabled_tee_is_passthrough_no_registry() {
         std::env::set_var("GROK_LHC_ROOT", root.path());
     }
     let sid = "cert-disabled";
-    let _p = tee_chat_persistence(sid, "/tmp", &[], Box::new(NullChatPersistence));
+    let _p = tee_chat_persistence(sid, "/tmp", &[], Box::new(NullChatPersistence), None);
     assert!(!capture_active(sid));
     match prev {
         Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
@@ -109,7 +111,7 @@ fn live_capture_and_idempotent_replay() {
         ConversationItem::user("one"),
         ConversationItem::assistant("two"),
     ];
-    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path())).unwrap();
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
     handle.persist(&history[0]);
     handle.persist(&history[1]);
     handle.flush_blocking();
@@ -118,7 +120,7 @@ fn live_capture_and_idempotent_replay() {
     handle.shutdown_blocking();
     wait_registry_gone(sid);
 
-    let handle2 = spawn_capture(sid, Some("/tmp"), &history, Some(root.path())).unwrap();
+    let handle2 = spawn_capture(sid, Some("/tmp"), &history, Some(root.path()), None).unwrap();
     let second = wait_exact(&handle2, 3);
     assert_eq!(keys(&second), k1);
     handle2.shutdown_blocking();
@@ -133,14 +135,14 @@ fn restart_reuses_thread_and_skips_duplicate_bootstrap() {
         ConversationItem::assistant("answer"),
     ];
     let first_keys = {
-        let handle = spawn_capture(sid, Some("/tmp"), &history, Some(root.path())).unwrap();
+        let handle = spawn_capture(sid, Some("/tmp"), &history, Some(root.path()), None).unwrap();
         let ev = wait_exact(&handle, 3);
         let k = keys(&ev);
         handle.shutdown_blocking();
         wait_registry_gone(sid);
         k
     };
-    let handle2 = spawn_capture(sid, Some("/tmp"), &history, Some(root.path())).unwrap();
+    let handle2 = spawn_capture(sid, Some("/tmp"), &history, Some(root.path()), None).unwrap();
     let ev2 = wait_exact(&handle2, 3);
     assert_eq!(keys(&ev2), first_keys);
     handle2.shutdown_blocking();
@@ -153,8 +155,8 @@ fn session_fork_transcripts_are_independent_on_shared_root() {
         ConversationItem::user("shared"),
         ConversationItem::assistant("ok"),
     ];
-    let a = spawn_capture("fork-a", Some("/tmp"), &history, Some(root.path())).unwrap();
-    let b = spawn_capture("fork-b", Some("/tmp"), &history, Some(root.path())).unwrap();
+    let a = spawn_capture("fork-a", Some("/tmp"), &history, Some(root.path()), None).unwrap();
+    let b = spawn_capture("fork-b", Some("/tmp"), &history, Some(root.path()), None).unwrap();
     let ea = wait_exact(&a, 3);
     let eb = wait_exact(&b, 3);
     assert!(keys(&ea).is_disjoint(&keys(&eb)));
@@ -171,8 +173,8 @@ fn session_fork_transcripts_are_independent_on_shared_root() {
     wait_registry_gone("fork-a");
     wait_registry_gone("fork-b");
 
-    let a2 = spawn_capture("fork-a", Some("/tmp"), &history, Some(root.path())).unwrap();
-    let b2 = spawn_capture("fork-b", Some("/tmp"), &history, Some(root.path())).unwrap();
+    let a2 = spawn_capture("fork-a", Some("/tmp"), &history, Some(root.path()), None).unwrap();
+    let b2 = spawn_capture("fork-b", Some("/tmp"), &history, Some(root.path()), None).unwrap();
     assert_eq!(keys(&wait_exact(&a2, 4)), ka);
     assert_eq!(keys(&wait_exact(&b2, 3)), kb);
     a2.shutdown_blocking();
@@ -190,7 +192,7 @@ fn prune_shaped_replace_history_adds_zero_events() {
         ConversationItem::user("u2"),
         ConversationItem::assistant("a2"),
     ];
-    let handle = spawn_capture(sid, Some("/tmp"), &items, Some(root.path())).unwrap();
+    let handle = spawn_capture(sid, Some("/tmp"), &items, Some(root.path()), None).unwrap();
     let before = wait_exact(&handle, 6);
     let before_keys = keys(&before);
 
@@ -222,7 +224,7 @@ fn replace_history_records_repair_tool_result_only() {
         model_fingerprint: None,
         reasoning_effort: None,
     });
-    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path())).unwrap();
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
     handle.persist(&user);
     handle.persist(&assistant);
     handle.flush_blocking();
@@ -263,7 +265,7 @@ fn replace_history_records_injected_system_reminder_only() {
         ConversationItem::user("u"),
         ConversationItem::assistant("a"),
     ];
-    let handle = spawn_capture(sid, Some("/tmp"), &items, Some(root.path())).unwrap();
+    let handle = spawn_capture(sid, Some("/tmp"), &items, Some(root.path()), None).unwrap();
     let before = wait_exact(&handle, 3);
     let before_keys = keys(&before);
 
@@ -294,7 +296,7 @@ fn replace_history_records_compaction_meta_only() {
         ConversationItem::user("u2"),
         ConversationItem::assistant("a2"),
     ];
-    let handle = spawn_capture(sid, Some("/tmp"), &full, Some(root.path())).unwrap();
+    let handle = spawn_capture(sid, Some("/tmp"), &full, Some(root.path()), None).unwrap();
     let before = wait_exact(&handle, 6);
     let before_keys = keys(&before);
 
@@ -332,7 +334,7 @@ fn rewind_then_reappend_identical_item_is_recorded_across_restart() {
     let sid = "cert-rewind-reappend";
     let a = ConversationItem::user("a");
     let b = ConversationItem::assistant("b");
-    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path())).unwrap();
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
     handle.persist(&a);
     handle.persist(&b);
     handle.flush_blocking();
@@ -366,6 +368,7 @@ fn rewind_then_reappend_identical_item_is_recorded_across_restart() {
         Some("/tmp"),
         std::slice::from_ref(&a),
         Some(root.path()),
+        None,
     )
     .unwrap();
     let resumed = wait_exact(&handle2, 5);
@@ -385,7 +388,7 @@ fn rewind_then_reappend_identical_item_is_recorded_across_restart() {
 fn concurrency_identical_digest_path() {
     let root = TempDir::new().unwrap();
     let sid = "cert-conc";
-    let handle = Arc::new(spawn_capture(sid, Some("/tmp"), &[], Some(root.path())).unwrap());
+    let handle = Arc::new(spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap());
     let item = ConversationItem::user("same");
     let mut joins = Vec::new();
     for _ in 0..8 {
@@ -413,7 +416,7 @@ fn crash_mid_batch_no_duplication_on_rerun() {
         ConversationItem::user("u2"),
         ConversationItem::assistant("a2"),
     ];
-    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path())).unwrap();
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
     let (_release_tx, release_rx) = oneshot::channel();
     let entered = handle.block_worker(release_rx);
     let _ = entered.blocking_recv();
@@ -429,7 +432,7 @@ fn crash_mid_batch_no_duplication_on_rerun() {
 
     // Discriminating observation (D2): empty bootstrap must see 0 events —
     // proves queued work never committed (a calm drain would leave 6).
-    let probe = spawn_capture(sid, Some("/tmp"), &[], Some(root.path())).unwrap();
+    let probe = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
     thread::sleep(Duration::from_millis(100));
     let empty = probe.list_events_blocking().unwrap();
     assert_eq!(
@@ -441,7 +444,7 @@ fn crash_mid_batch_no_duplication_on_rerun() {
     probe.shutdown_blocking();
     wait_registry_gone(sid);
 
-    let handle2 = spawn_capture(sid, Some("/tmp"), &items, Some(root.path())).unwrap();
+    let handle2 = spawn_capture(sid, Some("/tmp"), &items, Some(root.path()), None).unwrap();
     let final_ev = wait_exact(&handle2, 6);
     assert_eq!(final_ev.len(), 6);
     assert_eq!(keys(&final_ev).len(), 6);
@@ -449,7 +452,7 @@ fn crash_mid_batch_no_duplication_on_rerun() {
     handle2.shutdown_blocking();
     wait_registry_gone(sid);
 
-    let handle3 = spawn_capture(sid, Some("/tmp"), &items, Some(root.path())).unwrap();
+    let handle3 = spawn_capture(sid, Some("/tmp"), &items, Some(root.path()), None).unwrap();
     let again = wait_exact(&handle3, 6);
     assert_eq!(keys(&again), k);
     handle3.shutdown_blocking();
@@ -467,7 +470,7 @@ fn poisoned_lhc_disables_and_host_continues() {
     }
     let sid = "cert-poison";
     let (mock, mut rx) = xai_chat_state::MockChatPersistence::new();
-    let mut tee = tee_chat_persistence(sid, "/tmp", &[], Box::new(mock));
+    let mut tee = tee_chat_persistence(sid, "/tmp", &[], Box::new(mock), None);
     let handle = lookup_session(sid).unwrap();
     handle.poison_blocking();
     for i in 0..5 {
@@ -506,7 +509,7 @@ fn poisoned_lhc_disables_and_host_continues() {
 fn model_toggle_cycle_records_all_transitions() {
     let root = TempDir::new().unwrap();
     let sid = "cert-model-toggle";
-    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path())).unwrap();
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
     handle.model_change("m1", "m1", "none", "high");
     handle.model_change("m1", "m1", "high", "none");
     handle.model_change("m1", "m1", "none", "high");
@@ -514,7 +517,7 @@ fn model_toggle_cycle_records_all_transitions() {
     assert_eq!(wait_exact(&handle, 3).len(), 3);
     handle.shutdown_blocking();
     wait_registry_gone(sid);
-    let handle2 = spawn_capture(sid, Some("/tmp"), &[], Some(root.path())).unwrap();
+    let handle2 = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
     handle2.model_change("m1", "m1", "high", "none");
     handle2.flush_blocking();
     assert_eq!(wait_exact(&handle2, 4).len(), 4);
@@ -525,7 +528,7 @@ fn model_toggle_cycle_records_all_transitions() {
 fn model_noop_suppressed_and_previous_is_real() {
     let root = TempDir::new().unwrap();
     let sid = "cert-model-noop";
-    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path())).unwrap();
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
     handle.model_change("gpt-a", "gpt-a", "none", "none");
     handle.flush_blocking();
     thread::sleep(Duration::from_millis(100));
@@ -543,14 +546,14 @@ fn model_noop_suppressed_and_previous_is_real() {
 fn model_toggle_survives_colon_session_id() {
     let root = TempDir::new().unwrap();
     let sid = "acp:sess:with:colons";
-    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path())).unwrap();
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
     handle.model_change("m", "m", "none", "high");
     handle.model_change("m", "m", "high", "none");
     handle.flush_blocking();
     assert_eq!(wait_exact(&handle, 2).len(), 2);
     handle.shutdown_blocking();
     wait_registry_gone(sid);
-    let handle2 = spawn_capture(sid, Some("/tmp"), &[], Some(root.path())).unwrap();
+    let handle2 = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
     handle2.model_change("m", "m", "none", "high");
     handle2.flush_blocking();
     assert_eq!(wait_exact(&handle2, 3).len(), 3);
@@ -561,7 +564,7 @@ fn model_toggle_survives_colon_session_id() {
 fn batch_skip_reports_duplicate_idempotency_key() {
     let root = TempDir::new().unwrap();
     let sid = "cert-dup-skip";
-    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path())).unwrap();
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
     let item = ConversationItem::user("dup");
     let (mapped, _) = grok_lhc_host::map_history(sid, 0, std::slice::from_ref(&item));
     handle.persist(&item);
@@ -584,7 +587,7 @@ fn batch_skip_reports_duplicate_idempotency_key() {
 fn teardown_drains_via_watch_branch() {
     let root = TempDir::new().unwrap();
     let sid = "cert-teardown-watch";
-    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path())).unwrap();
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
     let (release_tx, release_rx) = oneshot::channel();
     let entered = handle.block_worker(release_rx);
     let _ = entered.blocking_recv();
@@ -594,7 +597,7 @@ fn teardown_drains_via_watch_branch() {
     handle.shutdown_watch_only();
     let _ = release_tx.send(());
     wait_registry_gone(sid);
-    let handle2 = spawn_capture(sid, Some("/tmp"), &[], Some(root.path())).unwrap();
+    let handle2 = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
     assert_eq!(wait_exact(&handle2, 5).len(), 5);
     handle2.shutdown_blocking();
 }
@@ -604,7 +607,7 @@ fn teardown_drains_via_watch_branch() {
 fn teardown_drains_via_shutdown_cmd_branch() {
     let root = TempDir::new().unwrap();
     let sid = "cert-teardown-cmd";
-    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path())).unwrap();
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
     let (release_tx, release_rx) = oneshot::channel();
     let entered = handle.block_worker(release_rx);
     let _ = entered.blocking_recv();
@@ -614,7 +617,7 @@ fn teardown_drains_via_shutdown_cmd_branch() {
     handle.shutdown_cmd_only();
     let _ = release_tx.send(());
     wait_registry_gone(sid);
-    let handle2 = spawn_capture(sid, Some("/tmp"), &[], Some(root.path())).unwrap();
+    let handle2 = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
     assert_eq!(wait_exact(&handle2, 5).len(), 5);
     handle2.shutdown_blocking();
 }
@@ -623,7 +626,7 @@ fn teardown_drains_via_shutdown_cmd_branch() {
 fn teardown_from_drop_clears_registry_without_panic() {
     let root = TempDir::new().unwrap();
     let sid = "cert-teardown";
-    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path())).unwrap();
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
     handle.persist(&ConversationItem::user("x"));
     handle.flush_blocking();
     let _ = wait_exact(&handle, 1);
@@ -636,7 +639,7 @@ fn teardown_from_drop_clears_registry_without_panic() {
 fn queue_saturation_drops_and_counts_model_exactly() {
     let root = TempDir::new().unwrap();
     let sid = "cert-saturate";
-    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path())).unwrap();
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
     let (release_tx, release_rx) = oneshot::channel();
     let entered = handle.block_worker(release_rx);
     let _ = entered.blocking_recv();
@@ -667,7 +670,7 @@ fn queue_saturation_drops_and_counts_model_exactly() {
 fn aborted_tool_turn_closed_by_synthetic_wake() {
     let root = TempDir::new().unwrap();
     let sid = "cert-abort-wake";
-    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path())).unwrap();
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
     handle.persist(&ConversationItem::user("go"));
     handle.persist(&ConversationItem::Assistant(
         xai_grok_sampling_types::AssistantItem {
@@ -705,8 +708,8 @@ fn session_ids_differing_by_sanitized_char_get_distinct_threads() {
     let pb = thread_file_path(root.path(), b);
     assert_ne!(pa, pb);
 
-    let ha = spawn_capture(a, Some("/tmp"), &[], Some(root.path())).unwrap();
-    let hb = spawn_capture(b, Some("/tmp"), &[], Some(root.path())).unwrap();
+    let ha = spawn_capture(a, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+    let hb = spawn_capture(b, Some("/tmp"), &[], Some(root.path()), None).unwrap();
     ha.persist(&ConversationItem::user("from-colon"));
     hb.persist(&ConversationItem::user("from-underscore"));
     ha.flush_blocking();
@@ -727,7 +730,7 @@ fn orphan_thread_file_without_registry_is_refused() {
     let sid = "cert-orphan";
     // Create a legitimate session, then wipe the registry while keeping the file.
     {
-        let h = spawn_capture(sid, Some("/tmp"), &[], Some(root.path())).unwrap();
+        let h = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
         h.persist(&ConversationItem::user("x"));
         h.flush_blocking();
         let _ = wait_exact(&h, 1);
@@ -742,7 +745,7 @@ fn orphan_thread_file_without_registry_is_refused() {
     let _ = std::fs::remove_file(root.path().join("registry.sqlite-shm"));
     assert!(thread_file_path(root.path(), sid).exists());
     // Spawn must not block; refused open unregisters asynchronously (C1/B5).
-    let _handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()));
+    let _handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None);
     wait_registry_gone(sid);
     assert!(
         !capture_active(sid),
@@ -768,7 +771,7 @@ fn path_disagreement_policy_refuses() {
 fn list_events_failure_refuses_open() {
     let root = TempDir::new().unwrap();
     let sid = "cert-listevents-fail";
-    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path())).unwrap();
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
     handle.persist(&ConversationItem::user("x"));
     handle.flush_blocking();
     let _ = wait_exact(&handle, 1);
@@ -779,7 +782,7 @@ fn list_events_failure_refuses_open() {
     sqlite_exec(&thread, "PRAGMA foreign_keys=OFF; DROP TABLE event;");
 
     // Spawn must not block; B2 refuse is observable via unregister (C1).
-    let _handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()));
+    let _handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None);
     wait_registry_gone(sid);
     assert!(
         !capture_active(sid),
@@ -792,7 +795,7 @@ fn list_events_failure_refuses_open() {
 fn seed_from_db_errors_when_list_events_fails() {
     let root = TempDir::new().unwrap();
     let sid = "cert-seed-poison";
-    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path())).unwrap();
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
     handle.shutdown_blocking();
     wait_registry_gone(sid);
 
@@ -822,7 +825,7 @@ fn sqlite_exec(db: &std::path::Path, sql: &str) {
 fn registry_file_path_disagreement_refuses_open() {
     let root = TempDir::new().unwrap();
     let sid = "cert-disagree";
-    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path())).unwrap();
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
     handle.persist(&ConversationItem::user("x"));
     handle.flush_blocking();
     let _ = wait_exact(&handle, 1);
@@ -839,7 +842,7 @@ fn registry_file_path_disagreement_refuses_open() {
     );
 
     // Spawn must not block; B5 refuse is observable via unregister (C1).
-    let _handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()));
+    let _handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None);
     wait_registry_gone(sid);
     assert!(
         !capture_active(sid),
@@ -852,7 +855,7 @@ fn registry_file_path_disagreement_refuses_open() {
 fn list_threads_file_path_fallback_reopens() {
     let root = TempDir::new().unwrap();
     let sid = "cert-list-fallback";
-    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path())).unwrap();
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
     handle.persist(&ConversationItem::user("keep-me"));
     handle.flush_blocking();
     let before = wait_exact(&handle, 1);
@@ -866,7 +869,7 @@ fn list_threads_file_path_fallback_reopens() {
         "UPDATE threads SET thread_id = 'not-the-file-id';",
     );
 
-    let handle2 = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()))
+    let handle2 = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None)
         .expect("list_threads file_path fallback must reopen");
     // Successful open keeps the registry entry live.
     for _ in 0..100 {
@@ -917,6 +920,7 @@ async fn tee_from_async_context_does_not_block_or_panic() {
                 "/tmp",
                 &[],
                 Box::new(xai_chat_state::NullChatPersistence),
+                None,
             );
             for _ in 0..100 {
                 if capture_active(sid) {
@@ -948,6 +952,7 @@ async fn tee_drop_from_async_context_does_not_block_or_panic() {
                 "/tmp",
                 &[],
                 Box::new(xai_chat_state::NullChatPersistence),
+                None,
             );
             for _ in 0..100 {
                 if capture_active(sid) {
@@ -972,7 +977,7 @@ async fn tee_drop_from_async_context_does_not_block_or_panic() {
 async fn capture_model_entry_records_for_matching_session() {
     let root = TempDir::new().unwrap();
     let sid = "cert-hook3-match";
-    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path())).unwrap();
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
     // None effort → "none" normalization at the public entry (sync, non-blocking).
     capture_model_or_thinking_change(sid, "m1", "m1", None, Some("high"));
     let handle2 = handle.clone();
@@ -996,8 +1001,8 @@ async fn capture_model_entry_records_for_matching_session() {
 fn capture_model_entry_ignores_mismatched_session_id() {
     let root = TempDir::new().unwrap();
     let sid = "cert-hook3-right";
-    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path())).unwrap();
-    capture_model_or_thinking_change("cert-hook3-WRONG", "a", "b", None, None);
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+    capture_model_or_thinking_change("cert-hook3-WRONG", "a", "b", None, Some("high"));
     handle.flush_blocking();
     thread::sleep(Duration::from_millis(100));
     assert!(
@@ -1023,7 +1028,7 @@ fn capture_model_entry_noop_when_no_capture_active() {
 fn capture_model_entry_suppresses_noop_transition() {
     let root = TempDir::new().unwrap();
     let sid = "cert-hook3-noop";
-    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path())).unwrap();
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
     capture_model_or_thinking_change(sid, "m", "m", None, None);
     handle.flush_blocking();
     thread::sleep(Duration::from_millis(100));
@@ -1039,7 +1044,7 @@ fn refused_open_tee_stops_and_host_persists() {
     let sid = "cert-d3-refuse-tee";
     // Seed a thread file, then wipe registry so reopen refuses (B5 orphan).
     {
-        let h = spawn_capture(sid, Some("/tmp"), &[], Some(root.path())).unwrap();
+        let h = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
         h.persist(&ConversationItem::user("seed"));
         h.flush_blocking();
         let _ = wait_exact(&h, 1);
@@ -1052,7 +1057,7 @@ fn refused_open_tee_stops_and_host_persists() {
 
     let (mock, mut rx) = xai_chat_state::MockChatPersistence::new();
     with_lhc_env(root.path(), || {
-        let mut tee = tee_chat_persistence(sid, "/tmp", &[], Box::new(mock));
+        let mut tee = tee_chat_persistence(sid, "/tmp", &[], Box::new(mock), None);
         // Probe the shared handle before/while open refuses.
         let probe = lookup_session(sid);
         wait_registry_gone(sid);
@@ -1101,7 +1106,7 @@ async fn tee_chat_persistence_methods_reach_inner_and_lhc() {
     tokio::time::timeout(Duration::from_secs(15), async {
         with_lhc_env(root.path(), || {
             let (mock, mut rx) = xai_chat_state::MockChatPersistence::new();
-            let mut tee = tee_chat_persistence(sid, "/tmp", &[], Box::new(mock));
+            let mut tee = tee_chat_persistence(sid, "/tmp", &[], Box::new(mock), None);
             for _ in 0..100 {
                 if capture_active(sid) {
                     break;
@@ -1162,4 +1167,201 @@ async fn tee_chat_persistence_methods_reach_inner_and_lhc() {
     })
     .await
     .expect("tee methods path timed out");
+}
+
+// ── Chunk 2: inference / serving / compact / watchdog ─────────────────
+
+/// Mock sampler is injectable at spawn (hook-2 argument widen) and satisfies
+/// the ModelCall contract (text + provenance model + request_messages).
+#[tokio::test(flavor = "multi_thread")]
+async fn chunk2_mock_sampler_registered_at_spawn() {
+    use grok_lhc_host::{LhcInferenceOp, LhcInferenceSampler};
+    let sid = "cert-chunk2-mock-sampler";
+    let root = TempDir::new().unwrap();
+    let mock: Arc<dyn LhcInferenceSampler> = Arc::new(MockLhcInferenceSampler::new());
+    let handle = spawn_capture(
+        sid,
+        Some("/tmp"),
+        &[],
+        Some(root.path()),
+        Some(Arc::clone(&mock)),
+    )
+    .unwrap();
+    let sample = mock
+        .sample(LhcInferenceOp::SmoothPrompt, "ping".into())
+        .await
+        .expect("mock sample");
+    assert!(sample.text.contains("smooth_prompt"));
+    assert_eq!(sample.model, "mock-lhc-inference");
+    assert!(!sample.request_messages.is_empty());
+    let handle2 = handle.clone();
+    tokio::task::spawn_blocking(move || {
+        handle2.flush_blocking();
+        handle2.shutdown_blocking();
+    })
+    .await
+    .unwrap();
+    wait_registry_gone(sid);
+}
+
+/// Serving fails open when capture is inactive.
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn chunk2_serve_fail_open_when_inactive() {
+    let _g = env_lock();
+    let prev = std::env::var_os("GROK_LHC");
+    unsafe { std::env::remove_var("GROK_LHC") };
+    let native = vec![ConversationItem::user("keep-me")];
+    let decision = serve_request_context("no-such-session", native.clone()).await;
+    let (items, substituted) = apply_serve_decision(native, decision);
+    assert!(!substituted);
+    assert_eq!(items.len(), 1);
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC") },
+    }
+}
+
+/// Live capture → get_llm_request_context → substitute preserves system prefix.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn chunk2_serve_substitutes_from_live_context() {
+    let _g = env_lock();
+    let root = TempDir::new().unwrap();
+    let sid = "cert-chunk2-serve";
+    let prev = std::env::var_os("GROK_LHC");
+    let prev_root = std::env::var_os("GROK_LHC_ROOT");
+    unsafe {
+        std::env::set_var("GROK_LHC", "1");
+        std::env::set_var("GROK_LHC_ROOT", root.path());
+    }
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+    handle.persist(&ConversationItem::user("hello-from-host"));
+    handle.persist(&ConversationItem::assistant("hi-back"));
+    let handle2 = handle.clone();
+    tokio::task::spawn_blocking(move || {
+        handle2.flush_blocking();
+        wait_events(&handle2, 2);
+    })
+    .await
+    .unwrap();
+
+    let native = vec![
+        ConversationItem::system("host-system"),
+        ConversationItem::user("stale-native"),
+    ];
+    let decision = serve_request_context(sid, native.clone()).await;
+    let (items, substituted) = apply_serve_decision(native, decision);
+    assert!(
+        substituted,
+        "expected Substitute after live capture; got Native"
+    );
+    assert!(matches!(&items[0], ConversationItem::System(_)));
+    assert!(!body_has_tool_cycle(&items));
+
+    tokio::task::spawn_blocking(move || handle.shutdown_blocking())
+        .await
+        .unwrap();
+    wait_registry_gone(sid);
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC") },
+    }
+    match prev_root {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC_ROOT", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC_ROOT") },
+    }
+}
+
+/// Compact modes are mutually exclusive writers (env + test override).
+#[test]
+fn chunk2_compact_modes_mutually_exclusive() {
+    let _g = env_lock();
+    set_compact_mode_for_test(Some(CompactMode::Shadow));
+    assert!(resolve_compact_mode().native_writes());
+    assert!(!resolve_compact_mode().lhc_writes());
+    set_compact_mode_for_test(Some(CompactMode::Replace));
+    assert!(!resolve_compact_mode().native_writes());
+    assert!(resolve_compact_mode().lhc_writes());
+    set_compact_mode_for_test(Some(CompactMode::Off));
+    assert!(resolve_compact_mode().native_writes());
+    assert!(!resolve_compact_mode().lhc_writes());
+    set_compact_mode_for_test(None);
+}
+
+/// Mid-tool-cycle native body is replaced wholesale (never hybrid).
+#[test]
+fn chunk2_mid_tool_cycle_all_lhc_or_native() {
+    use lhc::shared_tech::view::{
+        LlmRequestContext, LlmRequestContextMessage, LlmRequestContextPart,
+        LlmRequestContextPartType, LlmRequestContextRole,
+    };
+    use xai_grok_sampling_types::ToolCall;
+    let native = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user("run"),
+        ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: "c1".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        }]),
+    ];
+    assert!(body_has_tool_cycle(&native[1..]));
+    let ctx = LlmRequestContext {
+        thread_id: "t".into(),
+        messages: vec![LlmRequestContextMessage {
+            role: LlmRequestContextRole::User,
+            content: vec![LlmRequestContextPart {
+                type_: LlmRequestContextPartType::Text,
+                text: "run".into(),
+            }],
+        }],
+    };
+    match decide_substitution(&native, &ctx) {
+        ServeDecision::Substitute { items } => {
+            assert!(!body_has_tool_cycle(&items));
+            assert!(matches!(&items[0], ConversationItem::System(_)));
+        }
+        ServeDecision::Native { reason } => panic!("expected all-LHC substitute, got {reason}"),
+    }
+}
+
+/// Out-of-runtime watchdog: if the async guard body hangs synchronously,
+/// a peer thread trips before the tokio timeout can (closes Chunk 1 #2).
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn chunk2_async_guard_out_of_runtime_watchdog() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let _g = env_lock();
+    let root = TempDir::new().unwrap();
+    let sid = "cert-chunk2-watchdog";
+    let done = Arc::new(AtomicBool::new(false));
+    let done_w = Arc::clone(&done);
+    let watchdog = thread::spawn(move || {
+        for _ in 0..100 {
+            if done_w.load(Ordering::SeqCst) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("out-of-runtime watchdog: async tee guard hung (>5s)");
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        with_lhc_env(root.path(), || {
+            let tee = tee_chat_persistence(sid, "/tmp", &[], Box::new(NullChatPersistence), None);
+            for _ in 0..100 {
+                if capture_active(sid) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(capture_active(sid));
+            drop(tee);
+            wait_registry_gone(sid);
+        });
+    })
+    .await
+    .expect("tee install blocked the current-thread runtime");
+    done.store(true, Ordering::SeqCst);
+    watchdog.join().expect("watchdog thread");
 }

@@ -14,7 +14,7 @@ use tracing::{error, info, warn};
 
 use crate::gating::lhc_root;
 use crate::idempotency::{OccurrenceTracker, seed_occurrence_from_keys};
-use crate::inference::chunk2_stub_inference_callbacks;
+use crate::inference::inference_callbacks_for_session;
 
 /// Serialize registry schema init — concurrent `new_thread` races on CREATE TABLE.
 fn registry_lock() -> &'static AsyncMutex<()> {
@@ -67,7 +67,7 @@ impl LhcSession {
         let file_path = thread_file_path(root, session_id);
 
         let lhc = init_lhc(SdkConfig {
-            inference_callbacks: Some(chunk2_stub_inference_callbacks()),
+            inference_callbacks: Some(inference_callbacks_for_session(session_id)),
             inference: None,
             mode: SdkMode::Manual,
             clock: None,
@@ -188,6 +188,59 @@ impl LhcSession {
             .lhc
             .intake_stream
             .list_events(self.thread_ref.clone())
+            .await
+        {
+            OpResult::Ok { value } => Ok(value),
+            OpResult::Err { error } => Err(error.reason),
+        }
+    }
+
+    /// LHC assembled request context for serving (Chunk 2).
+    pub async fn get_llm_request_context(
+        &self,
+    ) -> Result<lhc::shared_tech::view::LlmRequestContext, String> {
+        match self
+            .lhc
+            .thread_view
+            .get_llm_request_context(self.thread_ref.clone())
+            .await
+        {
+            OpResult::Ok { value } => Ok(value),
+            OpResult::Err { error } => Err(error.reason),
+        }
+    }
+
+    /// Preview what LHC compaction would do (shadow mode).
+    pub async fn preview_compact(
+        &self,
+    ) -> Result<lhc::shared_tech::view::PreviewCompactOutcome, String> {
+        let opts = lhc::thread_view::CompactOpts {
+            profile: None,
+            params: None,
+            signal: None,
+        };
+        match self
+            .lhc
+            .thread_view
+            .preview_compact(self.thread_ref.clone(), opts)
+            .await
+        {
+            OpResult::Ok { value } => Ok(value),
+            OpResult::Err { error } => Err(error.reason),
+        }
+    }
+
+    /// Apply LHC compaction (replace mode).
+    pub async fn compact(&self) -> Result<lhc::shared_tech::view::CompactReceipt, String> {
+        let opts = lhc::thread_view::CompactOpts {
+            profile: None,
+            params: None,
+            signal: None,
+        };
+        match self
+            .lhc
+            .thread_view
+            .compact(self.thread_ref.clone(), opts)
             .await
         {
             OpResult::Ok { value } => Ok(value),

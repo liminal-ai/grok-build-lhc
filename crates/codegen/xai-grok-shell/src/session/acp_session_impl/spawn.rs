@@ -441,12 +441,26 @@ pub(crate) async fn spawn_session_actor(
         conversation.clone(),
         chat_state_sampling_config,
         actor_pruning_config,
-        // LHC-HOOK 2/3: wrap persistence in the LHC capture tee
+        // LHC-HOOK 2/5: wrap persistence in the LHC capture tee (+ inference sampler)
         grok_lhc_host::tee_chat_persistence(
             session_info.id.0.as_ref(),
             session_info.cwd.as_ref(),
             &conversation,
             chat_persistence,
+            match crate::session::lhc_inference::ShellLhcInferenceSampler::from_config(
+                sampling_config.clone(),
+                session_info.id.0.to_string(),
+                std::time::Duration::from_secs(60),
+            ) {
+                Ok(s) => Some(s.into_arc()),
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        "LHC: inference sampler unavailable; capture continues without ModelCall"
+                    );
+                    None
+                }
+            },
         ),
         chat_state_event_tx,
         tokio_util::sync::CancellationToken::new(),

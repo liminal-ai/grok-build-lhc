@@ -1,0 +1,14 @@
+[
+  {
+    "role": "system",
+    "text": "host-system-prefix"
+  },
+  {
+    "role": "user",
+    "text": "lhc-user"
+  },
+  {
+    "role": "assistant",
+    "text": "lhc-assistant"
+  }
+]

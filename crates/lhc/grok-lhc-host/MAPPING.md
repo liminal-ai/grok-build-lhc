@@ -189,3 +189,38 @@ baseline (see above). Must not block the chat-state actor. `dropped_count()` /
 `GROK_LHC` is consulted once at tee install (`tee_chat_persistence`).
 Post-spawn callbacks use registry presence only — they do not re-read the
 environment.
+
+## Chunk 2 — request-context serving (hook 4 in shell `turn.rs`)
+
+After host `ChatStateHandle::build_request` returns, the shell may substitute
+`request.items` from LHC `get_llm_request_context`. Tools, model, sampling
+params, and `prompt_index` / `x_grok_turn_idx` stay host-owned. Fail-open to
+the native body; never hybrid (all-LHC body or all-native body).
+
+### Post-substitution accounting (ruling)
+
+| Item | Decision | Test |
+|---|---|---|
+| **Token accounting** | `ConversationRequest` has no body-token field; the provider counts from the substituted wire body. Host `total_tokens` / auto-compact triggers remain on the **native** actor conversation and are **not** rewritten to match the LHC body (rewriting them would desync compaction from persistence). | `accounting_token_totals_unaffected_by_substitute` |
+| **Image byte-budget eviction** | Ran on the native clone inside `build_request`. On Substitute that clone is discarded; the wire body is the LHC text view. Native eviction is **moot for the wire**. | `accounting_image_eviction_moot_on_substitute_wire` |
+| **Memory-reminder injection** | Lives in the leading native `System` item(s). Serving **preserves** that system prefix and replaces only the non-system body. | `accounting_memory_reminder_preserved_in_system_prefix` |
+| **Integrity repair** | Ran on the actor before `build_request`. The LHC view has no tool calls/results, so substitution **cannot** introduce a dangling tool cycle. Mid-cycle native bodies are replaced wholesale (all-LHC). | `accounting_integrity_no_tool_cycle_on_substitute` |
+| **`prompt_index`** | Actor state; shell stamps `x_grok_turn_idx` **after** substitution. Serving never invents or bumps it. | `prompt_index_not_owned_by_serve_decision` |
+
+A substituted request whose host token totals described a different conversation
+would be a correctness bug (mysterious truncation later). We keep totals on the
+native conversation on purpose; the wire body is authoritative for the model.
+
+## Chunk 2 — compact bridge (hook 5)
+
+`CompactMode::{Off, Shadow, Replace}` — single enum, mutually exclusive writers.
+
+- `GROK_LHC` off → `Off`
+- `GROK_LHC=1` → `Shadow` (native writes; LHC `preview_compact`)
+- `GROK_LHC=1` + `GROK_LHC_COMPACT=replace` → `Replace` (LHC writes; native suppressed; fail-open)
+
+## Chunk 2 — inference sampler (hook 2 widen)
+
+`Arc<dyn LhcInferenceSampler>` is supplied at `tee_chat_persistence` /
+`spawn_capture`. Trait in `grok-lhc-host`; shell implements
+`ShellLhcInferenceSampler`. Adapter tests use `MockLhcInferenceSampler`.

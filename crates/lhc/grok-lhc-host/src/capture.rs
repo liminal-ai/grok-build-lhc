@@ -13,6 +13,9 @@ use tracing::{debug, error, warn};
 use xai_grok_sampling_types::ConversationItem;
 
 use crate::idempotency::{ITEM_KEY_GENERATION, OccurrenceTracker};
+use crate::inference::{
+    LhcInferenceSampler, register_inference_sampler, unregister_inference_sampler,
+};
 use crate::mapping::{MappedEvent, map_history, map_item, map_model_change};
 use crate::session::LhcSession;
 
@@ -34,6 +37,11 @@ enum CaptureCmd {
     Flush(oneshot::Sender<()>),
     #[cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
     ListEvents(oneshot::Sender<Result<Vec<lhc::intake_stream::EventRecord>, String>>),
+    GetLlmRequestContext(
+        oneshot::Sender<Result<lhc::shared_tech::view::LlmRequestContext, String>>,
+    ),
+    PreviewCompact(oneshot::Sender<Result<lhc::shared_tech::view::PreviewCompactOutcome, String>>),
+    Compact(oneshot::Sender<Result<lhc::shared_tech::view::CompactReceipt, String>>),
     #[cfg(any(test, feature = "test-util"))]
     Poison(oneshot::Sender<()>),
     #[cfg(any(test, feature = "test-util"))]
@@ -156,6 +164,43 @@ impl CaptureHandle {
     pub fn flush_async(&self) {
         let (tx, _rx) = oneshot::channel();
         let _ = self.inner.tx.try_send(CaptureCmd::Flush(tx));
+    }
+
+    /// Fetch LHC request context from the capture worker (async-safe).
+    pub async fn get_llm_request_context(
+        &self,
+    ) -> Result<lhc::shared_tech::view::LlmRequestContext, String> {
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .tx
+            .send(CaptureCmd::GetLlmRequestContext(tx))
+            .await
+            .map_err(|_| "capture worker gone".to_string())?;
+        rx.await.map_err(|_| "capture worker dropped".to_string())?
+    }
+
+    /// Shadow-mode preview (does not write).
+    pub async fn preview_compact(
+        &self,
+    ) -> Result<lhc::shared_tech::view::PreviewCompactOutcome, String> {
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .tx
+            .send(CaptureCmd::PreviewCompact(tx))
+            .await
+            .map_err(|_| "capture worker gone".to_string())?;
+        rx.await.map_err(|_| "capture worker dropped".to_string())?
+    }
+
+    /// Replace-mode compact (writes).
+    pub async fn compact_thread(&self) -> Result<lhc::shared_tech::view::CompactReceipt, String> {
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .tx
+            .send(CaptureCmd::Compact(tx))
+            .await
+            .map_err(|_| "capture worker gone".to_string())?;
+        rx.await.map_err(|_| "capture worker dropped".to_string())?
     }
 
     /// Fire-and-forget shutdown — drains then closes (safe from async Drop).
@@ -366,11 +411,15 @@ pub fn spawn_capture(
     cwd: Option<&str>,
     bootstrap: &[ConversationItem],
     root: Option<&Path>,
+    sampler: Option<Arc<dyn LhcInferenceSampler>>,
 ) -> Option<CaptureHandle> {
     let session_id_owned = session_id.to_string();
     let cwd_owned = cwd.map(|c| c.to_string());
     let bootstrap = bootstrap.to_vec();
     let root_owned: Option<PathBuf> = root.map(|p| p.to_path_buf());
+    if let Some(sampler) = sampler {
+        register_inference_sampler(session_id, sampler);
+    }
     let (tx, mut rx) = mpsc::channel::<CaptureCmd>(CAPTURE_QUEUE_CAP);
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     #[cfg(any(test, feature = "test-util"))]
@@ -414,6 +463,7 @@ pub fn spawn_capture(
                 Ok(rt) => rt,
                 Err(err) => {
                     error!(?err, "LHC: failed to build capture runtime");
+                    unregister_inference_sampler(&session_id_for_worker);
                     unregister_worker(&session_id_for_worker, worker_id_for_exit);
                     return;
                 }
@@ -429,6 +479,7 @@ pub fn spawn_capture(
                 )
                 .await
                 else {
+                    unregister_inference_sampler(&session_id_for_worker);
                     unregister_worker(&session_id_for_worker, worker_id_for_exit);
                     return;
                 };
@@ -581,6 +632,7 @@ pub fn spawn_capture(
                 }
 
                 let _ = session.take();
+                unregister_inference_sampler(&session_id_for_worker);
                 unregister_worker(&session_id_for_worker, worker_id_for_exit);
             });
         });
@@ -689,6 +741,18 @@ async fn process_cmd(
         }
         CaptureCmd::ListEvents(ack) => {
             let _ = ack.send(sess.list_events().await);
+            false
+        }
+        CaptureCmd::GetLlmRequestContext(ack) => {
+            let _ = ack.send(sess.get_llm_request_context().await);
+            false
+        }
+        CaptureCmd::PreviewCompact(ack) => {
+            let _ = ack.send(sess.preview_compact().await);
+            false
+        }
+        CaptureCmd::Compact(ack) => {
+            let _ = ack.send(sess.compact().await);
             false
         }
         #[cfg(any(test, feature = "test-util"))]

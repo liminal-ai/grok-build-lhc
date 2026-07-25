@@ -1,5 +1,7 @@
 //! `ChatPersistence` tee decorator — the whole Chunk 1 capture hook.
 
+use std::sync::Arc;
+
 use tokio::sync::oneshot;
 use tracing::warn;
 use xai_chat_state::{ChatPersistence, StrictAppendAck, StrictAppendError};
@@ -7,6 +9,7 @@ use xai_grok_sampling_types::ConversationItem;
 
 use crate::capture::{CaptureHandle, is_session_registered, spawn_capture};
 use crate::gating::is_enabled;
+use crate::inference::LhcInferenceSampler;
 
 /// Wrap `inner` with LHC capture when `GROK_LHC` is enabled; otherwise return
 /// `inner` unchanged (no decorator, no LHC instance, no SQLite, no worker).
@@ -14,16 +17,21 @@ use crate::gating::is_enabled;
 /// `bootstrap` is the in-memory conversation already loaded from
 /// `chat_history.jsonl` (not rewritten). Occurrence indices are seeded from
 /// LHC stored events at open; bootstrap is submitted for LHC dedup (B1).
+///
+/// `sampler` is the Chunk 2 inference transport (dedicated non-main model).
+/// Pass `None` only in tests that do not exercise derivation; production
+/// shell always supplies a real [`LhcInferenceSampler`].
 pub fn tee_chat_persistence(
     session_id: &str,
     cwd: &str,
     bootstrap: &[ConversationItem],
     inner: Box<dyn ChatPersistence>,
+    sampler: Option<Arc<dyn LhcInferenceSampler>>,
 ) -> Box<dyn ChatPersistence> {
     if !is_enabled() {
         return inner;
     }
-    let Some(handle) = spawn_capture(session_id, Some(cwd), bootstrap, None) else {
+    let Some(handle) = spawn_capture(session_id, Some(cwd), bootstrap, None, sampler) else {
         tracing::warn!(
             session_id,
             "LHC: capture worker failed to start; host continues"

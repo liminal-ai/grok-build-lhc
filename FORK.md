@@ -7,12 +7,11 @@ record, with banded compaction replacing native auto-compact — full history
 preserved and rebuildable at full fidelity. Working branch and default
 branch: `lhc`. `main` tracks upstream, untouched.
 
-Status: Chunk 1 (packaging, session identity, event capture) of the 3-chunk
-integration
+Status: Chunk 2 (inference adapter, request-context serving, compact bridge)
+of the 3-chunk integration
 (`long-horizon-context/docs/lhc-rs-port/phase3-grok-build-integration-brief.md`).
-Capture is gated off by default (`GROK_LHC`); host behavior is unchanged until
-enabled. Chunks 2–3 (inference adapter / compact bridge / product wiring)
-remain.
+Capture and serving are gated off by default (`GROK_LHC`); host behavior is
+unchanged until enabled. Chunk 3 (product wiring / live cert) remains.
 
 ## Layout
 
@@ -31,9 +30,11 @@ remain.
 
 | # | File | Lines | Purpose | Patch |
 |---|------|-------|---------|-------|
-| 1 | `crates/codegen/xai-grok-shell/Cargo.toml` | `LHC-HOOK 1/3` | dependency on `grok-lhc-host` | 0001 |
-| 2 | `crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs` | `LHC-HOOK 2/3` | wrap persistence in the LHC capture tee | 0001 |
-| 3 | `crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs` | `LHC-HOOK 3/3` | model / thinking-level change tee | 0001 |
+| 1 | `crates/codegen/xai-grok-shell/Cargo.toml` | `LHC-HOOK 1/5` | dependency on `grok-lhc-host` | 0001 |
+| 2 | `crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs` | `LHC-HOOK 2/5` | wrap persistence in the LHC capture tee (+ inference sampler) | 0001 |
+| 3 | `crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs` | `LHC-HOOK 3/5` | model / thinking-level change tee | 0001 |
+| 4 | `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs` | `LHC-HOOK 4/5` | substitute LHC request context after `build_request` | 0001 |
+| 5 | `crates/codegen/xai-grok-shell/src/session/compaction.rs` | `LHC-HOOK 5/5` | compact bridge (shadow / replace) | 0001 |
 | — | root `Cargo.toml` | workspace-members entry `crates/lhc/grok-lhc-host` (no marker — auto-generated/sorted; asserted in `scripts/check-lhc-hooks.sh`) | adapter workspace membership | 0001 |
 
 Rules: hooks are 1–5 line additive insertions marked
@@ -41,20 +42,21 @@ Rules: hooks are 1–5 line additive insertions marked
 `scripts/check-lhc-hooks.sh` and this table change in the same commit as any
 hook; each hook is regenerated into `patches/` in that same commit.
 
-Carve-out (Chunk 1, post-`cargo fmt` numstat vs pre-hook tree):
+Carve-out (post-`cargo fmt` numstat vs `origin/main` / pre-hook tree):
 
 | Hook file | `git diff --numstat` |
 |---|---|
-| `spawn.rs` (hook 2) | `+10 / -3` |
+| `spawn.rs` (hook 2) | `+24 / -3` |
 | `model_switch.rs` (hook 3) | `+9 / -0` |
+| `turn.rs` (hook 4) | `+25 / -0` |
+| `compaction.rs` (hook 5) | `+46 / -0` |
 
-Hook 2 hoists `ChannelChatPersistence::new(...)` to a `let` (preserving that
-expression) and wraps with a formatted multi-line `tee_chat_persistence(...)`.
-Hook 3 adds one capture line for `previous_reasoning_effort` plus a formatted
-`capture_model_or_thinking_change(...)` call so the host's previous model /
-thinking level are forwarded (no fabricated `"unknown"`). Both exceed the
-nominal 1–5-line additive budget once rustfmt expands the call sites; the
-counts above are the durable, CI-canonical figures.
+Hook 2 hoists `ChannelChatPersistence::new(...)` to a `let` and wraps with
+`tee_chat_persistence(..., sampler)`. Hook 3 forwards previous model /
+thinking level. Hook 4 substitutes LHC request context after `build_request`.
+Hook 5 bridges auto-compact (shadow preview / replace suppress). Counts above
+are the durable, CI-canonical figures; they exceed the nominal 1–5-line
+additive budget once rustfmt expands the call sites.
 
 Layer 3 of `scripts/check-lhc-hooks.sh` runs both `golden_smoke` and
 `certification` under `--features test-util` and asserts a nonzero test count
@@ -76,14 +78,9 @@ maintainer does not mistake them for oversights.
    — the same ACP id — confirmed independently by both verifiers. **If you
    ever change either hook's arguments, re-check this by hand.**
 2. **The async-convention guards catch panicking blocks, not silent ones.**
-   `tee_from_async_context_does_not_block_or_panic` and its `Drop` counterpart
-   wrap a `tokio::time::timeout`, but the awaited body contains no suspension
-   point — so a *synchronous* block (`JoinHandle::join()`,
-   `std::sync::mpsc::recv()`) hangs the test instead of failing it. The guards
-   still detect such a regression, just as a hang rather than a fast failure.
-   The defect that actually shipped (`blocking_recv` on the production path)
-   panics and is caught. Closing this properly needs an out-of-runtime
-   watchdog; carried into Chunk 2.
+   Closed in Chunk 2 by `chunk2_async_guard_out_of_runtime_watchdog`: a peer
+   thread panics if the tee install/drop path has not completed within 5s,
+   even when the current-thread runtime cannot advance a `tokio::time::timeout`.
 
 ## Upstream model (read before your first sync)
 
@@ -143,3 +140,5 @@ Chunk 1 means the first real upstream sync already has a proven fallback.)
 - `GROK_LHC=1` or `true` enables capture at session spawn; unset / anything
   else leaves the host bit-identical (tee not installed).
 - `GROK_LHC_ROOT` overrides the LHC storage root (default `~/.lhc`) for tests.
+- `GROK_LHC_COMPACT=replace` (with `GROK_LHC` on) selects replace-mode compact;
+  otherwise compact is shadow when LHC is on.

@@ -328,6 +328,7 @@ pub mod helpers;
 pub(crate) mod image_describe;
 pub(crate) mod image_normalize;
 pub mod inference_metrics;
+pub(crate) mod lhc_inference;
 pub use xai_grok_shared::session::info;
 pub mod managed_mcp;
 pub(crate) mod mcp_descriptors;

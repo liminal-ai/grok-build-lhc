@@ -2117,7 +2117,32 @@ impl SessionActor {
                 })),
             );
             let mut request = request;
+            // LHC-HOOK 4/5: substitute LHC request context (all-LHC or all-native)
+            {
+                let native_items = std::mem::take(&mut request.items);
+                let tools_before = request.tools.len();
+                let decision = grok_lhc_host::serve_request_context(
+                    self.session_info.id.0.as_ref(),
+                    native_items.clone(),
+                )
+                .await;
+                let (items, substituted) =
+                    grok_lhc_host::apply_serve_decision(native_items, decision);
+                request.items = items;
+                debug_assert_eq!(
+                    request.tools.len(),
+                    tools_before,
+                    "LHC serving must not alter tools"
+                );
+                if substituted {
+                    tracing::debug!(
+                        session_id = %self.session_info.id,
+                        "LHC serving: substituted conversation body"
+                    );
+                }
+            }
             request.x_grok_session_id = Some(self.session_info.id.to_string());
+            // prompt_index is actor state — stamped after substitution (preserved).
             request.x_grok_turn_idx =
                 Some(self.chat_state_handle.get_prompt_index().await.to_string());
             request.x_grok_agent_id = Some(xai_grok_telemetry::id::agent_id());

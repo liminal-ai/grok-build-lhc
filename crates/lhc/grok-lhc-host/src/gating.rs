@@ -32,12 +32,22 @@ pub fn lhc_root() -> std::path::PathBuf {
     home.join(".lhc")
 }
 
+/// Process-wide lock for tests that mutate `GROK_LHC*` env vars.
+#[cfg(any(test, feature = "test-util"))]
+pub fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn disabled_when_unset() {
+        let _g = env_lock();
         // SAFETY: test process; GROK_LHC restored below.
         let prev = std::env::var_os("GROK_LHC");
         unsafe { std::env::remove_var("GROK_LHC") };

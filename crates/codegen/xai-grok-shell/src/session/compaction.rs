@@ -601,6 +601,9 @@ impl SessionActor {
         self: &Arc<Self>,
         user_context: Option<String>,
     ) -> Result<(), acp::Error> {
+        if self.lhc_replace_suppresses_native_writer().await {
+            return Ok(());
+        }
         self.record_compaction_variant();
         let total_tokens = self.chat_state_handle.get_total_tokens().await;
         tracing::Span::current().record("pre_tokens", total_tokens as i64);
@@ -1838,6 +1841,35 @@ impl SessionActor {
         let estimated_total = self.chat_state_handle.get_estimated_total_tokens().await;
         estimated_total > context_window
     }
+    /// LHC compact bridge (hook 5): shadow previews; replace suppresses native.
+    /// Returns `true` when the native writer may proceed.
+    async fn lhc_compact_bridge_allow_native(&self) -> bool {
+        match grok_lhc_host::resolve_compact_mode() {
+            grok_lhc_host::CompactMode::Off => true,
+            grok_lhc_host::CompactMode::Shadow => {
+                grok_lhc_host::shadow_preview_compact(self.session_info.id.0.as_ref()).await;
+                true
+            }
+            grok_lhc_host::CompactMode::Replace => {
+                if grok_lhc_host::replace_compact(self.session_info.id.0.as_ref()).await {
+                    false
+                } else {
+                    // Fail-open: native resumes.
+                    true
+                }
+            }
+        }
+    }
+
+    /// Choke point for every native compact writer (auto, preflight, manual,
+    /// model-switch, error-recovery). Replace mode must not hybrid-write.
+    async fn lhc_replace_suppresses_native_writer(&self) -> bool {
+        matches!(
+            grok_lhc_host::resolve_compact_mode(),
+            grok_lhc_host::CompactMode::Replace
+        ) && grok_lhc_host::replace_compact(self.session_info.id.0.as_ref()).await
+    }
+
     /// Pre-sampling compaction check. Uses `get_estimated_total_tokens()`
     /// (exact prior count + byte-estimate of items since last response) so
     /// tool results are accounted for. Returns `None` when `is_flushing`.
@@ -1883,6 +1915,9 @@ impl SessionActor {
                 "Forced auto-compact trigger (debug): model={model}, \
                  {percentage}% full ({estimated_total}/{cw} tokens)",
             );
+            if !self.lhc_compact_bridge_allow_native().await {
+                return None;
+            }
             return Some(AutoCompactTriggerInfo {
                 tokens_used: estimated_total,
                 context_window: cw,
@@ -1897,6 +1932,10 @@ impl SessionActor {
                 trigger_info.tokens_used,
                 trigger_info.context_window,
             );
+            // LHC-HOOK 5/5: compact bridge — shadow previews; replace suppresses native
+            if !self.lhc_compact_bridge_allow_native().await {
+                return None;
+            }
             return Some(trigger_info);
         }
         None
@@ -1969,6 +2008,10 @@ impl SessionActor {
             cfg.context_window.get(),
             trigger_info.percentage,
         );
+        // Same compact bridge as pre-sampling (hook 5) — never hybrid writers.
+        if !self.lhc_compact_bridge_allow_native().await {
+            return Ok(());
+        }
         if let Err(e) = self.run_compact_only(trigger_info).await {
             tracing::error!(error = %e, "Model-switch compaction failed");
             if Self::is_auth_compact_error(&e) {
@@ -2008,6 +2051,9 @@ impl SessionActor {
         self: &Arc<Self>,
         trigger_info: AutoCompactTriggerInfo,
     ) -> Result<(), acp::Error> {
+        if self.lhc_replace_suppresses_native_writer().await {
+            return Ok(());
+        }
         use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
         self.record_compaction_variant();
         let tokens_before = self.chat_state_handle.get_total_tokens().await;
