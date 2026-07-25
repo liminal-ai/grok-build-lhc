@@ -1,0 +1,14 @@
+[package]
+name = "grok-lhc-host"
+version = "0.1.0"
+edition = "2024"
+description = "LHC host adapter for Grok Build — capture tee, compact bridge, request-context serving (fork-only crate)"
+publish = false
+
+[dependencies]
+lhc = { path = "../vendor/long-horizon-context/packages/lhc-rs" }
+
+# Standalone during Chunk 0: deliberately NOT a member of the auto-generated
+# root workspace (zero core touches). Patch 0001 adds the members entry when
+# the first hook lands (Chunk 1) — see FORK.md, "Cargo.toml conflict rule".
+[workspace]

@@ -1,0 +1,4 @@
+[submodule "crates/lhc/vendor/long-horizon-context"]
+	path = crates/lhc/vendor/long-horizon-context
+	url = https://github.com/liminal-ai/long-horizon-context.git
+	branch = lhc-rs-port
