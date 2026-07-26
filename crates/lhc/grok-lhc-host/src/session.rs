@@ -3,23 +3,91 @@
 //! Capture identity lives only in LHC (registry + thread SQLite). Generation is
 //! latched from `BatchResult.thread_position.last_event_order` — never a sidecar.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use lhc::sdk::{Lhc, OpResult, SdkConfig, ThreadRef, init_lhc};
 use lhc::shared_tech::SdkMode;
+use lhc::shared_tech::errors::ErrorCode;
+use lhc::thread_view::CompactAbortSignal;
 use lhc::threads::{ListThreadsInput, NewThreadInput, ResolveInput};
 use tokio::sync::Mutex as AsyncMutex;
-use tracing::{error, info, warn};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 
 use crate::gating::lhc_root;
 use crate::idempotency::{OccurrenceTracker, seed_occurrence_from_keys};
 use crate::inference::inference_callbacks_for_session;
 
+#[cfg(any(test, feature = "test-util"))]
+use std::sync::atomic::{AtomicBool, Ordering};
+
 /// Serialize registry schema init — concurrent `new_thread` races on CREATE TABLE.
 fn registry_lock() -> &'static AsyncMutex<()> {
     static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| AsyncMutex::new(()))
+}
+
+/// Compact abort outcome surfaced in `/lhc status` (not a drain wait state).
+///
+/// Background mode drains continuously; compact never waits on derivation.
+/// The only host-visible compact outcome worth recording is abandon-before-install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactDrainOutcome {
+    /// Turn abort / cancel stopped compact before a snapshot install (R1).
+    AbandonedByCancel,
+}
+
+impl CompactDrainOutcome {
+    pub fn status_line(self) -> &'static str {
+        match self {
+            Self::AbandonedByCancel => {
+                "compact abandoned — turn abort (no LHC snapshot install / write-back)"
+            }
+        }
+    }
+}
+
+fn compact_outcome_registry() -> &'static Mutex<HashMap<String, CompactDrainOutcome>> {
+    static REG: OnceLock<Mutex<HashMap<String, CompactDrainOutcome>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn note_compact_drain_outcome(session_id: &str, outcome: CompactDrainOutcome) {
+    if let Ok(mut map) = compact_outcome_registry().lock() {
+        map.insert(session_id.to_string(), outcome);
+    }
+}
+
+/// Last compact abort outcome for `/lhc status` (R1 visibility).
+pub fn last_compact_drain_outcome(session_id: &str) -> Option<CompactDrainOutcome> {
+    compact_outcome_registry()
+        .lock()
+        .ok()
+        .and_then(|map| map.get(session_id).copied())
+}
+
+#[cfg(any(test, feature = "test-util"))]
+fn sever_compact_signal_flag() -> &'static std::sync::atomic::AtomicBool {
+    static FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    &FLAG
+}
+
+/// Test-only: when true, compact passes `signal: None` (R1 break-watch).
+#[cfg(any(test, feature = "test-util"))]
+pub fn set_sever_compact_signal_for_test(sever: bool) {
+    sever_compact_signal_flag().store(sever, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(any(test, feature = "test-util"))]
+fn sever_compact_signal_for_test() -> bool {
+    sever_compact_signal_flag().load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(not(any(test, feature = "test-util")))]
+fn sever_compact_signal_for_test() -> bool {
+    false
 }
 
 /// Live LHC capture session (owns the SDK instance + thread path).
@@ -66,10 +134,27 @@ impl LhcSession {
         let registry_path = root.join("registry.sqlite");
         let file_path = thread_file_path(root, session_id);
 
+        let callbacks = {
+            #[cfg(any(test, feature = "test-util"))]
+            {
+                if use_deterministic_inference_for_test() {
+                    lhc::create_deterministic_inference_callbacks()
+                } else {
+                    inference_callbacks_for_session(session_id)
+                }
+            }
+            #[cfg(not(any(test, feature = "test-util")))]
+            {
+                inference_callbacks_for_session(session_id)
+            }
+        };
+        // Always Background — pi-lhc / t3code reference shape. Derivation drains
+        // via the SDK scheduler after each intake commit; first-touch catch-up
+        // absorbs backlog at open. No host poke / idle pump.
         let lhc = init_lhc(SdkConfig {
-            inference_callbacks: Some(inference_callbacks_for_session(session_id)),
+            inference_callbacks: Some(callbacks),
             inference: None,
-            mode: SdkMode::Manual,
+            mode: SdkMode::Background,
             clock: None,
             guards: None,
             tool_result: None,
@@ -280,20 +365,95 @@ impl LhcSession {
     }
 
     /// Apply LHC compaction (replace mode).
-    pub async fn compact(&self) -> Result<lhc::shared_tech::view::CompactReceipt, String> {
+    ///
+    /// Compact is a **selection walk with the fallback ladder** — immediately
+    /// and unconditionally. It never waits on derivation: missing material
+    /// degrades visibly; background drain upgrades stored forms for the next
+    /// compact. There is no time budget on this path.
+    ///
+    /// Pass a [`CancellationToken`] + live [`CompactAbortSignal`] so turn abort
+    /// prevents snapshot install (R1). Compact compute after thread resolution
+    /// is **synchronous** — `tokio::select!` cannot preempt it; the port signal
+    /// (live `Arc<AtomicBool>` re-read at `compact_stopped`) is what stops the
+    /// write. Callers that cancel mid-compute **must** also call
+    /// [`CompactAbortSignal::abort`] (the production
+    /// [`crate::replace_compact_for_writeback`] DropGuard does this on drop —
+    /// no OS bridge thread). Prefer that entry point.
+    ///
+    /// Background derivation continuing after abort is correct — not a leak.
+    pub async fn compact(
+        &self,
+        cancel: CancellationToken,
+        signal: CompactAbortSignal,
+    ) -> Result<lhc::shared_tech::view::CompactReceipt, String> {
+        if cancel.is_cancelled() {
+            signal.abort();
+            note_compact_drain_outcome(&self.session_id, CompactDrainOutcome::AbandonedByCancel);
+            return Err("compact_cancelled".into());
+        }
+
+        let params = {
+            #[cfg(any(test, feature = "test-util"))]
+            {
+                take_compact_params_override_for_test()
+            }
+            #[cfg(not(any(test, feature = "test-util")))]
+            {
+                None
+            }
+        };
         let opts = lhc::thread_view::CompactOpts {
             profile: None,
-            params: None,
-            signal: None,
+            params,
+            // Live CompactAbortSignal — port re-reads `.aborted()` at each
+            // checkpoint; do not snapshot a bool here.
+            signal: if sever_compact_signal_for_test() {
+                None
+            } else {
+                Some(signal.clone())
+            },
         };
-        match self
-            .lhc
-            .thread_view
-            .compact(self.thread_ref.clone(), opts)
-            .await
-        {
-            OpResult::Ok { value } => Ok(value),
-            OpResult::Err { error } => Err(error.reason),
+        // Race cancel against the async compact future only — not a drain
+        // budget. Sync compute inside still depends on CompactAbortSignal.
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                signal.abort();
+                note_compact_drain_outcome(
+                    &self.session_id,
+                    CompactDrainOutcome::AbandonedByCancel,
+                );
+                Err("compact_cancelled".into())
+            }
+            result = self.lhc.thread_view.compact(self.thread_ref.clone(), opts) => {
+                match result {
+                    OpResult::Ok { value } => {
+                        if cancel.is_cancelled() || signal.aborted() {
+                            note_compact_drain_outcome(
+                                &self.session_id,
+                                CompactDrainOutcome::AbandonedByCancel,
+                            );
+                            Err("compact_cancelled".into())
+                        } else {
+                            Ok(value)
+                        }
+                    }
+                    OpResult::Err { error } => {
+                        if error.code == ErrorCode::CompactStopped
+                            || cancel.is_cancelled()
+                            || signal.aborted()
+                        {
+                            note_compact_drain_outcome(
+                                &self.session_id,
+                                CompactDrainOutcome::AbandonedByCancel,
+                            );
+                            Err("compact_cancelled".into())
+                        } else {
+                            Err(error.reason)
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -305,8 +465,50 @@ impl LhcSession {
         }
     }
 
-    pub async fn close(self) {
+    /// Inspect health (derivation ready/pending counts + queue).
+    pub async fn inspect_health(&self) -> Result<lhc::shared_tech::inspect::HealthReport, String> {
+        match self.lhc.inspect.health(self.thread_ref.clone()).await {
+            OpResult::Ok { value } => Ok(value),
+            OpResult::Err { error } => Err(error.reason),
+        }
+    }
+
+    /// Await background-scheduler quiescence for this thread.
+    ///
+    /// Production runs [`SdkMode::Background`]; the scheduler drains after each
+    /// intake poke. This waits — it does **not** start a host-driven
+    /// `work.drain`. Used by tests / cert to observe settle-between-turns, and
+    /// (capped) by [`Self::close`].
+    pub async fn drain_settled(&self) {
         self.lhc.drain_settled(self.thread_ref.clone()).await;
+    }
+
+    /// Tear down the session: capped [`Lhc::drain_settled`], then drop.
+    ///
+    /// The sole host-side drain-related call (pi-lhc dispose / t3code stop).
+    /// With Background mode, work has been draining continuously — this is a
+    /// short settle for in-flight items, not a six-minute catch-up bill.
+    pub async fn close(self) {
+        match tokio::time::timeout(
+            crate::DRAIN_SETTLED_AT_CLOSE,
+            self.lhc.drain_settled(self.thread_ref.clone()),
+        )
+        .await
+        {
+            Ok(()) => {
+                debug!(
+                    session_id = %self.session_id,
+                    "LHC: close drainSettled completed"
+                );
+            }
+            Err(_) => {
+                warn!(
+                    session_id = %self.session_id,
+                    timeout_secs = crate::DRAIN_SETTLED_AT_CLOSE.as_secs(),
+                    "LHC: close drainSettled timed out — proceeding with teardown"
+                );
+            }
+        }
     }
 
     #[cfg(any(test, feature = "test-util"))]
@@ -536,6 +738,48 @@ fn force_classify_list_failure() -> bool {
 #[cfg(any(test, feature = "test-util"))]
 pub fn set_force_classify_list_failure(armed: bool) {
     FORCE_CLASSIFY_LIST_FAILURE.store(armed, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Test-only: open sessions with [`lhc::create_deterministic_inference_callbacks`]
+/// instead of the host sampler bridge (Chunk 3B harness — no network).
+#[cfg(any(test, feature = "test-util"))]
+static USE_DETERMINISTIC_INFERENCE: AtomicBool = AtomicBool::new(false);
+
+#[cfg(any(test, feature = "test-util"))]
+fn use_deterministic_inference_for_test() -> bool {
+    USE_DETERMINISTIC_INFERENCE.load(Ordering::SeqCst)
+}
+
+#[cfg(any(test, feature = "test-util"))]
+pub fn set_use_deterministic_inference_for_test(armed: bool) {
+    USE_DETERMINISTIC_INFERENCE.store(armed, Ordering::SeqCst);
+}
+
+/// Test-only: one-shot `ViewCompactParams` for the next [`LhcSession::compact`].
+///
+/// Production always passes `params: None`. The Chunk 3B harness arms tight
+/// params so deterministic callbacks can emit typed bands through the host
+/// Replace choke (same triple as the N3 probe). Cleared after one compact.
+#[cfg(any(test, feature = "test-util"))]
+static COMPACT_PARAMS_OVERRIDE: std::sync::Mutex<
+    Option<lhc::shared_tech::view::ViewCompactParams>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(any(test, feature = "test-util"))]
+fn take_compact_params_override_for_test() -> Option<lhc::shared_tech::view::ViewCompactParams> {
+    COMPACT_PARAMS_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
+#[cfg(any(test, feature = "test-util"))]
+pub fn set_compact_params_override_for_test(
+    params: Option<lhc::shared_tech::view::ViewCompactParams>,
+) {
+    *COMPACT_PARAMS_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = params;
 }
 
 #[cfg(test)]

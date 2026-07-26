@@ -1864,6 +1864,779 @@ fn writeback_replace_compact_for_writeback_is_production_path() {
     handle.shutdown_blocking();
 }
 
+/// N1 — Background mode drains PromptSmoothing between turns; compact is
+/// selection-only. ToolResultSummary sampler ops remain absent (**DERIV-12** /
+/// port `FORCE_TOOL_RESULT_SUMMARY_FALLBACK`).
+#[test]
+fn n1_background_drain_prompt_smoothing_before_compact_tool_result_absent_by_deriv12() {
+    use std::time::Instant;
+
+    use grok_lhc_host::LhcInferenceOp;
+    use xai_grok_sampling_types::ToolCall;
+
+    let _g = env_lock();
+    let root = TempDir::new().unwrap();
+    let sid = "cert-n1-bg-drain-lanes";
+    let blob = "word ".repeat(40);
+    let large_tool = "line\n".repeat(3_000);
+    let mut native = vec![ConversationItem::system("sys")];
+    for t in 0..3 {
+        let mut u = ConversationItem::user(format!("turn {t} {blob}"));
+        u.set_prompt_index(t);
+        native.push(u);
+        if t == 1 {
+            native.push(ConversationItem::assistant_tool_calls(vec![ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: "{\"cmd\":\"ls\"}".into(),
+            }]));
+            native.push(ConversationItem::tool_result("c1", large_tool.clone()));
+        }
+        native.push(ConversationItem::assistant(format!("answer {t} {blob}")));
+    }
+
+    let counter = Arc::new(CountingLhcInferenceSampler::new());
+    let handle = spawn_capture(
+        sid,
+        Some("/tmp"),
+        &native,
+        Some(root.path()),
+        Some(counter.clone()),
+    )
+    .unwrap();
+    let _ = wait_events(&handle, 1);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // Production path: background scheduler settles between turns — host does
+    // not drain inside compact.
+    rt.block_on(handle.drain_settled())
+        .expect("background drainSettled");
+
+    let ops_before = counter.call_ops();
+    eprintln!("N1 ops after background settle (before compact): {ops_before:?}");
+    assert!(
+        ops_before.contains(&LhcInferenceOp::SmoothPrompt),
+        "Background mode must run PromptSmoothing before compact; got {ops_before:?}"
+    );
+    assert!(
+        !ops_before.contains(&LhcInferenceOp::SummarizeToolResult),
+        "ToolResultSummary sampler ops must be absent (DERIV-12 / \
+         FORCE_TOOL_RESULT_SUMMARY_FALLBACK). Got {ops_before:?}"
+    );
+
+    set_compact_mode_for_test(Some(CompactMode::Replace));
+    let t0 = Instant::now();
+    let wb = rt
+        .block_on(grok_lhc_host::replace_compact_for_writeback(sid))
+        .expect("replace_compact_for_writeback");
+    let compact_wall = t0.elapsed();
+    set_compact_mode_for_test(None);
+
+    let ops_after = counter.call_ops();
+    eprintln!(
+        "N1 compact wall={compact_wall:?}; ops after compact: {ops_after:?} \
+         (compact must not bill a 400s drain)"
+    );
+    assert!(
+        compact_wall < Duration::from_secs(5),
+        "compact must be selection-walk fast after background drain; took {compact_wall:?}"
+    );
+    assert_eq!(
+        ops_after.len(),
+        ops_before.len(),
+        "compact must not start new derivation sampler ops; before={ops_before:?} after={ops_after:?}"
+    );
+    assert!(
+        !wb.view.entries.is_empty(),
+        "production path returns a view"
+    );
+    handle.shutdown_blocking();
+}
+
+/// N2 — `/lhc off` unregisters immediately; close settles in-flight work under
+/// [`grok_lhc_host::DRAIN_SETTLED_AT_CLOSE`] (not an unbounded host drain).
+#[test]
+fn n2_shutdown_unregisters_immediately_close_settle_capped() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    use grok_lhc_host::{
+        DRAIN_SETTLED_AT_CLOSE, LhcInferenceError, LhcInferenceErrorKind, LhcInferenceFuture,
+        LhcInferenceRequest, LhcInferenceSample, LhcInferenceSampler, capture_active,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    struct SleepySampler {
+        started: Arc<AtomicUsize>,
+    }
+    impl LhcInferenceSampler for SleepySampler {
+        fn sample(
+            &self,
+            req: LhcInferenceRequest,
+            cancel: CancellationToken,
+        ) -> LhcInferenceFuture {
+            let started = Arc::clone(&self.started);
+            let label = req.op().as_prompt_label().to_string();
+            let max_output_tokens = req.max_output_tokens();
+            Box::pin(async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                tokio::select! {
+                    _ = cancel.cancelled() => Err(LhcInferenceError {
+                        kind: LhcInferenceErrorKind::Cancelled,
+                        detail: "sleepy cancelled".into(),
+                        request_messages: None,
+                    }),
+                    _ = tokio::time::sleep(Duration::from_secs(60)) => Ok(LhcInferenceSample {
+                        text: "sleepy".into(),
+                        model: "sleepy".into(),
+                        prompt_label: label,
+                        request_messages: vec![],
+                        max_output_tokens,
+                    }),
+                }
+            })
+        }
+    }
+
+    let _g = env_lock();
+    let root = TempDir::new().unwrap();
+    let sid = "cert-n2-shutdown-cap";
+    let native = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user("u0 word word"),
+        ConversationItem::assistant("a0 word word"),
+    ];
+    let started = Arc::new(AtomicUsize::new(0));
+    let sampler = Arc::new(SleepySampler {
+        started: Arc::clone(&started),
+    });
+    let handle =
+        spawn_capture(sid, Some("/tmp"), &native, Some(root.path()), Some(sampler)).unwrap();
+    let _ = wait_events(&handle, 1);
+    assert!(capture_active(sid));
+
+    // Give background mode a moment to start the sleepy sample (correct).
+    let start_deadline = Instant::now() + Duration::from_secs(5);
+    while started.load(Ordering::SeqCst) == 0 && Instant::now() < start_deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let t0 = Instant::now();
+    // Product path: unregister is immediate; worker close is capped.
+    shutdown_session(sid);
+    assert!(
+        !capture_active(sid),
+        "N2: capture_active must be false immediately after shutdown_session"
+    );
+    handle.shutdown_blocking();
+    let elapsed = t0.elapsed();
+    let cap_plus = DRAIN_SETTLED_AT_CLOSE + Duration::from_secs(5);
+    assert!(
+        elapsed < cap_plus,
+        "N2: close settle must respect DRAIN_SETTLED_AT_CLOSE \
+         ({DRAIN_SETTLED_AT_CLOSE:?}); took {elapsed:?} (unbounded would be ~60s)"
+    );
+    eprintln!(
+        "N2: unregister immediate; shutdown_blocking in {elapsed:?} \
+         (cap={DRAIN_SETTLED_AT_CLOSE:?}); samples_started={}",
+        started.load(Ordering::SeqCst)
+    );
+
+    let handle2 = spawn_capture(sid, Some("/tmp"), &native, Some(root.path()), None).unwrap();
+    assert!(capture_active(sid));
+    handle2.shutdown_blocking();
+}
+
+/// R3 (re-pointed) — after turn abort during compact: **no snapshot install**,
+/// native/view unchanged. Background derivation continuing is fine (not a leak).
+/// Call-cessation / TokenWatchSampler is no longer the invariant.
+#[test]
+fn r3_abort_installs_no_compact_snapshot_derivation_may_continue() {
+    use grok_lhc_host::{
+        CompactDrainOutcome, CountingLhcInferenceSampler, last_compact_drain_outcome,
+        replace_compact_for_writeback_with_cancel_signal, set_compact_params_override_for_test,
+        set_sever_compact_signal_for_test, set_use_deterministic_inference_for_test,
+    };
+    use lhc::shared_tech::view::{PartialViewProfilePercentages, ViewCompactParams};
+    use lhc::thread_view::CompactAbortSignal;
+    use lhc::thread_view::internal::seam::{ViewInjectionPoint, set_view_injection_hook};
+    use tokio_util::sync::CancellationToken;
+
+    fn tight_params() -> ViewCompactParams {
+        ViewCompactParams {
+            lower_bound: Some(400.0),
+            percentages: Some(PartialViewProfilePercentages {
+                full: Some(30.0),
+                smooth: Some(25.0),
+                detailed: Some(20.0),
+                brief: Some(25.0),
+            }),
+        }
+    }
+
+    fn context_fingerprint(handle: &CaptureHandle, rt: &tokio::runtime::Runtime) -> String {
+        let ctx = rt
+            .block_on(handle.get_llm_request_context())
+            .expect("llm context");
+        serde_json::to_string(&ctx).unwrap_or_default()
+    }
+
+    let _g = env_lock();
+    let root = TempDir::new().unwrap();
+    let blob = "word ".repeat(80);
+    let mut native = vec![ConversationItem::system("sys")];
+    for t in 0..8 {
+        let mut u = ConversationItem::user(format!("turn {t} {blob}"));
+        u.set_prompt_index(t);
+        native.push(u);
+        native.push(ConversationItem::assistant(format!("answer {t} {blob}")));
+    }
+
+    let sid = "cert-r3-no-install";
+    let counter = Arc::new(CountingLhcInferenceSampler::new());
+    let handle = spawn_capture(
+        sid,
+        Some("/tmp"),
+        &native,
+        Some(root.path()),
+        Some(counter.clone()),
+    )
+    .unwrap();
+    let _ = wait_events(&handle, 1);
+    set_compact_mode_for_test(Some(CompactMode::Replace));
+    set_use_deterministic_inference_for_test(true);
+    set_sever_compact_signal_for_test(false);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let _ = rt.block_on(handle.drain_settled());
+    let ops_at_abort_gate = counter.call_ops().len();
+    let prior = context_fingerprint(&handle, &rt);
+
+    let cancel = CancellationToken::new();
+    let signal = CompactAbortSignal::new();
+    let cancel_h = cancel.clone();
+    let signal_h = signal.clone();
+    set_view_injection_hook(
+        ViewInjectionPoint::CompactWrite,
+        Some(Arc::new(move || {
+            // Drive the live CompactAbortSignal atomic directly — no OS bridge
+            // thread. tokio::select! cannot preempt sync compact compute.
+            cancel_h.cancel();
+            signal_h.abort();
+            assert!(
+                signal_h.aborted(),
+                "R3: CompactAbortSignal atomic must be aborted before \
+                 compact_stopped re-read"
+            );
+        })),
+    );
+    set_compact_params_override_for_test(Some(tight_params()));
+    let result = rt.block_on(replace_compact_for_writeback_with_cancel_signal(
+        sid,
+        cancel,
+        signal.clone(),
+    ));
+    set_view_injection_hook(ViewInjectionPoint::CompactWrite, None);
+
+    assert!(
+        matches!(&result, Err(e) if e == "compact_cancelled"),
+        "R3: compact must cancel at snapshot checkpoint; got {result:?}"
+    );
+    assert!(signal.aborted(), "R3: signal must be aborted");
+    let after = context_fingerprint(&handle, &rt);
+    assert_eq!(
+        after, prior,
+        "R3: LLM request context unchanged — no snapshot install after abort"
+    );
+    assert_eq!(
+        last_compact_drain_outcome(sid),
+        Some(CompactDrainOutcome::AbandonedByCancel),
+        "R3: status must surface abandon"
+    );
+    // Background derivation may continue — do not require call cessation.
+    let ops_after = counter.call_ops().len();
+    eprintln!(
+        "R3: no install; ops_at_gate={ops_at_abort_gate} ops_after={ops_after} \
+         (continuation is fine)"
+    );
+
+    set_use_deterministic_inference_for_test(false);
+    set_compact_mode_for_test(None);
+    handle.shutdown_blocking();
+    wait_registry_gone(sid);
+}
+
+/// R1 — port `CompactAbortSignal` must observe turn abort during sync compute
+/// so the snapshot write does not land. `tokio::select!` cannot preempt.
+#[test]
+fn r1_cancel_at_snapshot_write_leaves_view_unchanged() {
+    use grok_lhc_host::{
+        CountingLhcInferenceSampler, replace_compact_for_writeback_with_cancel_signal,
+        set_compact_params_override_for_test, set_sever_compact_signal_for_test,
+        set_use_deterministic_inference_for_test,
+    };
+    use lhc::shared_tech::view::{PartialViewProfilePercentages, ViewCompactParams};
+    use lhc::thread_view::CompactAbortSignal;
+    use lhc::thread_view::internal::seam::{ViewInjectionPoint, set_view_injection_hook};
+    use tokio_util::sync::CancellationToken;
+
+    fn tight_params() -> ViewCompactParams {
+        ViewCompactParams {
+            lower_bound: Some(400.0),
+            percentages: Some(PartialViewProfilePercentages {
+                full: Some(30.0),
+                smooth: Some(25.0),
+                detailed: Some(20.0),
+                brief: Some(25.0),
+            }),
+        }
+    }
+
+    fn context_fingerprint(handle: &CaptureHandle, rt: &tokio::runtime::Runtime) -> String {
+        let ctx = rt
+            .block_on(handle.get_llm_request_context())
+            .expect("llm context");
+        serde_json::to_string(&ctx).unwrap_or_default()
+    }
+
+    let _g = env_lock();
+    let root = TempDir::new().unwrap();
+    let blob = "word ".repeat(80);
+    let mut native = vec![ConversationItem::system("sys")];
+    for t in 0..8 {
+        let mut u = ConversationItem::user(format!("turn {t} {blob}"));
+        u.set_prompt_index(t);
+        native.push(u);
+        native.push(ConversationItem::assistant(format!("answer {t} {blob}")));
+    }
+
+    // --- RESTORED path: signal wired → abort at CompactWrite → no snapshot ---
+    let sid = "cert-r1-signal-wired";
+    let handle = spawn_capture(
+        sid,
+        Some("/tmp"),
+        &native,
+        Some(root.path()),
+        Some(Arc::new(CountingLhcInferenceSampler::new())),
+    )
+    .unwrap();
+    let _ = wait_events(&handle, 1);
+    set_compact_mode_for_test(Some(CompactMode::Replace));
+    set_use_deterministic_inference_for_test(true);
+    set_sever_compact_signal_for_test(false);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let prior = context_fingerprint(&handle, &rt);
+
+    let cancel = CancellationToken::new();
+    let signal = CompactAbortSignal::new();
+    let cancel_h = cancel.clone();
+    let signal_h = signal.clone();
+    set_view_injection_hook(
+        ViewInjectionPoint::CompactWrite,
+        Some(Arc::new(move || {
+            // Drive the live CompactAbortSignal atomic directly — no OS bridge.
+            cancel_h.cancel();
+            signal_h.abort();
+            assert!(
+                signal_h.aborted(),
+                "R1: CompactAbortSignal atomic must be aborted before \
+                 compact_stopped re-read"
+            );
+        })),
+    );
+    set_compact_params_override_for_test(Some(tight_params()));
+    let result = rt.block_on(replace_compact_for_writeback_with_cancel_signal(
+        sid,
+        cancel,
+        signal.clone(),
+    ));
+    set_view_injection_hook(ViewInjectionPoint::CompactWrite, None);
+    assert!(
+        matches!(&result, Err(e) if e == "compact_cancelled"),
+        "R1 restored: compact must cancel at snapshot checkpoint; got {result:?}"
+    );
+    assert!(signal.aborted(), "R1: signal must be aborted");
+    let after = context_fingerprint(&handle, &rt);
+    assert_eq!(
+        after, prior,
+        "R1 restored: LLM request context must be unchanged (no snapshot write)"
+    );
+    eprintln!("R1 RESTORED: compact_cancelled + view unchanged");
+    set_use_deterministic_inference_for_test(false);
+    set_compact_mode_for_test(None);
+    handle.shutdown_blocking();
+    wait_registry_gone(sid);
+
+    // --- SEVERED path: signal: None → CompactWrite cancel does not stop write ---
+    let sid2 = "cert-r1-signal-severed";
+    let handle2 = spawn_capture(
+        sid2,
+        Some("/tmp"),
+        &native,
+        Some(root.path()),
+        Some(Arc::new(CountingLhcInferenceSampler::new())),
+    )
+    .unwrap();
+    let _ = wait_events(&handle2, 1);
+    set_compact_mode_for_test(Some(CompactMode::Replace));
+    set_use_deterministic_inference_for_test(true);
+    set_sever_compact_signal_for_test(true);
+
+    let prior2 = context_fingerprint(&handle2, &rt);
+    let cancel2 = CancellationToken::new();
+    let signal2 = CompactAbortSignal::new();
+    let cancel2_h = cancel2.clone();
+    set_view_injection_hook(
+        ViewInjectionPoint::CompactWrite,
+        Some(Arc::new(move || {
+            cancel2_h.cancel();
+            // Severed path: signal: None in CompactOpts — aborting a local
+            // signal (or cancelling the token) must not stop the write.
+            std::thread::sleep(Duration::from_millis(50));
+        })),
+    );
+    set_compact_params_override_for_test(Some(tight_params()));
+    let severed = rt.block_on(replace_compact_for_writeback_with_cancel_signal(
+        sid2, cancel2, signal2,
+    ));
+    set_view_injection_hook(ViewInjectionPoint::CompactWrite, None);
+    set_sever_compact_signal_for_test(false);
+    let after2 = context_fingerprint(&handle2, &rt);
+    let wrote = after2 != prior2 || severed.is_ok();
+    eprintln!(
+        "R1 SEVERED: result={severed:?} view_changed={} (expect write landed)",
+        after2 != prior2
+    );
+    assert!(
+        wrote,
+        "R1 break-watch: with signal: None, CompactWrite cancel must not block \
+         the snapshot — otherwise the test is not proving the port checkpoint"
+    );
+    set_use_deterministic_inference_for_test(false);
+    set_compact_mode_for_test(None);
+    handle2.shutdown_blocking();
+    wait_registry_gone(sid2);
+}
+
+/// Count lingering `lhc-compact-abort-bridge` threads (Linux `/proc`).
+///
+/// Kernel `comm` is truncated to 15 chars → `lhc-compact-abo`.
+fn count_compact_abort_bridge_threads() -> usize {
+    let Ok(dir) = std::fs::read_dir("/proc/self/task") else {
+        return 0;
+    };
+    dir.filter_map(|e| e.ok())
+        .filter(|e| {
+            std::fs::read_to_string(e.path().join("comm"))
+                .map(|n| {
+                    let n = n.trim();
+                    n.starts_with("lhc-compact-ab") || n == "lhc-compact-abort-bridge"
+                })
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+/// T1 — successful compact must not leak an OS cancel→signal bridge thread.
+///
+/// Production drives [`lhc::thread_view::CompactAbortSignal`]'s live atomic
+/// from the DropGuard (no bridge). N successful compacts must leave the
+/// bridge-thread count at baseline.
+#[test]
+fn t1_successful_compact_leaves_no_abort_bridge_threads() {
+    use grok_lhc_host::{
+        CountingLhcInferenceSampler, replace_compact_for_writeback,
+        set_compact_params_override_for_test, set_use_deterministic_inference_for_test,
+    };
+    use lhc::shared_tech::view::{PartialViewProfilePercentages, ViewCompactParams};
+
+    let _g = env_lock();
+    let root = TempDir::new().unwrap();
+    let blob = "word ".repeat(80);
+    let mut native = vec![ConversationItem::system("sys")];
+    for t in 0..6 {
+        let mut u = ConversationItem::user(format!("turn {t} {blob}"));
+        u.set_prompt_index(t);
+        native.push(u);
+        native.push(ConversationItem::assistant(format!("answer {t} {blob}")));
+    }
+
+    let sid = "cert-t1-bridge-leak";
+    let handle = spawn_capture(
+        sid,
+        Some("/tmp"),
+        &native,
+        Some(root.path()),
+        Some(Arc::new(CountingLhcInferenceSampler::new())),
+    )
+    .unwrap();
+    let _ = wait_events(&handle, 1);
+    set_compact_mode_for_test(Some(CompactMode::Replace));
+    set_use_deterministic_inference_for_test(true);
+    set_compact_params_override_for_test(Some(ViewCompactParams {
+        lower_bound: Some(400.0),
+        percentages: Some(PartialViewProfilePercentages {
+            full: Some(30.0),
+            smooth: Some(25.0),
+            detailed: Some(20.0),
+            brief: Some(25.0),
+        }),
+    }));
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let before = count_compact_abort_bridge_threads();
+    const N: usize = 3;
+    for i in 0..N {
+        set_compact_params_override_for_test(Some(ViewCompactParams {
+            lower_bound: Some(400.0),
+            percentages: Some(PartialViewProfilePercentages {
+                full: Some(30.0),
+                smooth: Some(25.0),
+                detailed: Some(20.0),
+                brief: Some(25.0),
+            }),
+        }));
+        let wb = rt
+            .block_on(replace_compact_for_writeback(sid))
+            .unwrap_or_else(|e| panic!("compact {i} failed: {e}"));
+        assert!(wb.receipt_total_tokens > 0, "compact {i} empty receipt");
+    }
+    // Join windows: worker must finish; give any leaked bridge a chance to show.
+    std::thread::sleep(Duration::from_millis(100));
+    let after = count_compact_abort_bridge_threads();
+    eprintln!("VERIFIER bridge threads before={before} after={after} (N={N} successful compacts)");
+    assert_eq!(
+        after, before,
+        "T1: {N} successful replace_compact_for_writeback calls leaked \
+         lhc-compact-abort-bridge threads (before={before} after={after}). \
+         Success path must not leave a cancel waiter alive."
+    );
+
+    set_use_deterministic_inference_for_test(false);
+    set_compact_mode_for_test(None);
+    handle.shutdown_blocking();
+    wait_registry_gone(sid);
+}
+
+/// Drain architecture repair — t3code-shaped certification measurements.
+///
+/// 1. ready ≈ total at compact threshold (after between-turn settle)
+/// 2. compact wall-time in fractions of a second (not hundreds)
+/// 3. queue settles between turns
+/// 4. first-touch catch-up absorbs a pre-existing backlog at open
+#[test]
+fn drain_architecture_background_mode_cert_measurements() {
+    use std::time::Instant;
+
+    use grok_lhc_host::{
+        CountingLhcInferenceSampler, set_compact_params_override_for_test,
+        set_use_deterministic_inference_for_test,
+    };
+    use lhc::create_deterministic_inference_callbacks;
+    use lhc::init_lhc;
+    use lhc::intake_stream::MessageEventInput;
+    use lhc::shared_tech::derivation::{SdkConfig, SdkMode};
+    use lhc::shared_tech::errors::OpResult;
+    use lhc::shared_tech::view::{PartialViewProfilePercentages, ViewCompactParams};
+    use lhc::threads::{NewThreadInput, ThreadRef};
+    use serde_json::{Map, json};
+
+    fn ev(kind: &str, payload: Map<String, serde_json::Value>, key: &str) -> MessageEventInput {
+        MessageEventInput {
+            event_kind: kind.into(),
+            idempotency_key: Some(key.into()),
+            actor: "grok".into(),
+            harness: "drain-arch".into(),
+            payload,
+            extra: Map::new(),
+        }
+    }
+
+    fn health_ready_total(h: &lhc::shared_tech::inspect::HealthReport) -> (i64, i64) {
+        let mut ready = 0i64;
+        let mut total = 0i64;
+        for o in &h.owners {
+            ready += o.counts.ready;
+            total += o.counts.ready + o.counts.pending + o.counts.failed + o.counts.blocked;
+        }
+        (ready, total)
+    }
+
+    let _g = env_lock();
+    let root = TempDir::new().unwrap();
+    let sid = "cert-drain-arch-bg";
+
+    // --- (4) First-touch: seed a Manual backlog, then open Background ---
+    let backlog_path = root.path().join("threads");
+    std::fs::create_dir_all(&backlog_path).unwrap();
+    let thread_path = thread_file_path(root.path(), sid);
+    let registry = root.path().join("registry.sqlite");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let manual = init_lhc(SdkConfig {
+            inference_callbacks: Some(create_deterministic_inference_callbacks()),
+            inference: None,
+            mode: SdkMode::Manual,
+            clock: None,
+            guards: None,
+            tool_result: None,
+            lease: None,
+            chunk_policy: None,
+            view: None,
+        });
+        let created = manual
+            .threads
+            .new_thread(NewThreadInput {
+                file_path: thread_path.to_string_lossy().into_owned(),
+                title: Some("drain-arch".into()),
+                cwd: None,
+                registry_path: Some(registry.to_string_lossy().into_owned()),
+            })
+            .await;
+        let OpResult::Ok { value: info } = created else {
+            panic!("new_thread failed");
+        };
+        let ref_ = ThreadRef::file_path(info.file_path);
+        let blob = "word ".repeat(30);
+        let mut batch = Vec::new();
+        for t in 0..4 {
+            batch.push(ev(
+                "user_prompt",
+                json!({ "text": format!("turn {t} {blob}") })
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+                &format!("u{t}"),
+            ));
+            batch.push(ev(
+                "assistant_text",
+                json!({ "text": format!("answer {t} {blob}") })
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+                &format!("a{t}"),
+            ));
+            batch.push(ev("turn_end", Map::new(), &format!("te{t}")));
+        }
+        let submitted = manual
+            .intake_stream
+            .message_events(ref_.clone(), &batch)
+            .await;
+        assert!(matches!(submitted, OpResult::Ok { .. }), "{submitted:?}");
+        // Deliberately do NOT drain — leave backlog for first-touch.
+        drop(manual);
+    });
+
+    let counter = Arc::new(CountingLhcInferenceSampler::new());
+    // Empty bootstrap: identity open is touch-suppressed (RECORD-28). First
+    // intake write fires scheduler.touch → first-touch catch-up of the Manual
+    // backlog (that is the "at open" the operating model means).
+    let handle = spawn_capture(
+        sid,
+        Some("/tmp"),
+        &[],
+        Some(root.path()),
+        Some(counter.clone()),
+    )
+    .expect("Background open of pre-existing thread");
+    let _ = wait_events(&handle, 4);
+    let health_before_touch = rt
+        .block_on(handle.inspect_health())
+        .expect("health before first write");
+    assert!(
+        health_before_touch.queue.queued > 0,
+        "precondition: Manual backlog still queued before first-touch write \
+         (queued={})",
+        health_before_touch.queue.queued
+    );
+
+    // First write → touch → catch-up.
+    handle.persist(&ConversationItem::user("first-touch trigger"));
+    handle.flush_blocking();
+    let _ = wait_events(&handle, 5);
+
+    // --- (3)+(4) Queue settles; first-touch absorbed backlog ---
+    rt.block_on(handle.drain_settled())
+        .expect("settle after first-touch");
+    let health = rt
+        .block_on(handle.inspect_health())
+        .expect("inspect_health");
+    assert_eq!(
+        health.queue.queued, 0,
+        "queue must settle after first-touch catch-up; queued={}",
+        health.queue.queued
+    );
+    assert_eq!(
+        health.queue.claimed, 0,
+        "queue must settle after first-touch catch-up; claimed={}",
+        health.queue.claimed
+    );
+
+    // --- (1) ready ≈ total when compact would trip ---
+    let (ready, total) = health_ready_total(&health);
+    eprintln!(
+        "drain-arch: first-touch backlog_before={} → ready={ready} total={total} queue={:?}",
+        health_before_touch.queue.queued, health.queue
+    );
+    assert!(total > 0, "expected derivations after multi-turn seed");
+    assert!(
+        ready * 100 >= total * 90,
+        "healthy system: ready≈total at settle (ready={ready} total={total})"
+    );
+
+    // --- (2) Compact wall-time fractions of a second ---
+    set_use_deterministic_inference_for_test(true);
+    set_compact_mode_for_test(Some(CompactMode::Replace));
+    set_compact_params_override_for_test(Some(ViewCompactParams {
+        lower_bound: Some(200.0),
+        percentages: Some(PartialViewProfilePercentages {
+            full: Some(30.0),
+            smooth: Some(25.0),
+            detailed: Some(20.0),
+            brief: Some(25.0),
+        }),
+    }));
+    let t0 = Instant::now();
+    let wb = rt
+        .block_on(grok_lhc_host::replace_compact_for_writeback(sid))
+        .expect("compact after background settle");
+    let compact_wall = t0.elapsed();
+    set_compact_mode_for_test(None);
+    set_use_deterministic_inference_for_test(false);
+    eprintln!(
+        "drain-arch: compact_wall={compact_wall:?} receipt_tokens={} \
+         (ref: t3code 0.4s with pre-built summaries)",
+        wb.receipt_total_tokens
+    );
+    assert!(
+        compact_wall < Duration::from_secs(2),
+        "compact must be sub-second-class after background drain; took {compact_wall:?}"
+    );
+
+    handle.shutdown_blocking();
+    wait_registry_gone(sid);
+}
+
 /// N3 reachability: public SDK + deterministic callbacks + tight ViewCompactParams
 /// + multi-turn seed **can** emit typed bands. Contrasts with production
 /// `LhcSession::compact` (`params: None`) which does not force bands on the
@@ -2018,6 +2791,156 @@ async fn n3_deterministic_callbacks_with_tight_params_can_emit_typed_bands() {
     assert!(
         bands > 0,
         "deterministic cbs + multi-turn + tight ViewCompactParams must emit          typed bands (empty source_messages); got 0 (params=None yielded {bands_none})"
+    );
+}
+
+/// M1 budget probe: production `params: None` bands only when seed tokens
+/// exceed the built-in `continuation` full share (120000 × 30% = 36000).
+/// Documents the size G2 must use — never shrink ViewCompactParams instead.
+#[tokio::test(flavor = "current_thread")]
+async fn m1_production_params_none_requires_seed_above_full_budget() {
+    use lhc::create_deterministic_inference_callbacks;
+    use lhc::estimate_tokens;
+    use lhc::init_lhc;
+    use lhc::intake_stream::MessageEventInput;
+    use lhc::shared_tech::derivation::{SdkConfig, SdkMode};
+    use lhc::shared_tech::errors::OpResult;
+    use lhc::shared_tech::view::{SessionThreadViewEntry, SessionThreadViewMessage};
+    use lhc::thread_view::CompactOpts;
+    use lhc::threads::{NewThreadInput, ThreadRef};
+    use serde_json::{Map, json};
+
+    fn ev(kind: &str, payload: Map<String, serde_json::Value>, key: &str) -> MessageEventInput {
+        MessageEventInput {
+            event_kind: kind.into(),
+            idempotency_key: Some(key.into()),
+            actor: "grok".into(),
+            harness: "m1-budget".into(),
+            payload,
+            extra: Map::new(),
+        }
+    }
+
+    fn count_bands(v: &lhc::shared_tech::view::SessionThreadView) -> usize {
+        v.entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    SessionThreadViewEntry::Message(SessionThreadViewMessage::User(u))
+                        if u.source_messages.is_empty()
+                )
+            })
+            .count()
+    }
+
+    async fn seed_and_compact(turns: usize, words: usize) -> (i64, usize /* bands */) {
+        let root = TempDir::new().unwrap();
+        let registry = root.path().join("registry.sqlite");
+        let path = root.path().join("t.sqlite");
+        let path_str = path.to_string_lossy().into_owned();
+        let sdk = init_lhc(SdkConfig {
+            inference_callbacks: Some(create_deterministic_inference_callbacks()),
+            inference: None,
+            mode: SdkMode::Manual,
+            clock: None,
+            guards: None,
+            tool_result: None,
+            lease: None,
+            chunk_policy: None,
+            view: None,
+        });
+        let created = sdk
+            .threads
+            .new_thread(NewThreadInput {
+                file_path: path_str.clone(),
+                title: None,
+                cwd: None,
+                registry_path: Some(registry.to_string_lossy().into_owned()),
+            })
+            .await;
+        assert!(created.is_ok(), "{created:?}");
+
+        let blob = "word ".repeat(words);
+        let mut est = 0i64;
+        for turn in 0..turns {
+            let u = format!("turn {turn} {blob}");
+            let a = format!("answer {turn} {blob}");
+            est += estimate_tokens(&u) + estimate_tokens(&a);
+            let batch = vec![
+                ev(
+                    "user_prompt",
+                    {
+                        let mut m = Map::new();
+                        m.insert("text".into(), json!(u));
+                        m
+                    },
+                    &format!("u{turn}"),
+                ),
+                ev(
+                    "assistant_text",
+                    {
+                        let mut m = Map::new();
+                        m.insert("text".into(), json!(a));
+                        m
+                    },
+                    &format!("a{turn}"),
+                ),
+                ev("turn_end", Map::new(), &format!("e{turn}")),
+            ];
+            let r = sdk
+                .intake_stream
+                .message_events(ThreadRef::file_path(&path_str), &batch)
+                .await;
+            assert!(r.is_ok(), "turn {turn}: {r:?}");
+        }
+        let _ = sdk.work.drain(ThreadRef::file_path(&path_str), None).await;
+        let c = sdk
+            .thread_view
+            .compact(
+                ThreadRef::file_path(&path_str),
+                CompactOpts {
+                    profile: None,
+                    params: None,
+                    signal: None,
+                },
+            )
+            .await;
+        assert!(c.is_ok(), "params=None compact failed: {c:?}");
+        let v = sdk
+            .thread_view
+            .get_session_thread_view(ThreadRef::file_path(&path_str))
+            .await;
+        let OpResult::Ok { value: view } = v else {
+            panic!("view: {v:?}");
+        };
+        (est, count_bands(&view))
+    }
+
+    const FULL_BUDGET: f64 = 120_000.0 * 30.0 / 100.0; // continuation
+    let (small_tok, small_bands) = seed_and_compact(12, 200).await;
+    eprintln!("M1 small seed: tokens≈{small_tok} bands={small_bands} full_budget={FULL_BUDGET}");
+    assert_eq!(
+        small_bands, 0,
+        "12×200-word seed must stay under production full budget (got bands)"
+    );
+    assert!((small_tok as f64) < FULL_BUDGET);
+
+    // Prefer fewer, larger turns so real-inference G2 has fewer PromptSmoothing
+    // round-trips while still clearing the production full budget.
+    let (big_tok, big_bands) = seed_and_compact(6, 5000).await;
+    eprintln!(
+        "M1 large seed (6×5000): tokens≈{big_tok} bands={big_bands} full_budget={FULL_BUDGET}"
+    );
+    assert!(
+        (big_tok as f64) > FULL_BUDGET,
+        "6×5000-word seed must exceed full_budget={FULL_BUDGET} (got {big_tok})"
+    );
+    assert!(
+        big_bands > 0,
+        "M1: production params:None must emit typed bands once seed exceeds \
+         continuation full_budget={FULL_BUDGET}; got 0 (tokens≈{big_tok}). \
+         If this fails, G2 cannot certify under real budgets without shrinking params."
     );
 }
 

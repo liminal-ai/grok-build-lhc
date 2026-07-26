@@ -109,8 +109,12 @@ impl SessionActor {
                     LhcSlashOp::Off => {
                         if grok_lhc_host::capture_active(sid) {
                             grok_lhc_host::shutdown_session(sid);
+                            // Unregisters immediately; worker settles in-flight
+                            // background work under a short drainSettled cap.
                             "**LHC:** capture stopped for this session.\n\n\
                              **Active context engine:** native\n\n\
+                             Derivations had been draining in the background; \
+                             in-flight work gets a short settle window at shutdown. \
                              LHC storage is kept on disk. Native conversation is unchanged. \
                              Subsequent turns use the native request-context path. \
                              Use `/lhc on` to re-attach."

@@ -7,7 +7,7 @@ record, with banded compaction replacing native auto-compact — full history
 preserved and rebuildable at full fidelity. Working branch and default
 branch: `lhc`. `main` tracks upstream, untouched.
 
-Status: Chunk 3A (product wiring — config, `/lhc` status/repair, rollout
+Status: Chunk 3B harness track in progress (3A accepted); product wiring — config, `/lhc` status/repair, rollout
 safety) of the 3-chunk integration
 (`long-horizon-context/docs/lhc-rs-port/phase3-grok-build-integration-brief.md`).
 Capture and serving are gated off by default (`GROK_LHC` / `[lhc]`). A resolving
@@ -96,20 +96,26 @@ Recorded so nobody rediscovers them as missing touchpoints:
 | `/btw` recap | `.../session/acp_session_impl/recap.rs` | Reads native conversation |
 | Memory flush | `.../session/acp_session_impl/memory_dream.rs` | Reads native conversation |
 
-**Chunk 3 live certification must:**
+**Chunk 3 live certification** is the runbook at
+`crates/lhc/grok-lhc-host/LIVE_RUNBOOK.md` (setup, commands, expected
+output, failure criteria, evidence, stop/rollback). Do not improvise from
+scattered prose — execute that file.
 
-1. Run an explicit `/btw` check and an explicit memory-flush check on a
-   **compacted** session, confirming both receive the LHC body and behave
-   coherently. If either misbehaves, reopen as its own decision.
-2. **G2:** capture the real body the shell write-back delivers from an
-   actual Replace compaction (item shapes, ordering, system prefix,
-   `prompt_index` markers) and diff it against the certification fixtures
-   in `grok-lhc-host` (`realistic_post_compact_ctx` / `writeback_fixture`).
-   Regenerate fixtures if the live body differs.
+**G2 fixture ruling (do not “regen on diff”):** when a real compacted
+Replace body differs from `realistic_post_compact_ctx` /
+`writeback_fixture`, **classify first** — (1) expected compaction/profile
+variance, (2) different input coverage, or (3) genuine calibration error —
+and only then decide. Never regenerate fixtures merely because the
+fingerprint differs (MAPPING.md retains the richer H2 fixtures pending
+diagnosis). The harness scenario cannot exercise tool-cycle or
+typed-runtime discrimination at all (its only tool cycle sits at turn 1
+and is compacted away; it never seeds a runtime note or model change), so
+regenerating from any harness body would destroy that coverage even if
+bands matched.
 
-Layer 3 of `scripts/check-lhc-hooks.sh` runs both `golden_smoke` and
-`certification` under `--features test-util` and asserts a nonzero test count
-for each.
+Layer 3 of `scripts/check-lhc-hooks.sh` runs `golden_smoke`,
+`certification`, and `harness_chunk3b` under `--features test-util` and
+asserts a nonzero test count for each.
 
 ### Scheduled verification (not permanent acceptance)
 
@@ -119,9 +125,9 @@ waived.
 
 | Blind spot | What verifies it | Checkpoint |
 |---|---|---|
-| **Hook-2 / hook-3 session-id coupling** — today only by inspection (`session_id.0.as_ref()` at both sites). A mismatched id would silently drop model changes with no adapter-suite failure. | Live cert: drive a model/thinking change on a captured session and assert the change event lands in that session's LHC thread (proves the registered id matches the tee). Same checkpoint as write-back body capture. | **Chunk 3 live cert** (with G2) |
-| **Async guards catch panicking but not silent blocks** — `chunk2_async_guard_out_of_thread_watchdog` is the corrected attempt; treat as open until CI proves a hang fails fast. | Re-run / strengthen the out-of-thread watchdog under Chunk 3 CI; hang must fail the test within the watchdog budget. | **Chunk 3 live cert / CI** |
-| **G2 live write-back body harness** — fixtures today mirror the realistic post-compact *view* shape; end-to-end shell Replace write-back capture was deferred. | **Mandatory:** run an actual Replace compaction through the shell write-back path; capture item shapes, ordering, system prefix, and `prompt_index` markers; diff against `realistic_post_compact_view` / `writeback_fixture`. If the live body differs, **regenerate fixtures from the real body and re-run the gate**. | **Chunk 3 live cert** |
+| **Hook-2 / hook-3 session-id coupling** — today only by inspection (`session_id.0.as_ref()` at both sites). A mismatched id would silently drop model changes with no adapter-suite failure. | **Harness discharged:** `b2_hook2_hook3_session_id_coupling_no_cross_leak` (spawn / resume / fork, no cross-leak). Live: confirm on real ACP session ids. | **Chunk 3B harness** + live confirm |
+| **Async guards catch panicking but not silent blocks** — `chunk2_async_guard_out_of_thread_watchdog` is the corrected attempt; treat as open until CI proves a hang fails fast. | **Harness narrowed:** out-of-thread hangs detectable via `recv_timeout`; in-task async silent awaits still need an external controller. | **Chunk 3B harness** (narrowed) + live/CI |
+| **G2 live write-back body harness** — fixtures today mirror the realistic post-compact *view* shape; end-to-end shell Replace write-back capture was deferred. | **Harness discharged** (deterministic). **Real-inference G2:** `l3_g2_real_inference_writeback_body_vs_fixture` (bands>0 under production params). Live: [`LIVE_RUNBOOK.md`](crates/lhc/grok-lhc-host/LIVE_RUNBOOK.md) L1. **Do not regen fixtures on diff** — classify first. | **Chunk 3B** + live runbook |
 | **Banded LHC-ahead crash window (shell kill)** — adapter half is covered by `writeback_crash_between_lhc_compact_and_native_replace_is_transient` (deterministic cbs + tight `ViewCompactParams` + multi-turn seed → typed bands → write-back retry idempotent). Remaining: live shell Replace choke kill **before** `replace_conversation_for_compaction`. | Live cert: kill at the shell choke; reopen old native; confirm same idempotency. | **Chunk 3 live cert** (shell kill only) |
 
 Also at that same Chunk 3 checkpoint: `/btw` + memory-flush on a compacted
@@ -218,16 +224,31 @@ Chunk 1 means the first real upstream sync already has a proven fallback.)
   **writes back** into native state (`replace_conversation_for_compaction`) —
   ruled architecture, not a workaround (see
   `crates/lhc/grok-lhc-host/MAPPING.md`).
-- `GROK_LHC_INFERENCE_MODEL` / `[lhc].inference_model` selects a dedicated
-  non-main model slug for LHC ModelCall; unset → session model with refreshed
-  credentials per call.
+- `GROK_LHC_INFERENCE_MODEL` / `[lhc].inference_model` overrides the derivation
+  inference model. **Default is `grok-4.5`** (never the session chat model).
+  Thinking is fixed at **low** (`ReasoningEffort::Low`). **Scoped ruling:**
+  real inference applies to lanes that call inference — today
+  `WorkKind::PromptSmoothing → smoothed_prompt` via
+  `ShellLhcInferenceSampler`. `WorkKind::ToolResultSummary →
+  tool_result_summary` keeps the vendored truncate-fallback
+  (**DERIV-12**: inference at intake rate clogged the queue; classifier path
+  dormant pending a high-speed lane —
+  `FORCE_TOOL_RESULT_SUMMARY_FALLBACK = true` at
+  `…/lhc-rs/src/messages/internal/handlers.rs:35`; call site `opts: None` at
+  `:537`). Not unresolved.
+  Details: `crates/lhc/grok-lhc-host/MAPPING.md` (Derivation lanes).
+- SDK mode is **Background** unconditionally (pi-lhc / t3code shape). Host
+  drain surface: capped `drainSettled` at session close only. Compact never
+  waits on derivation.
 - `/lhc` slash command: status / health / repair / per-session on / off.
+- Live cert checklist: `crates/lhc/grok-lhc-host/LIVE_RUNBOOK.md`.
 
 ## Rollback runbook (Chunk 3A)
 
 A fresh agent can disable LHC without losing the fork:
 
-1. **Immediate (this session):** `/lhc off` — stops capture; active context
+1. **Immediate (this session):** `/lhc off` — stops capture (unregisters
+   immediately; short background settle at worker close); active context
    engine becomes **native**. LHC SQLite is kept; native conversation is not
    rewritten by this step.
 2. **Process-wide:** unset `GROK_LHC` (and remove `[lhc] enabled = true` from

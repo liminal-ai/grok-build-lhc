@@ -251,10 +251,9 @@ that has dropped its channel receiver while a Sender `Arc` still exists
 (tokio mpsc closes when the receiver is gone) — that is a channel guarantee,
 not incidental.
 
-**Pinning test:** `ab1_refresh_snapshot_atomic_keeps_mid_session_on` toggles
-the **`refresh_binding` call site** (`set_refresh_binding_racy_for_test`), not
-a helper simulation. Racy call-site assembly loses the post-enable event
-(`events<2`); atomic `lookup_session_snapshot` keeps it (`events>=2`).
+**Pinning test:** `ab1_refresh_snapshot_atomic_keeps_mid_session_on` drives the
+real atomic `lookup_session_snapshot` path (mid-session enable during refresh)
+and asserts the durable outcome (`events>=2`). No racy call-site reconstruction.
 
 ## Chunk 2 — request-context serving (hook 4 in shell `turn.rs`)
 
@@ -406,13 +405,68 @@ fix the *body shape* first; do not unilaterally rewire Chunk 1 capture.
 | `prompt_index` survives write-back + rewind/fork | `writeback_prompt_index_survives_*` |
 | Rewind after write-back keeps compacted body | `rewind_after_lhc_writeback_shaped_checkpoint_keeps_compacted_body` |
 
-### Chunk 3 live-cert checkpoints (G2)
+### Chunk 3B harness track (G2 discharged for deterministic path)
 
-Fixtures are rebuilt from the realistic post-compact view shape (bands
-first, tool results, notes, model-change). A full live harness that runs
-shell Replace write-back end-to-end and diffs the delivered body against
-fixtures is **mandatory in Chunk 3** if not landed here — register under
-Chunk 3 live cert alongside `/btw` + memory-flush on a compacted session.
+Integration binary `tests/harness_chunk3b.rs` (tripwire Layer 3) drives
+real `ChatStateActor` + capture tee + `create_deterministic_inference_callbacks`
++ tight `ViewCompactParams` override through `replace_compact_for_writeback`
+→ `build_writeback_conversation` → `replace_conversation_for_compaction`.
+
+**G2 result (deterministic):** the real write-back body **differs** from
+`writeback_fixture` / `realistic_post_compact_view`. Observed shape:
+`system` + one `[context · smooth]` band (degraded) + live user/assistant
+tail (4 items). Adapter fixture remains the richer H2 renderer-faithful
+shape (9 items: brief/detailed/smooth bands, tools, runtime note, model
+change). Five gate properties re-run against the **real** body in the
+harness (pass). Equivalence calibration re-verified on the real body
+(`turns_served_and_compared > 0`, silent self-compare). H2 fixtures were
+**not** overwritten with the thinner deterministic body (would drop
+tool-cycle discrimination) — **fixture ruling:** on any live/real-body
+diff, classify (expected variance | input-coverage gap | calibration
+error) before changing fixtures; never regen merely because the
+fingerprint differs. The harness cannot exercise tool-cycle / runtime-note
+/ model-change discrimination (tool cycle at turn 1 is compacted away;
+no runtime note or model change seeded).
+
+**G2 real-inference (unit 19):** `xai-grok-shell`
+`l3_g2_real_inference_writeback_body_vs_fixture` (`#[ignore]`; LIVE_RUNBOOK L1
+with `-- --ignored`). Production `params: None`. SDK runs
+**`SdkMode::Background`** — derivation drains via the scheduler after each
+intake commit; compact is a selection walk with the fallback ladder (never
+waits). `/lhc off` unregisters immediately; worker `close` awaits capped
+`drainSettled` (`DRAIN_SETTLED_AT_CLOSE` = 30s). Scoped inference: PromptSmoothing
+→ sampler; ToolResultSummary → truncate-fallback (**DERIV-12**). Assert
+`bands > 0` before compare; five hard gates + equivalence on the credentialed
+body. Live checklist: [`LIVE_RUNBOOK.md`](./LIVE_RUNBOOK.md).
+
+**Turn abort → no snapshot install (R1):**
+`replace_compact_for_writeback` drop-guards a `CancellationToken` **and** a
+live `CompactAbortSignal`. Port sync compute re-reads `signal.aborted()` at
+`compact_stopped` checkpoints — that is what stops the snapshot write.
+Background derivation continuing after abort is correct. Certs:
+`r1_cancel_at_snapshot_write_leaves_view_unchanged` (CompactWrite hook + view
+unchanged; fails if `signal: None`) and
+`r3_abort_installs_no_compact_snapshot_derivation_may_continue`.
+
+**Drain architecture cert (t3code-shaped):**
+`drain_architecture_background_mode_cert_measurements` — ready≈total after
+settle, compact wall-time well under 1s, queue settles after first-touch
+catch-up, first-touch absorbs a pre-existing Manual backlog on the first
+intake write (identity open is touch-suppressed per RECORD-28).
+
+**Credentialed G2 gates (R2):** five hard gates run via
+`run_five_gates_on_body_async` from the Tokio test (sync
+`run_five_gates_on_body` uses `blocking_send` and panics inside a runtime).
+Before reporting G2, state which gates ran and on which body label.
+
+**Derivation request shape (pinned clean):** `build_derivation_request` uses a
+purpose-built ~250-char system prompt, `tools: []`, `hosted_tools: []`,
+`prompt_cache_key: None` — not the session agent prompt (Codex found a 4.7×
+cost undercount when theirs shipped the full agent prompt). Test:
+`derivation_request_excludes_session_tools_and_agent_prompt`.
+
+Test hooks (test-util only): `set_use_deterministic_inference_for_test` (harness
+paths that cannot reach real inference), `set_compact_params_override_for_test`.
 
 ## Chunk 2 — hook 4 equivalence instrumentation (G1)
 
@@ -620,6 +674,54 @@ together), or one `out.push_str(kind)` site. Three dispositions:
 `spawn_capture`. Trait in `grok-lhc-host`; shell implements
 `ShellLhcInferenceSampler`. Adapter tests use `MockLhcInferenceSampler`.
 
+### Derivation lanes (Lee's ruling, Chunk 3 unit 19) — scoped
+
+**Ruling as scoped:** real inference (`grok-4.5`, `ReasoningEffort::Low`,
+native `ShellLhcInferenceSampler`) governs derivation lanes that **call
+inference at all**. Today that is **PromptSmoothing only**.
+**ToolResultSummary keeps the port's truncate-fallback** (no sampler op).
+
+| Lane | WorkKind | Derivation | What runs today |
+|---|---|---|---|
+| Prompt smoothing | `PromptSmoothing` | `smoothed_prompt` | `smooth_prompt` → registered sampler (`grok-4.5` @ low) |
+| Tool-result summary | `ToolResultSummary` | `tool_result_summary` | Work drains; **truncate fallback** — sampler not called |
+
+**Why ToolResultSummary does not hit the sampler — documented decision DERIV-12
+(not unresolved, not awaiting a ruling):**
+
+> *Interim: tool_result_summaries are forced to 500-char truncation (inference
+> clogged the queue at intake rate); the classifier-routed inference path is
+> dormant pending a high-speed lane.* — `docs/onboard/03-decisions-brief.md`
+
+1. Vendored `FORCE_TOOL_RESULT_SUMMARY_FALLBACK = true` at
+   `crates/lhc/vendor/long-horizon-context/packages/lhc-rs/src/messages/internal/handlers.rs:35`
+   (mirrors the TS private constant / DERIV-12).
+2. The work handler calls `derive_tool_result_summary(..., None)` at
+   `handlers.rs:537`, so `use_inference` defaults to
+   `!FORCE_TOOL_RESULT_SUMMARY_FALLBACK` → **false**, and
+   `truncate_for_fallback` runs.
+3. Re-enabling inference for this lane is a port change (high-speed lane /
+   items 11/22) — not a fork defect.
+
+Both callbacks still share one registry lookup when invoked
+(`both_derivation_lanes_dispatch_to_same_sampler`). Production runs
+**Background** mode; PromptSmoothing drains between turns. Counting proof:
+`n1_background_drain_prompt_smoothing_before_compact_tool_result_absent_by_deriv12`
+(PromptSmoothing ops before compact; SummarizeToolResult **absent by DERIV-12**;
+compact adds no new sampler ops).
+
+| Setting (PromptSmoothing / real-inference lane) | Value |
+|---|---|
+| Model default | `grok-4.5` (`DEFAULT_LHC_INFERENCE_MODEL`) — **not** the session model |
+| Override | `GROK_LHC_INFERENCE_MODEL` / `[lhc] inference_model` |
+| Thinking | `ReasoningEffort::Low` (fixed; not configurable without a new ruling) |
+| Transport | Native `ShellLhcInferenceSampler` |
+| Status | `/lhc` shows resolved model slug + source + thinking |
+
+Mechanism-only cert may still use deterministic callbacks
+(`harness_chunk3b`). Derivation **content** / G2 re-compare:
+`xai-grok-shell` `l3_g2_real_inference_writeback_body_vs_fixture` (`#[ignore]`).
+
 ## Chunk 3A — configuration, status, diagnostics, rollout
 
 ### Config precedence
@@ -642,7 +744,7 @@ that set `GROK_LHC*` are unchanged. Default remains **off**.
 | `compact` | `GROK_LHC_COMPACT` | `shadow` / `replace` |
 | `compact_experimental` | `GROK_LHC_COMPACT_EXPERIMENTAL` | required for Replace |
 | `equivalence` | `GROK_LHC_EQUIVALENCE` | `0`/`false`/`off` disarms |
-| `inference_model` | `GROK_LHC_INFERENCE_MODEL` | ModelCall override |
+| `inference_model` | `GROK_LHC_INFERENCE_MODEL` | Override derivation model; default `grok-4.5` |
 
 ### Status surface (`/lhc`)
 

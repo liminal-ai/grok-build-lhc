@@ -1582,6 +1582,12 @@ mod fs_injection_regression_tests;
 #[path = "acp_session_tests/interjection_actor_tests.rs"]
 mod interjection_actor_tests;
 #[cfg(test)]
+#[path = "acp_session_tests/lhc_derivation_quality_timing.rs"]
+mod lhc_derivation_quality_timing;
+#[cfg(test)]
+#[path = "acp_session_tests/lhc_real_inference_g2.rs"]
+mod lhc_real_inference_g2;
+#[cfg(test)]
 #[path = "acp_session_tests/observability_bridge_mapping_tests.rs"]
 mod observability_bridge_mapping_tests;
 #[cfg(test)]

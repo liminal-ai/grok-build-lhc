@@ -21,6 +21,8 @@ mod serving;
 mod session;
 mod status;
 mod tee;
+#[cfg(any(test, feature = "test-util"))]
+mod writeback_gates;
 
 pub use capture::{
     CAPTURE_QUEUE_CAP, CaptureHandle, RegistrySnapshot, any_capture_active, is_session_registered,
@@ -29,8 +31,7 @@ pub use capture::{
 
 #[cfg(any(test, feature = "test-util"))]
 pub use capture::{
-    registry_lookup_count, reset_registry_lookup_count, set_refresh_binding_racy_for_test,
-    set_refresh_interleave_hook_for_test,
+    registry_lookup_count, reset_registry_lookup_count, set_refresh_interleave_hook_for_test,
 };
 pub use compact::{
     CompactBridgePlan, CompactChokeAction, CompactEventBridge, CompactMode, compact_mode,
@@ -43,10 +44,11 @@ pub use equivalence::{
 };
 pub use gating::{is_enabled, lhc_root};
 pub use inference::{
-    CountingLhcInferenceSampler, LhcInferenceError, LhcInferenceErrorKind, LhcInferenceFuture,
-    LhcInferenceOp, LhcInferenceRequest, LhcInferenceSample, LhcInferenceSampler,
-    MockLhcInferenceSampler, inference_callbacks_for_session, inference_sampler_registered,
-    register_inference_sampler, unregister_inference_sampler,
+    CountingLhcInferenceSampler, DEFAULT_LHC_INFERENCE_MODEL, LHC_INFERENCE_THINKING_LEVEL,
+    LhcInferenceError, LhcInferenceErrorKind, LhcInferenceFuture, LhcInferenceOp,
+    LhcInferenceRequest, LhcInferenceSample, LhcInferenceSampler, MockLhcInferenceSampler,
+    inference_callbacks_for_session, inference_sampler_registered, register_inference_sampler,
+    resolved_inference_model, unregister_inference_sampler,
 };
 /// Re-exported so the shell sampler can stamp provenance without depending on `lhc` directly.
 pub use lhc::shared_tech::{InferenceRequestMessage, InferenceRequestRole};
@@ -65,7 +67,10 @@ pub use serving::{
 };
 #[cfg(any(test, feature = "test-util"))]
 pub use session::set_force_classify_list_failure;
-pub use session::{encode_session_id_for_path, paths_disagree, thread_file_path};
+pub use session::{
+    CompactDrainOutcome, encode_session_id_for_path, last_compact_drain_outcome, paths_disagree,
+    thread_file_path,
+};
 pub use status::{
     ContextEngine, LhcHealthReport, LhcRepairAction, LhcRepairPlan, LhcStatusReport,
     execute_repair, format_health_report, format_repair_plan, format_status_report, health_check,
@@ -88,6 +93,15 @@ pub async fn session_open_for_test(
 pub use session::LhcSession;
 
 #[cfg(any(test, feature = "test-util"))]
+pub use session::{
+    set_compact_params_override_for_test, set_sever_compact_signal_for_test,
+    set_use_deterministic_inference_for_test,
+};
+
+#[cfg(any(test, feature = "test-util"))]
+pub use writeback_gates::{run_five_gates_on_body, run_five_gates_on_body_async};
+
+#[cfg(any(test, feature = "test-util"))]
 pub use compact::{
     preview_call_count, replace_call_count, reset_compact_call_counters, set_compact_mode_for_test,
 };
@@ -101,6 +115,8 @@ pub use equivalence::{
     serve_fallback_turns, structural_hit_count,
 };
 
+/// Token estimator used by LHC budgets (o200k_base) — for seed sizing in G2.
+pub use lhc::estimate_tokens;
 /// Re-exported so the tripwire compile genuinely links the vendored port.
 pub use lhc::sdk::init_lhc;
 
@@ -145,6 +161,11 @@ pub fn shutdown_session(session_id: &str) {
 
 /// Bound on the serving wait for `get_session_thread_view` (request path).
 pub const SERVE_CONTEXT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Cap on [`LhcSession::close`]'s `drainSettled` wait (t3code
+/// `DEFAULT_DRAIN_SETTLED_CAP_MS` = 30s). Background mode drains continuously;
+/// close only settles in-flight work before dropping the handle.
+pub const DRAIN_SETTLED_AT_CLOSE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Chunk 2 serving entry: fetch typed session view and decide substitution.
 ///
@@ -235,6 +256,8 @@ pub async fn shadow_preview_compact(session_id: &str) {
 pub struct ReplaceCompactWriteback {
     /// LHC compact receipt total (view tokens) — diagnostics only.
     pub receipt_total_tokens: i64,
+    /// Full compact receipt (bands, degraded rungs, gaps) — reportable.
+    pub receipt: lhc::shared_tech::view::CompactReceipt,
     /// Post-compact typed session view (structure + text for write-back).
     pub view: lhc::shared_tech::view::SessionThreadView,
     /// Once-per-translation `message_id` → kind index (RuntimeNote vs prompt).
@@ -247,8 +270,41 @@ pub struct ReplaceCompactWriteback {
 /// On success the host **must** write the body into native state via
 /// `replace_conversation_for_compaction` (see MAPPING.md). Flag-off remains
 /// the rollback at every point.
+///
+/// **Turn abort (R1):** drop-guard aborts the live port
+/// [`lhc::thread_view::CompactAbortSignal`] (`Arc<AtomicBool>`) and the
+/// [`CancellationToken`]. No OS bridge thread — the guard (or any caller)
+/// flips the atomic the port re-reads at `compact_stopped`. The invariant is
+/// **no snapshot install after abort** — background derivation may continue.
+/// `tokio::select!` alone cannot preempt synchronous compact compute.
 pub async fn replace_compact_for_writeback(
     session_id: &str,
+) -> Result<ReplaceCompactWriteback, String> {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let signal = lhc::thread_view::CompactAbortSignal::new();
+    let mut guard = CompactAbortDropGuard::armed(cancel.clone(), signal.clone());
+    let result = replace_compact_for_writeback_with_cancel_signal(session_id, cancel, signal).await;
+    guard.disarm();
+    result
+}
+
+/// Replace-mode compact with an explicit cancel token (tests / callers that
+/// already own a turn cancel). Creates a fresh live port signal bridged from
+/// `cancel`.
+pub async fn replace_compact_for_writeback_with_cancel(
+    session_id: &str,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<ReplaceCompactWriteback, String> {
+    let signal = lhc::thread_view::CompactAbortSignal::new();
+    replace_compact_for_writeback_with_cancel_signal(session_id, cancel, signal).await
+}
+
+/// Replace-mode compact with an explicit cancel token **and** port abort signal
+/// (R1 tests that must hold the same `CompactAbortSignal` the port observes).
+pub async fn replace_compact_for_writeback_with_cancel_signal(
+    session_id: &str,
+    cancel: tokio_util::sync::CancellationToken,
+    signal: lhc::thread_view::CompactAbortSignal,
 ) -> Result<ReplaceCompactWriteback, String> {
     if !matches!(resolve_compact_mode(), CompactMode::Replace) {
         return Err("replace_mode_inactive".into());
@@ -258,14 +314,28 @@ pub async fn replace_compact_for_writeback(
         return Err("no_capture_handle".into());
     };
     compact::note_replace_call();
-    let receipt = handle.compact_thread().await.map_err(|err| {
-        tracing::error!(
-            session_id,
-            %err,
-            "LHC compact replace: compact failed; native path should resume"
-        );
-        err
-    })?;
+    let receipt = handle
+        .compact_thread_cancellable(cancel.clone(), signal.clone())
+        .await
+        .map_err(|err| {
+            if err == "compact_cancelled" {
+                tracing::warn!(
+                    session_id,
+                    "LHC compact replace: abandoned on cancel — no write-back"
+                );
+            } else {
+                tracing::error!(
+                    session_id,
+                    %err,
+                    "LHC compact replace: compact failed; native path should resume"
+                );
+            }
+            err
+        })?;
+    if cancel.is_cancelled() || signal.aborted() {
+        session::note_compact_drain_outcome(session_id, CompactDrainOutcome::AbandonedByCancel);
+        return Err("compact_cancelled".into());
+    }
     tracing::info!(
         session_id,
         receipt_total = receipt.total_tokens,
@@ -281,9 +351,49 @@ pub async fn replace_compact_for_writeback(
     })?;
     Ok(ReplaceCompactWriteback {
         receipt_total_tokens: receipt.total_tokens,
+        receipt,
         view,
         kinds,
     })
+}
+
+/// Drop-guard: abort port signal **and** cancel token (signal atomic first).
+///
+/// Lifetime: success path calls [`Self::disarm`] — neither cancel nor abort
+/// runs, and **no helper thread** remains. Cancel/drop path flips the live
+/// `CompactAbortSignal` atomic so sync compact checkpoints observe abort.
+struct CompactAbortDropGuard {
+    cancel: tokio_util::sync::CancellationToken,
+    signal: lhc::thread_view::CompactAbortSignal,
+    armed: bool,
+}
+
+impl CompactAbortDropGuard {
+    fn armed(
+        cancel: tokio_util::sync::CancellationToken,
+        signal: lhc::thread_view::CompactAbortSignal,
+    ) -> Self {
+        Self {
+            cancel,
+            signal,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CompactAbortDropGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // Signal first so a worker mid-sync-compute sees abort at the next
+            // `compact_stopped` re-read (no OS bridge thread).
+            self.signal.abort();
+            self.cancel.cancel();
+        }
+    }
 }
 
 /// Replace-mode boolean helper (tests / counters). Prefer
@@ -488,11 +598,17 @@ mod tests {
         shutdown_session(session_id);
     }
 
-    /// Shared AC1 scenario: disabled B's `refresh_binding` runs while an
-    /// interleave hook registers B. `racy` selects the **call-site** assembly
-    /// in `refresh_binding` (not a helper simulation).
-    fn ab1_interleave_register_event_count(racy_call_site: bool) -> usize {
-        set_refresh_binding_racy_for_test(racy_call_site);
+    /// AC1 — mid-session enable via atomic `lookup_session_snapshot`.
+    ///
+    /// Durable outcome: a disabled tee that refreshes while an interleave
+    /// registers the session still captures post-enable persists. No racy
+    /// call-site reconstruction (bad-code-log — test the real path).
+    #[test]
+    fn ab1_refresh_snapshot_atomic_keeps_mid_session_on() {
+        let _g = env_lock();
+        let prev = std::env::var_os("GROK_LHC");
+        let prev_root = std::env::var_os("GROK_LHC_ROOT");
+
         set_refresh_interleave_hook_for_test(None);
 
         let root = tempfile::tempdir().unwrap();
@@ -500,7 +616,6 @@ mod tests {
             std::env::set_var("GROK_LHC", "1");
             std::env::set_var("GROK_LHC_ROOT", root.path());
         }
-        // Session A bumps the generation so B's next persist must refresh.
         let a = spawn_capture(
             "ab1-active-a",
             Some("/tmp"),
@@ -532,7 +647,6 @@ mod tests {
             );
         })));
 
-        // Unregister A → generation moves → B's persist refreshes and runs the hook.
         a.shutdown_blocking();
         wait_until_inactive("ab1-active-a");
 
@@ -541,7 +655,7 @@ mod tests {
         tee_b.flush();
 
         let handle = lookup_session("ab1-disabled-b");
-        let n = match handle {
+        let atomic_events = match handle {
             Some(h) => {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -565,31 +679,8 @@ mod tests {
         drop(tee_b);
         wait_until_inactive("ab1-disabled-b");
         set_refresh_interleave_hook_for_test(None);
-        set_refresh_binding_racy_for_test(false);
-        n
-    }
 
-    /// AC1 — pins `refresh_binding`'s call site, not a helper simulation.
-    ///
-    /// Racy call-site assembly (lookup → interleave → generation) loses the
-    /// mid-session enable; atomic `lookup_session_snapshot` keeps it.
-    #[test]
-    fn ab1_refresh_snapshot_atomic_keeps_mid_session_on() {
-        let _g = env_lock();
-        let prev = std::env::var_os("GROK_LHC");
-        let prev_root = std::env::var_os("GROK_LHC_ROOT");
-
-        let racy_events = ab1_interleave_register_event_count(true);
-        eprintln!(
-            "AC1 racy refresh_binding call site: events={racy_events} (expect bootstrap-only / <2)"
-        );
-        assert!(
-            racy_events < 2,
-            "racy refresh_binding must lose the post-enable persist (got events={racy_events})"
-        );
-
-        let atomic_events = ab1_interleave_register_event_count(false);
-        eprintln!("AC1 atomic refresh_binding call site: events={atomic_events} (expect >= 2)");
+        eprintln!("AC1 atomic refresh_binding: events={atomic_events} (expect >= 2)");
         assert!(
             atomic_events >= 2,
             "atomic refresh_binding must observe mid-session on (got events={atomic_events})"

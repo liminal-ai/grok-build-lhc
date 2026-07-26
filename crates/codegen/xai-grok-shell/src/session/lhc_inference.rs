@@ -1,36 +1,47 @@
 //! Shell-side [`grok_lhc_host::LhcInferenceSampler`] — dedicated LHC transport.
 //!
 //! Builds a fresh client per call (credentials re-resolved via
-//! [`AuthManager`] / bearer resolver), using a dedicated non-main model when
-//! `GROK_LHC_INFERENCE_MODEL` is set; otherwise the session model with a
-//! distinct request id. Mirrors compaction's `prepare_chat_completion`
-//! refresh pattern, not a spawn-time credential snapshot.
+//! [`AuthManager`] / bearer resolver). Derivation inference uses
+//! [`grok_lhc_host::DEFAULT_LHC_INFERENCE_MODEL`] (`grok-4.5`) by default,
+//! with `GROK_LHC_INFERENCE_MODEL` as an explicit override — **never** the
+//! session chat model. Thinking is fixed at
+//! [`xai_grok_sampling_types::ReasoningEffort::Low`] (ruling).
+//!
+//! **Production drain lane (DERIV-12):** only `PromptSmoothing` reaches this
+//! sampler from Background work. `ToolResultSummary` stays on the vendored
+//! truncate-fallback (`FORCE_TOOL_RESULT_SUMMARY_FALLBACK`) and does **not**
+//! call the sampler in production. The host callback bridge can still
+//! dispatch a direct `SummarizeToolResult` (capability / probe); that is not
+//! a production lane. Mirrors compaction's `prepare_chat_completion` refresh
+//! pattern, not a spawn-time credential snapshot.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use grok_lhc_host::{
-    InferenceRequestMessage, InferenceRequestRole, LhcInferenceError, LhcInferenceErrorKind,
-    LhcInferenceFuture, LhcInferenceRequest, LhcInferenceSample, LhcInferenceSampler,
+    DEFAULT_LHC_INFERENCE_MODEL, InferenceRequestMessage, InferenceRequestRole, LhcInferenceError,
+    LhcInferenceErrorKind, LhcInferenceFuture, LhcInferenceRequest, LhcInferenceSample,
+    LhcInferenceSampler, resolved_inference_model,
 };
 use tokio_util::sync::CancellationToken;
-use xai_grok_sampling_types::{ConversationItem, ConversationRequest};
+use xai_grok_sampling_types::{ConversationItem, ConversationRequest, ReasoningEffort};
 
 use crate::auth::AuthManager;
 use crate::sampling::Client as OaiCompatClient;
 use crate::sampling::{SamplerConfig, SamplingError};
 
-/// Env override for a dedicated non-main LHC inference model slug.
+/// Env override for a dedicated LHC derivation model slug.
 const LHC_INFERENCE_MODEL_ENV: &str = "GROK_LHC_INFERENCE_MODEL";
 
 /// Inference sampler wired at LHC tee/open (hook 2).
 pub struct ShellLhcInferenceSampler {
-    /// Template config (URL, backend, headers). Model may be overridden per call.
+    /// Template config (URL, backend, headers). Model is **not** taken from
+    /// `base_config.model` for derivation calls — see [`Self::model_slug`].
     base_config: SamplerConfig,
     auth_manager: Option<Arc<AuthManager>>,
     session_id: String,
     timeout: Duration,
-    /// Dedicated non-main model slug when set; else `base_config.model`.
+    /// Explicit override from `GROK_LHC_INFERENCE_MODEL` when set at construct.
     dedicated_model: Option<String>,
 }
 
@@ -58,10 +69,69 @@ impl ShellLhcInferenceSampler {
         Arc::new(self)
     }
 
-    fn model_slug(&self) -> String {
-        self.dedicated_model
-            .clone()
-            .unwrap_or_else(|| self.base_config.model.clone())
+    /// Resolved derivation model: env/config override, else `grok-4.5`.
+    ///
+    /// Never falls back to the session's `base_config.model`.
+    pub fn model_slug(&self) -> String {
+        if let Some(ref m) = self.dedicated_model {
+            return m.clone();
+        }
+        let (slug, _) = resolved_inference_model();
+        // resolved_inference_model already defaults to grok-4.5; keep the
+        // constant visible for readers of this call site.
+        if slug.is_empty() {
+            DEFAULT_LHC_INFERENCE_MODEL.to_string()
+        } else {
+            slug
+        }
+    }
+
+    /// Fixed thinking level for derivation calls (ruling).
+    pub fn thinking_level(&self) -> ReasoningEffort {
+        ReasoningEffort::Low
+    }
+
+    /// Build the [`ConversationRequest`] that will be sent for a derivation.
+    ///
+    /// Kept as a pure constructor so tests can assert `reasoning_effort` (and
+    /// model) on the request object itself — not only on accessors.
+    pub(crate) fn build_derivation_request(
+        &self,
+        req: &LhcInferenceRequest,
+        model: &str,
+    ) -> ConversationRequest {
+        let label = req.op().as_prompt_label();
+        let max_output_tokens = req.max_output_tokens();
+        let user_text = req.user_prompt_text();
+        let system = format!(
+            "You are a Grok Build helper performing `{label}` for long-horizon context. \
+             Reply with only the transformed text, no preamble. \
+             Respect the target token budget implied by the user message."
+        );
+        ConversationRequest {
+            items: vec![
+                ConversationItem::system(system),
+                ConversationItem::user(user_text),
+            ],
+            tools: vec![],
+            hosted_tools: vec![],
+            tool_choice: None,
+            model: Some(model.to_string()),
+            temperature: Some(0.0),
+            max_output_tokens: Some(max_output_tokens),
+            top_p: None,
+            x_grok_conv_id: Some(format!("lhc-inf-{}", self.session_id)),
+            x_grok_req_id: Some(format!("xai-lhc-{}-{}", label, uuid::Uuid::new_v4())),
+            x_grok_session_id: Some(self.session_id.clone()),
+            x_grok_turn_idx: None,
+            x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
+            x_grok_deployment_id: None,
+            x_grok_user_id: None,
+            trace: None,
+            prompt_cache_key: None,
+            reasoning_effort: Some(self.thinking_level()),
+            json_schema: None,
+        }
     }
 
     /// Rebuild a client with live credentials (compaction-style refresh).
@@ -138,46 +208,21 @@ impl LhcInferenceSampler for ShellLhcInferenceSampler {
             let (client, model) = this.resolve_client().await?;
             let label = req.op().as_prompt_label().to_string();
             let max_output_tokens = req.max_output_tokens();
-            let user_text = req.user_prompt_text();
-            let system = format!(
-                "You are a Grok Build helper performing `{label}` for long-horizon context. \
-                 Reply with only the transformed text, no preamble. \
-                 Respect the target token budget implied by the user message."
-            );
-            let request_messages = vec![
-                InferenceRequestMessage {
-                    role: InferenceRequestRole::System,
-                    content: system.clone(),
-                },
-                InferenceRequestMessage {
-                    role: InferenceRequestRole::User,
-                    content: user_text.clone(),
-                },
-            ];
-            let request = ConversationRequest {
-                items: vec![
-                    ConversationItem::system(system),
-                    ConversationItem::user(user_text),
-                ],
-                tools: vec![],
-                hosted_tools: vec![],
-                tool_choice: None,
-                model: Some(model.clone()),
-                temperature: Some(0.0),
-                max_output_tokens: Some(max_output_tokens),
-                top_p: None,
-                x_grok_conv_id: Some(format!("lhc-inf-{session_id}")),
-                x_grok_req_id: Some(format!("xai-lhc-{}-{}", label, uuid::Uuid::new_v4())),
-                x_grok_session_id: Some(session_id),
-                x_grok_turn_idx: None,
-                x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
-                x_grok_deployment_id: None,
-                x_grok_user_id: None,
-                trace: None,
-                prompt_cache_key: None,
-                reasoning_effort: None,
-                json_schema: None,
-            };
+            let request = this.build_derivation_request(&req, &model);
+            let request_messages: Vec<InferenceRequestMessage> = request
+                .items
+                .iter()
+                .filter_map(|item| {
+                    let content = item.text_content();
+                    let role = match item {
+                        ConversationItem::System(_) => InferenceRequestRole::System,
+                        ConversationItem::User(_) => InferenceRequestRole::User,
+                        _ => return None,
+                    };
+                    Some(InferenceRequestMessage { role, content })
+                })
+                .collect();
+            let _ = session_id; // stamped inside build_derivation_request
             let fut = client.conversation_collect(request);
             tokio::select! {
                 _ = cancel.cancelled() => Err(LhcInferenceError {
@@ -218,5 +263,155 @@ impl LhcInferenceSampler for ShellLhcInferenceSampler {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Duration;
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn base_cfg(session_model: &str) -> SamplerConfig {
+        SamplerConfig {
+            base_url: "https://api.example.com".into(),
+            model: session_model.into(),
+            context_window: 128_000,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn model_slug_defaults_to_grok_45_not_session_model() {
+        let _g = env_lock();
+        let prev = std::env::var_os("GROK_LHC_INFERENCE_MODEL");
+        unsafe { std::env::remove_var("GROK_LHC_INFERENCE_MODEL") };
+        let s = ShellLhcInferenceSampler::new(
+            base_cfg("session-chat-model"),
+            None,
+            "test-sid",
+            Duration::from_secs(1),
+        );
+        assert_eq!(s.model_slug(), "grok-4.5");
+        assert_ne!(s.model_slug(), "session-chat-model");
+        assert_eq!(s.thinking_level(), ReasoningEffort::Low);
+        match prev {
+            Some(v) => unsafe { std::env::set_var("GROK_LHC_INFERENCE_MODEL", v) },
+            None => unsafe { std::env::remove_var("GROK_LHC_INFERENCE_MODEL") },
+        }
+    }
+
+    #[test]
+    fn model_slug_honors_env_override() {
+        let _g = env_lock();
+        let prev = std::env::var_os("GROK_LHC_INFERENCE_MODEL");
+        unsafe { std::env::set_var("GROK_LHC_INFERENCE_MODEL", "override-model") };
+        let s = ShellLhcInferenceSampler::new(
+            base_cfg("session-chat-model"),
+            None,
+            "test-sid",
+            Duration::from_secs(1),
+        );
+        assert_eq!(s.model_slug(), "override-model");
+        match prev {
+            Some(v) => unsafe { std::env::set_var("GROK_LHC_INFERENCE_MODEL", v) },
+            None => unsafe { std::env::remove_var("GROK_LHC_INFERENCE_MODEL") },
+        }
+    }
+
+    /// M4 — pin `ReasoningEffort::Low` on the constructed request, not the accessor.
+    #[test]
+    fn derivation_request_carries_reasoning_effort_low() {
+        let _g = env_lock();
+        let prev = std::env::var_os("GROK_LHC_INFERENCE_MODEL");
+        unsafe { std::env::remove_var("GROK_LHC_INFERENCE_MODEL") };
+        let s = ShellLhcInferenceSampler::new(
+            base_cfg("session-chat-model"),
+            None,
+            "m4-sid",
+            Duration::from_secs(1),
+        );
+        let req = LhcInferenceRequest::SmoothPrompt {
+            text: "rewrite me".into(),
+            max_output_tokens: 32,
+        };
+        let built = s.build_derivation_request(&req, &s.model_slug());
+        assert_eq!(
+            built.reasoning_effort,
+            Some(ReasoningEffort::Low),
+            "derivation ConversationRequest must carry ReasoningEffort::Low"
+        );
+        assert_eq!(built.model.as_deref(), Some("grok-4.5"));
+        match prev {
+            Some(v) => unsafe { std::env::set_var("GROK_LHC_INFERENCE_MODEL", v) },
+            None => unsafe { std::env::remove_var("GROK_LHC_INFERENCE_MODEL") },
+        }
+    }
+
+    /// Pin: derivation must NOT ship the session agent prompt / tools.
+    ///
+    /// Codex live cert found their derivation forwarded a ~20k-char agent
+    /// prompt per call (4.7× cost undercount). This fork builds a purpose-built
+    /// ~250-char system prompt with empty tools — assert so a future change
+    /// cannot silently reintroduce session baggage.
+    #[test]
+    fn derivation_request_excludes_session_tools_and_agent_prompt() {
+        let _g = env_lock();
+        let prev = std::env::var_os("GROK_LHC_INFERENCE_MODEL");
+        unsafe { std::env::remove_var("GROK_LHC_INFERENCE_MODEL") };
+        let s = ShellLhcInferenceSampler::new(
+            base_cfg("session-chat-model"),
+            None,
+            "pin-no-agent-prompt",
+            Duration::from_secs(1),
+        );
+        let req = LhcInferenceRequest::SmoothPrompt {
+            text: "rewrite me".into(),
+            max_output_tokens: 32,
+        };
+        let built = s.build_derivation_request(&req, &s.model_slug());
+        assert!(
+            built.tools.is_empty(),
+            "derivation must not carry session tools; got {} tools",
+            built.tools.len()
+        );
+        assert!(
+            built.hosted_tools.is_empty(),
+            "derivation must not carry hosted tools; got {} hosted_tools",
+            built.hosted_tools.len()
+        );
+        assert!(
+            built.prompt_cache_key.is_none(),
+            "derivation must set prompt_cache_key: None (write-back invalidates prefix cache)"
+        );
+        let system = built
+            .items
+            .iter()
+            .find_map(|i| match i {
+                ConversationItem::System(_) => Some(i.text_content()),
+                _ => None,
+            })
+            .expect("derivation request must include a system item");
+        assert!(
+            system.len() < 500,
+            "derivation system prompt must be purpose-built (~250 chars), not the \
+             session agent prompt; got {} chars",
+            system.len()
+        );
+        assert!(
+            system.contains("lhc.smooth_prompt"),
+            "system prompt should name the derivation op, not agent instructions"
+        );
+        match prev {
+            Some(v) => unsafe { std::env::set_var("GROK_LHC_INFERENCE_MODEL", v) },
+            None => unsafe { std::env::remove_var("GROK_LHC_INFERENCE_MODEL") },
+        }
     }
 }

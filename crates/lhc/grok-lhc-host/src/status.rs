@@ -13,10 +13,12 @@ use lhc::shared_tech::{get_schema_version, open_database};
 use crate::compact::CompactMode;
 use crate::equivalence::{EquivalenceSnapshot, equivalence_armed, equivalence_snapshot};
 use crate::gating::{is_enabled, lhc_root};
-use crate::inference::inference_sampler_registered;
+use crate::inference::{
+    LHC_INFERENCE_THINKING_LEVEL, inference_sampler_registered, resolved_inference_model,
+};
 use crate::runtime_config::{ConfigSource, applied_config, config_parse_error};
 use crate::serving::last_serve_outcome;
-use crate::session::{encode_session_id_for_path, thread_file_path};
+use crate::session::{encode_session_id_for_path, last_compact_drain_outcome, thread_file_path};
 use crate::tee::capture_active;
 use crate::{any_capture_active, lookup_session};
 
@@ -58,6 +60,11 @@ pub struct LhcStatusReport {
     pub last_serve_reason: Option<&'static str>,
     /// Whether ModelCall compaction has a registered inference sampler (Z2).
     pub inference_compact_available: bool,
+    /// Resolved derivation inference model (`grok-4.5` default; env/config override).
+    pub inference_model: String,
+    pub inference_model_source: ConfigSource,
+    /// Fixed thinking level for derivation calls (`low` — ruling).
+    pub inference_thinking: &'static str,
     pub thread_path: Option<PathBuf>,
     pub storage_bytes: Option<u64>,
     pub event_count: Option<usize>,
@@ -192,6 +199,7 @@ pub async fn status_report(session_id: &str) -> LhcStatusReport {
     let active = capture_active(session_id);
     let (context_engine, last_serve_reason) = engine_from_last_serve(session_id, active);
     let inference_compact_available = inference_sampler_registered(session_id);
+    let (inference_model, inference_model_source) = resolved_inference_model();
     let parse_err = config_parse_error();
 
     if !enabled && !any_capture_active() {
@@ -207,6 +215,9 @@ pub async fn status_report(session_id: &str) -> LhcStatusReport {
             context_engine: ContextEngine::Native,
             last_serve_reason: None,
             inference_compact_available: false,
+            inference_model,
+            inference_model_source,
+            inference_thinking: LHC_INFERENCE_THINKING_LEVEL,
             thread_path: None,
             storage_bytes: None,
             event_count: None,
@@ -345,6 +356,15 @@ pub async fn status_report(session_id: &str) -> LhcStatusReport {
         ));
     }
 
+    let last_compact_line =
+        last_compact_drain_outcome(session_id).map(|o| o.status_line().to_string());
+    if let Some(ref line) = last_compact_line {
+        // Compact abandon must never be silent in status (R1).
+        if line.contains("abandoned") {
+            notes.push(line.clone());
+        }
+    }
+
     let ok = storage_reachable
         && (schema_present || !thread_path.exists())
         && failed_derivations.unwrap_or(0) == 0
@@ -364,12 +384,15 @@ pub async fn status_report(session_id: &str) -> LhcStatusReport {
         context_engine,
         last_serve_reason,
         inference_compact_available,
+        inference_model,
+        inference_model_source,
+        inference_thinking: LHC_INFERENCE_THINKING_LEVEL,
         thread_path: Some(thread_path),
         storage_bytes,
         event_count,
         last_event_summary,
         view_status_line,
-        last_compact_line: None,
+        last_compact_line,
         equivalence: if active && equivalence_armed() {
             Some(equivalence_snapshot())
         } else {
@@ -567,6 +590,8 @@ pub fn format_status_report(r: &LhcStatusReport) -> String {
          **Storage root:** {} (source: {})\n\n\
          **Session:** {}\n\n\
          **Capture active:** {}\n\n\
+         **Derivation inference:** model `{}` (source: {}), thinking `{}`\n\
+         (PromptSmoothing→smoothed_prompt real; ToolResultSummary truncate-fallback by port)\n\n\
          **ModelCall compact:** {}\n",
         r.compact_mode,
         r.compact_source.as_str(),
@@ -574,6 +599,9 @@ pub fn format_status_report(r: &LhcStatusReport) -> String {
         r.root_source.as_str(),
         r.session_id,
         r.capture_active,
+        r.inference_model,
+        r.inference_model_source.as_str(),
+        r.inference_thinking,
         if r.inference_compact_available {
             "available"
         } else if r.capture_active {
@@ -690,6 +718,8 @@ mod tests {
         assert_eq!(r.context_engine, ContextEngine::Native);
         assert!(r.event_count.is_none());
         assert!(format_status_report(&r).contains("Active context engine:** native"));
+        assert_eq!(r.inference_model, crate::DEFAULT_LHC_INFERENCE_MODEL);
+        assert_eq!(r.inference_thinking, "low");
         match prev {
             Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
             None => unsafe { std::env::remove_var("GROK_LHC") },

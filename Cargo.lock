@@ -13887,6 +13887,7 @@ dependencies = [
  "jsonschema",
  "jsonwebtoken",
  "kanal",
+ "lhc",
  "libc",
  "moka",
  "nix 0.30.1",

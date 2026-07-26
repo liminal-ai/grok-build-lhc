@@ -75,17 +75,8 @@ impl LhcTeePersistence {
     /// branch (AC1) reconstructs the pre-AB1 two-observation call site so the
     /// suite can fail when that assembly is restored.
     fn refresh_binding(&mut self) {
-        #[cfg(any(test, feature = "test-util"))]
-        if crate::capture::refresh_binding_racy_for_test() {
-            // Pre-AB1 call site — two separate observations with a window.
-            let handle = crate::capture::lookup_session(&self.session_id);
-            crate::capture::take_and_run_refresh_interleave_hook();
-            let generation = registry_generation();
-            self.cached = RegistrySnapshot::from_parts_for_test(generation, handle);
-            return;
-        }
         self.cached = lookup_session_snapshot(&self.session_id);
-        // Test-only fail-safe: interleave after the atomic stamp (no race window).
+        // Test-only: interleave after the atomic stamp (mid-session-on race).
         #[cfg(any(test, feature = "test-util"))]
         crate::capture::take_and_run_refresh_interleave_hook();
     }

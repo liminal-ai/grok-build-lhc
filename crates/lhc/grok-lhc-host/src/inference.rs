@@ -2,6 +2,24 @@
 //!
 //! The trait lives here; the real transport lives in `xai-grok-shell` (alongside
 //! `ShellCompactionSampler`). Adapter tests inject [`MockLhcInferenceSampler`].
+//!
+//! ## Derivation lanes (Lee's ruling, Chunk 3 unit 19)
+//!
+//! Callback bridge (capability): both work kinds *can* fan into the single
+//! registered [`LhcInferenceSampler`] via [`inference_callbacks_for_session`]
+//! → [`dispatch`]:
+//! - `WorkKind::PromptSmoothing` → `smoothed_prompt` → `smooth_prompt`
+//! - `WorkKind::ToolResultSummary` → `tool_result_summary` → `summarize_tool_result`
+//!
+//! **Production Background drain (DERIV-12):** only PromptSmoothing actually
+//! reaches the sampler. ToolResultSummary is forced onto the vendored
+//! truncate-fallback (`FORCE_TOOL_RESULT_SUMMARY_FALLBACK = true` in
+//! `handlers.rs`) — no production `SummarizeToolResult` sampler op. Direct
+//! callback/probe calls remain a capability check, not a production lane.
+//!
+//! Resolved model default: [`DEFAULT_LHC_INFERENCE_MODEL`] (`grok-4.5`).
+//! Thinking: [`LHC_INFERENCE_THINKING_LEVEL`] (`low`) — set on the shell
+//! `ConversationRequest`, not configurable without a new ruling.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -16,6 +34,43 @@ use lhc::shared_tech::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
+
+use crate::runtime_config::{ConfigSource, applied_config};
+
+/// Default model slug for LHC derivation inference (production:
+/// PromptSmoothing; ToolResultSummary is truncate-fallback under DERIV-12).
+///
+/// Override with `GROK_LHC_INFERENCE_MODEL` / `[lhc] inference_model`. Must
+/// **not** fall back to the session's chat model.
+pub const DEFAULT_LHC_INFERENCE_MODEL: &str = "grok-4.5";
+
+/// Fixed thinking level for derivation calls (ruling — not a tunable default).
+pub const LHC_INFERENCE_THINKING_LEVEL: &str = "low";
+
+/// Resolve the derivation inference model slug and its provenance.
+///
+/// Order: env `GROK_LHC_INFERENCE_MODEL` → applied config file value →
+/// [`DEFAULT_LHC_INFERENCE_MODEL`].
+pub fn resolved_inference_model() -> (String, ConfigSource) {
+    if let Ok(v) = std::env::var("GROK_LHC_INFERENCE_MODEL") {
+        let t = v.trim();
+        if !t.is_empty() {
+            return (t.to_string(), ConfigSource::Env);
+        }
+    }
+    if let Some(applied) = applied_config()
+        && let Some(ref m) = applied.inference_model.value
+    {
+        let t = m.trim();
+        if !t.is_empty() {
+            return (t.to_string(), applied.inference_model.source);
+        }
+    }
+    (
+        DEFAULT_LHC_INFERENCE_MODEL.to_string(),
+        ConfigSource::Default,
+    )
+}
 
 /// Boxed future used by [`LhcInferenceSampler`].
 pub type LhcInferenceFuture =
@@ -315,6 +370,8 @@ pub fn inference_callbacks_for_session(session_id: &str) -> InferenceCallbacks {
                     text: input.text,
                     max_output_tokens: DEFAULT_SMOOTH_TOKENS,
                 };
+                // Background drain is independent of turn abort — samples run
+                // to completion (or host-level cancel). Compact never waits.
                 dispatch(&sid, req, CancellationToken::new()).await
             })
         }),
@@ -483,6 +540,73 @@ impl LhcInferenceSampler for CountingLhcInferenceSampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gating::env_lock;
+
+    #[test]
+    fn resolved_inference_model_defaults_to_grok_45_not_session() {
+        let _g = env_lock();
+        let prev = std::env::var_os("GROK_LHC_INFERENCE_MODEL");
+        unsafe { std::env::remove_var("GROK_LHC_INFERENCE_MODEL") };
+        let (slug, src) = resolved_inference_model();
+        assert_eq!(slug, DEFAULT_LHC_INFERENCE_MODEL);
+        assert_eq!(slug, "grok-4.5");
+        assert_eq!(src, ConfigSource::Default);
+        assert_eq!(LHC_INFERENCE_THINKING_LEVEL, "low");
+        match prev {
+            Some(v) => unsafe { std::env::set_var("GROK_LHC_INFERENCE_MODEL", v) },
+            None => unsafe { std::env::remove_var("GROK_LHC_INFERENCE_MODEL") },
+        }
+    }
+
+    #[test]
+    fn resolved_inference_model_env_overrides_default() {
+        let _g = env_lock();
+        let prev = std::env::var_os("GROK_LHC_INFERENCE_MODEL");
+        unsafe { std::env::set_var("GROK_LHC_INFERENCE_MODEL", "custom-slug") };
+        let (slug, src) = resolved_inference_model();
+        assert_eq!(slug, "custom-slug");
+        assert_eq!(src, ConfigSource::Env);
+        match prev {
+            Some(v) => unsafe { std::env::set_var("GROK_LHC_INFERENCE_MODEL", v) },
+            None => unsafe { std::env::remove_var("GROK_LHC_INFERENCE_MODEL") },
+        }
+    }
+
+    /// Callback-bridge capability: both work kinds can dispatch to one sampler.
+    /// Not a production-lane proof — ToolResultSummary is truncate-fallback
+    /// under DERIV-12 in Background drain.
+    #[tokio::test]
+    async fn both_derivation_lanes_dispatch_to_same_sampler() {
+        let sid = "inf-both-lanes";
+        let counter = Arc::new(CountingLhcInferenceSampler::new());
+        register_inference_sampler(sid, counter.clone());
+        let cbs = inference_callbacks_for_session(sid);
+        let _ = (cbs.smooth_prompt)(SmoothPromptInput {
+            text: "smooth-me".into(),
+        })
+        .await;
+        let _ = (cbs.summarize_tool_result)(SummarizeToolResultInput {
+            tool_name: "bash".into(),
+            content: "out".into(),
+            outcome: None,
+            target_tokens: None,
+            operation_class: None,
+            response_shape: None,
+            prompt_mode: None,
+            facts: None,
+        })
+        .await;
+        let ops = counter.call_ops();
+        assert!(
+            ops.contains(&LhcInferenceOp::SmoothPrompt),
+            "PromptSmoothing lane missing: {ops:?}"
+        );
+        assert!(
+            ops.contains(&LhcInferenceOp::SummarizeToolResult),
+            "ToolResultSummary lane missing: {ops:?}"
+        );
+        unregister_inference_sampler(sid);
+    }
 
     #[tokio::test]
     async fn mock_sampler_round_trips_via_registry() {

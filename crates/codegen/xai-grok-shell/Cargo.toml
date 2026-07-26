@@ -188,6 +188,11 @@ windows = { workspace = true }
 criterion = { workspace = true }
 filetime = { workspace = true }
 tempfile = { workspace = true }
+# Test builds only: five hard write-back gates + crash seams for credentialed G2.
+# Production `cargo build -p xai-grok-shell` does not enable this feature.
+grok-lhc-host = { path = "../../lhc/grok-lhc-host", features = ["test-util"] }
+# Measurement harness (quality/timing) queries LHC logging + messages surfaces.
+lhc = { path = "../../lhc/vendor/long-horizon-context/packages/lhc-rs" }
 xai-grok-memory = { workspace = true, features = ["test-support"] }
 xai-grok-workspace = { workspace = true, features = ["test-support"] }
 xai-grok-config = { workspace = true, features = [] }

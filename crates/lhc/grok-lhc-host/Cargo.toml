@@ -16,6 +16,10 @@ test-util = []
 name = "certification"
 required-features = ["test-util"]
 
+[[test]]
+name = "harness_chunk3b"
+required-features = ["test-util"]
+
 [dependencies]
 lhc = { path = "../vendor/long-horizon-context/packages/lhc-rs" }
 xai-chat-state = { path = "../../codegen/xai-chat-state" }

@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 use lhc::intake_stream::BatchEventOutcome;
+use lhc::thread_view::CompactAbortSignal;
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 use xai_grok_sampling_types::ConversationItem;
 
@@ -67,8 +69,16 @@ enum CaptureCmd {
         >,
     ),
     PreviewCompact(oneshot::Sender<Result<lhc::shared_tech::view::PreviewCompactOutcome, String>>),
-    Compact(oneshot::Sender<Result<lhc::shared_tech::view::CompactReceipt, String>>),
+    Compact {
+        ack: oneshot::Sender<Result<lhc::shared_tech::view::CompactReceipt, String>>,
+        cancel: CancellationToken,
+        /// Live port abort signal (same turn-abort as `cancel`).
+        signal: CompactAbortSignal,
+    },
+    /// Await background-scheduler quiescence (does not start a host drain).
+    DrainSettled(oneshot::Sender<()>),
     GetViewStatus(oneshot::Sender<Result<lhc::shared_tech::view::ViewStatus, String>>),
+    InspectHealth(oneshot::Sender<Result<lhc::shared_tech::inspect::HealthReport, String>>),
     #[cfg(any(test, feature = "test-util"))]
     Poison(oneshot::Sender<()>),
     #[cfg(any(test, feature = "test-util"))]
@@ -257,10 +267,83 @@ impl CaptureHandle {
 
     /// Replace-mode compact (writes).
     pub async fn compact_thread(&self) -> Result<lhc::shared_tech::view::CompactReceipt, String> {
+        self.compact_thread_cancellable(CancellationToken::new(), CompactAbortSignal::new())
+            .await
+    }
+
+    /// Compact with a cancel token + live port abort signal.
+    pub async fn compact_thread_cancellable(
+        &self,
+        cancel: CancellationToken,
+        signal: CompactAbortSignal,
+    ) -> Result<lhc::shared_tech::view::CompactReceipt, String> {
         let (tx, rx) = oneshot::channel();
         self.inner
             .tx
-            .send(CaptureCmd::Compact(tx))
+            .send(CaptureCmd::Compact {
+                ack: tx,
+                cancel,
+                signal,
+            })
+            .await
+            .map_err(|_| "capture worker gone".to_string())?;
+        rx.await.map_err(|_| "capture worker dropped".to_string())?
+    }
+
+    /// Awaitable flush (async-safe — do not use blocking helpers inside a runtime).
+    pub async fn flush(&self) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .tx
+            .send(CaptureCmd::Flush(tx))
+            .await
+            .map_err(|_| "capture worker gone".to_string())?;
+        rx.await.map_err(|_| "capture worker dropped".to_string())
+    }
+
+    /// Awaitable shutdown that waits for the worker to finish teardown.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn shutdown(&self) -> Result<(), String> {
+        unregister_worker(&self.inner.session_id, self.inner.worker_id);
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .tx
+            .send(CaptureCmd::Shutdown(Some(tx)))
+            .await
+            .map_err(|_| "capture worker gone".to_string())?;
+        let _ = rx.await;
+        let join = self
+            .inner
+            .join
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        if let Some(handle) = join {
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = handle.join();
+            })
+            .await;
+        }
+        Ok(())
+    }
+
+    /// Await background-scheduler quiescence for this session's thread.
+    pub async fn drain_settled(&self) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .tx
+            .send(CaptureCmd::DrainSettled(tx))
+            .await
+            .map_err(|_| "capture worker gone".to_string())?;
+        rx.await.map_err(|_| "capture worker dropped".to_string())
+    }
+
+    /// Inspect health (ready/pending derivation counts + queue).
+    pub async fn inspect_health(&self) -> Result<lhc::shared_tech::inspect::HealthReport, String> {
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .tx
+            .send(CaptureCmd::InspectHealth(tx))
             .await
             .map_err(|_| "capture worker gone".to_string())?;
         rx.await.map_err(|_| "capture worker dropped".to_string())?
@@ -288,8 +371,14 @@ impl CaptureHandle {
         rx.await.map_err(|_| "capture worker dropped".to_string())?
     }
 
-    /// Fire-and-forget shutdown — drains then closes (safe from async Drop).
+    /// Fire-and-forget shutdown.
+    ///
+    /// Unregisters **immediately** so [`crate::capture_active`] / `/lhc status`
+    /// report stopped before the worker finishes teardown. The worker's
+    /// [`LhcSession::close`] awaits a **capped** `drainSettled` (background
+    /// settle only — not a host-driven catch-up bill).
     pub fn shutdown_async(&self) {
+        unregister_worker(&self.inner.session_id, self.inner.worker_id);
         let _ = self.inner.shutdown_tx.send(true);
         let _ = self.inner.tx.try_send(CaptureCmd::Shutdown(None));
     }
@@ -338,6 +427,9 @@ impl CaptureHandle {
 
     #[cfg(any(test, feature = "test-util"))]
     pub fn shutdown_blocking(&self) {
+        // Match shutdown_async: detach from registry before teardown so
+        // capture_active is false immediately while close settles in-flight work.
+        unregister_worker(&self.inner.session_id, self.inner.worker_id);
         let (tx, rx) = oneshot::channel();
         if self
             .inner
@@ -352,6 +444,7 @@ impl CaptureHandle {
         {
             let _ = handle.join();
         }
+        // Idempotent if already removed above.
         unregister_worker(&self.inner.session_id, self.inner.worker_id);
     }
 
@@ -486,13 +579,11 @@ fn unregister_worker(session_id: &str, worker_id: u64) {
     }
 }
 
-/// Atomic `(generation, handle)` observed under the registry mutex (AB1 / AC1).
+/// Atomic `(generation, handle)` observed under the registry mutex (AB1).
 ///
-/// Fields are private: the only production constructor is
-/// [`lookup_session_snapshot`]. The tee cache stores this type so a
-/// two-observation assembly (`lookup_session` + `registry_generation`) cannot
-/// stamp the cache without going through a snapshot (or the test-only
-/// [`RegistrySnapshot::from_parts_for_test`] escape hatch).
+/// Fields are private: the only constructor is [`lookup_session_snapshot`].
+/// The tee cache stores this type so a two-observation assembly cannot stamp
+/// the cache without going through a snapshot.
 #[derive(Clone)]
 pub struct RegistrySnapshot {
     generation: u64,
@@ -510,15 +601,6 @@ impl RegistrySnapshot {
 
     pub fn into_handle(self) -> Option<CaptureHandle> {
         self.handle
-    }
-
-    /// Test-only: assemble a pair without holding the registry lock.
-    ///
-    /// Used solely to force the pre-AB1 call-site defect in
-    /// `refresh_binding` under [`set_refresh_binding_racy_for_test`].
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn from_parts_for_test(generation: u64, handle: Option<CaptureHandle>) -> Self {
-        Self { generation, handle }
     }
 }
 
@@ -577,27 +659,10 @@ pub fn reset_registry_lookup_count() {
     REGISTRY_LOOKUPS.store(0, Ordering::Relaxed);
 }
 
-/// Test-only: when set, [`crate::tee`] `refresh_binding` uses the pre-AB1
-/// two-observation assembly (call site), not a helper simulation.
-#[cfg(any(test, feature = "test-util"))]
-static REFRESH_BINDING_RACY: AtomicBool = AtomicBool::new(false);
-
 #[cfg(any(test, feature = "test-util"))]
 static REFRESH_INTERLEAVE: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
 
-/// Test-only: force `refresh_binding` to assemble the cache from two separate
-/// observations with an interleave window (AC1 — pins the call site).
-#[cfg(any(test, feature = "test-util"))]
-pub fn set_refresh_binding_racy_for_test(racy: bool) {
-    REFRESH_BINDING_RACY.store(racy, Ordering::SeqCst);
-}
-
-#[cfg(any(test, feature = "test-util"))]
-pub fn refresh_binding_racy_for_test() -> bool {
-    REFRESH_BINDING_RACY.load(Ordering::SeqCst)
-}
-
-/// Test-only: one-shot hook run in the refresh interleave window.
+/// Test-only: one-shot hook run after an atomic refresh (mid-session-on race).
 #[cfg(any(test, feature = "test-util"))]
 pub fn set_refresh_interleave_hook_for_test(hook: Option<Box<dyn FnOnce() + Send>>) {
     *REFRESH_INTERLEAVE.lock().unwrap_or_else(|e| e.into_inner()) = hook;
@@ -1009,12 +1074,25 @@ async fn process_cmd(
             let _ = ack.send(sess.preview_compact().await);
             false
         }
-        CaptureCmd::Compact(ack) => {
-            let _ = ack.send(sess.compact().await);
+        CaptureCmd::Compact {
+            ack,
+            cancel,
+            signal,
+        } => {
+            let _ = ack.send(sess.compact(cancel, signal).await);
+            false
+        }
+        CaptureCmd::DrainSettled(ack) => {
+            sess.drain_settled().await;
+            let _ = ack.send(());
             false
         }
         CaptureCmd::GetViewStatus(ack) => {
             let _ = ack.send(sess.get_view_status().await);
+            false
+        }
+        CaptureCmd::InspectHealth(ack) => {
+            let _ = ack.send(sess.inspect_health().await);
             false
         }
         #[cfg(any(test, feature = "test-util"))]
