@@ -332,7 +332,7 @@ fn push_option_dbg<T: std::fmt::Debug>(out: &mut String, opt: Option<&T>) {
 
 /// Structural fingerprint. Length-framing is injective over the **field
 /// projections** that are framed (presence bit + value for every `Option`).
-/// Every arm must frame typed fields, never a rendered aggregate (T1/U2).
+/// Every arm must frame typed fields, never a rendered aggregate.
 fn raw_fingerprint(item: &ConversationItem) -> String {
     let mut out = String::new();
     match item {

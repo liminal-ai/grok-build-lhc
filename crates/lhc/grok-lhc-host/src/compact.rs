@@ -40,11 +40,6 @@ impl CompactMode {
     pub fn lhc_writes(self) -> bool {
         matches!(self, Self::Replace)
     }
-
-    /// LHC should run preview for comparison / certification.
-    pub fn lhc_previews(self) -> bool {
-        matches!(self, Self::Shadow)
-    }
 }
 
 /// Pure plan for one logical compact event (no I/O).

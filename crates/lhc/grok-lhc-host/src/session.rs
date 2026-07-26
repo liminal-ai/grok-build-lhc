@@ -35,7 +35,7 @@ fn registry_lock() -> &'static AsyncMutex<()> {
 /// The only host-visible compact outcome worth recording is abandon-before-install.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactDrainOutcome {
-    /// Turn abort / cancel stopped compact before a snapshot install (R1).
+    /// Turn abort / cancel stopped compact before a snapshot install.
     AbandonedByCancel,
 }
 
@@ -60,7 +60,7 @@ pub(crate) fn note_compact_drain_outcome(session_id: &str, outcome: CompactDrain
     }
 }
 
-/// Last compact abort outcome for `/lhc status` (R1 visibility).
+/// Last compact abort outcome for `/lhc status`.
 pub fn last_compact_drain_outcome(session_id: &str) -> Option<CompactDrainOutcome> {
     compact_outcome_registry()
         .lock()
@@ -99,7 +99,7 @@ pub struct LhcSession {
     pub file_path: PathBuf,
     #[allow(dead_code)]
     pub registry_path: PathBuf,
-    /// Latched from LHC `last_event_order` (A1). Used as the key-generation
+    /// Latched from LHC `last_event_order`. Used as the key-generation
     /// coordinate for subsequent `persist_message` events.
     pub generation: u64,
     /// Next ordinal for model/thinking change keys; seeded from list_events.
@@ -113,7 +113,7 @@ impl LhcSession {
     /// Create or reopen the per-session thread under `root` (or `GROK_LHC_ROOT` / `~/.lhc`).
     ///
     /// Returns the session and an occurrence tracker seeded from LHC's stored
-    /// events (B1). Refuses to open if `list_events` fails (B2).
+    /// events. Refuses to open if `list_events` fails.
     pub async fn open(
         session_id: &str,
         cwd: Option<&str>,
@@ -125,12 +125,6 @@ impl LhcSession {
             error!(?err, "LHC: failed to create threads directory");
             return None;
         }
-        // Best-effort: remove legacy sidecars from the round-1 scheme (A1).
-        let legacy_meta = thread_meta_path(root, session_id);
-        if legacy_meta.exists() {
-            let _ = std::fs::remove_file(&legacy_meta);
-        }
-
         let registry_path = root.join("registry.sqlite");
         let file_path = thread_file_path(root, session_id);
 
@@ -188,7 +182,7 @@ impl LhcSession {
                 error!(
                     session_id,
                     %err,
-                    "LHC: list_events failed at open; refusing (B2)"
+                    "LHC: list_events failed at open; refusing to open the session"
                 );
                 return None;
             }
@@ -214,7 +208,7 @@ impl LhcSession {
         Ok(seed_occurrence_from_keys(keys))
     }
 
-    /// Latch tip from a batch result — monotonic `max` (B6).
+    /// Latch tip from a batch result — monotonic `max`.
     pub fn latch_generation_from_batch(&mut self, batch: &lhc::intake_stream::BatchResult) {
         let tip = batch.thread_position.last_event_order.max(0) as u64;
         self.generation = self.generation.max(tip);
@@ -372,7 +366,7 @@ impl LhcSession {
     /// compact. There is no time budget on this path.
     ///
     /// Pass a [`CancellationToken`] + live [`CompactAbortSignal`] so turn abort
-    /// prevents snapshot install (R1). Compact compute after thread resolution
+    /// prevents snapshot install. Compact compute after thread resolution
     /// is **synchronous** — `tokio::select!` cannot preempt it; the port signal
     /// (live `Arc<AtomicBool>` re-read at `compact_stopped`) is what stops the
     /// write. Callers that cancel mid-compute **must** also call
@@ -551,7 +545,7 @@ async fn open_existing(
             return None;
         }
     };
-    // Require registry binding (F8) — refuse orphans.
+    // Require registry binding — refuse orphans.
     match lhc
         .threads
         .resolve(ResolveInput {
@@ -561,7 +555,7 @@ async fn open_existing(
         .await
     {
         OpResult::Ok { value } => {
-            // B5: registry/file disagreement is unsafe (could attach this ACP
+            // registry/file disagreement is unsafe (could attach this ACP
             // session to another session's transcript). Refuse rather than adopt.
             if value.file_path != path_str && Path::new(&value.file_path) != file_path {
                 error!(
@@ -684,14 +678,7 @@ pub fn thread_file_path(root: &Path, session_id: &str) -> PathBuf {
     ))
 }
 
-fn thread_meta_path(root: &Path, session_id: &str) -> PathBuf {
-    root.join("threads").join(format!(
-        "grok-{}.meta.json",
-        encode_session_id_for_path(session_id)
-    ))
-}
-
-/// Injective filename encoding for ACP session ids (B4).
+/// Injective filename encoding for ACP session ids.
 ///
 /// Percent-encodes every byte outside `[A-Za-z0-9_-]` so `a:b` and `a_b` cannot
 /// collide on one thread file.
@@ -718,7 +705,7 @@ fn nibble_hex(n: u8) -> char {
     }
 }
 
-/// True when registry-resolved path is not the session's expected file (B5).
+/// True when registry-resolved path is not the session's expected file.
 pub fn paths_disagree(expected: &Path, registry_file_path: &str) -> bool {
     registry_file_path != expected.to_string_lossy().as_ref()
         && Path::new(registry_file_path) != expected
@@ -734,7 +721,7 @@ fn force_classify_list_failure() -> bool {
     FORCE_CLASSIFY_LIST_FAILURE.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// Arm/disarm whole-index classify failure (Q1).
+/// Arm/disarm whole-index classify failure.
 #[cfg(any(test, feature = "test-util"))]
 pub fn set_force_classify_list_failure(armed: bool) {
     FORCE_CLASSIFY_LIST_FAILURE.store(armed, std::sync::atomic::Ordering::SeqCst);

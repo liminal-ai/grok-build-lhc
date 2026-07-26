@@ -4,10 +4,10 @@
 //! (generation + handle) produced atomically under the registry mutex.
 //! Steady-state persists compare one atomic to the cached generation and use
 //! the cached value — including cached `None` — without taking the registry
-//! mutex (AA1 / L3). When the generation moves, the next persist re-resolves
+//! mutex. When the generation moves, the next persist re-resolves
 //! via [`lookup_session_snapshot`] only — there is no production path that
 //! stamps the cache from a bare `registry_generation()` plus a separate
-//! `lookup_session` (AB1 / AC1).
+//! `lookup_session`.
 
 use std::sync::Arc;
 
@@ -29,7 +29,7 @@ use crate::inference::LhcInferenceSampler;
 /// seventh runtime hook or mutating `ChatStateActor`'s persistence slot.
 ///
 /// Disabled persist path (steady state, any other session's state): one
-/// generation atomic compare; no registry mutex, no SQLite (AA1 / L3).
+/// generation atomic compare; no registry mutex, no SQLite.
 pub fn tee_chat_persistence(
     session_id: &str,
     cwd: &str,
@@ -52,7 +52,7 @@ pub fn tee_chat_persistence(
 
 /// True when a capture worker is registered for `session_id`.
 ///
-/// Post-spawn gating uses registry presence, not a re-read of `GROK_LHC` (F9).
+/// Post-spawn gating uses registry presence, not a re-read of `GROK_LHC`.
 /// Cheap process-wide atomic first — no registry mutex when LHC is off entirely.
 pub fn capture_active(session_id: &str) -> bool {
     if !crate::capture::any_capture_active() {
@@ -64,15 +64,15 @@ pub fn capture_active(session_id: &str) -> bool {
 struct LhcTeePersistence {
     inner: Box<dyn ChatPersistence>,
     session_id: String,
-    /// Last atomic registry snapshot for this session (AB1 / AC1).
+    /// Last atomic registry snapshot for this session.
     cached: RegistrySnapshot,
 }
 
 impl LhcTeePersistence {
-    /// Refresh the cached binding from an atomic registry snapshot (AB1).
+    /// Refresh the cached binding from an atomic registry snapshot.
     ///
     /// Production path: only [`lookup_session_snapshot`]. The test-only racy
-    /// branch (AC1) reconstructs the pre-AB1 two-observation call site so the
+    /// branch reconstructs the pre-AB1 two-observation call site so the
     /// suite can fail when that assembly is restored.
     fn refresh_binding(&mut self) {
         self.cached = lookup_session_snapshot(&self.session_id);
@@ -124,8 +124,8 @@ impl ChatPersistence for LhcTeePersistence {
 
 impl Drop for LhcTeePersistence {
     fn drop(&mut self) {
-        // Session teardown: clear last-serve label (Z1) and shut down any live
-        // worker for this session (F4). Fire-and-forget — never block on an
+        // Session teardown: clear last-serve label and shut down any live
+        // worker for this session. Fire-and-forget — never block on an
         // async runtime.
         crate::serving::clear_last_serve_outcome(&self.session_id);
         let snap = lookup_session_snapshot(&self.session_id);

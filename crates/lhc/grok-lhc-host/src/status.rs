@@ -24,7 +24,7 @@ use crate::{any_capture_active, lookup_session};
 
 /// How the active request-context engine is labeled for the user.
 ///
-/// Derived from the **last serve turn**, not from capture registration (Y2).
+/// Derived from the **last serve turn**, not from capture registration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextEngine {
     /// Last serve turn substituted an LHC-built conversation body.
@@ -58,7 +58,7 @@ pub struct LhcStatusReport {
     pub context_engine: ContextEngine,
     /// Fail-open reason from the last serve turn, when engine is native after a consult.
     pub last_serve_reason: Option<&'static str>,
-    /// Whether ModelCall compaction has a registered inference sampler (Z2).
+    /// Whether ModelCall compaction has a registered inference sampler.
     pub inference_compact_available: bool,
     /// Resolved derivation inference model (`grok-4.5` default; env/config override).
     pub inference_model: String,
@@ -122,7 +122,7 @@ fn engine_from_last_serve(
     session_id: &str,
     capture: bool,
 ) -> (ContextEngine, Option<&'static str>) {
-    // Without capture, never claim LHC — even if a stale outcome slipped through (Z1).
+    // Without capture, never claim LHC — even if a stale outcome slipped through.
     if !capture {
         return (ContextEngine::Native, None);
     }
@@ -133,12 +133,12 @@ fn engine_from_last_serve(
     }
 }
 
-/// SQLite main-DB header magic (16 bytes). Do not read the whole file (Z4).
+/// SQLite main-DB header magic (16 bytes). Do not read the whole file.
 const SQLITE_HEADER_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 
 /// Validate that `path` is a real LHC thread SQLite with a supported schema.
 ///
-/// Does not infer schema from filename presence (Y5). Vendored `open_database`
+/// Does not infer schema from filename presence. Vendored `open_database`
 /// panics on some corrupt files (PRAGMA after a soft open), so we magic-check
 /// first and catch_unwind around the open path.
 fn validate_thread_schema(path: &Path) -> Result<(), String> {
@@ -187,7 +187,7 @@ pub async fn status_report(session_id: &str) -> LhcStatusReport {
     // `GROK_LHC_ROOT` changes in tests and mid-process overrides.
     let root = lhc_root();
     // Provenance: env only when the variable is actually set. Defaults must
-    // not have been written into env (Y3); fall back to the applied snapshot.
+    // not have been written into env; fall back to the applied snapshot.
     let root_source = if std::env::var_os("GROK_LHC_ROOT").is_some() {
         ConfigSource::Env
     } else {
@@ -250,10 +250,10 @@ pub async fn status_report(session_id: &str) -> LhcStatusReport {
     let mut last_event_summary = None;
     let mut view_status_line = None;
     let mut failed_derivations = None;
-    // Do not infer schema from filename — validate (Y5).
+    // Do not infer schema from filename — validate.
     let mut schema_present = false;
     let mut notes = Vec::new();
-    // Worker inspection timed out or errored — must fail health (Z3).
+    // Worker inspection timed out or errored — must fail health.
     let mut inspection_degraded = false;
     if let Some(ref err) = parse_err {
         notes.push(format!("[lhc] config parse error: {err}"));
@@ -359,7 +359,7 @@ pub async fn status_report(session_id: &str) -> LhcStatusReport {
     let last_compact_line =
         last_compact_drain_outcome(session_id).map(|o| o.status_line().to_string());
     if let Some(ref line) = last_compact_line {
-        // Compact abandon must never be silent in status (R1).
+        // Compact abandon must never be silent in status.
         if line.contains("abandoned") {
             notes.push(line.clone());
         }
@@ -416,7 +416,7 @@ pub async fn health_check(session_id: &str) -> LhcHealthReport {
     status_report(session_id).await.health
 }
 
-/// Plan repair actions and bind them for a later [`execute_repair`] (Y4).
+/// Plan repair actions and bind them for a later [`execute_repair`].
 ///
 /// Never deletes until confirm. Confirm must match an action id from this
 /// displayed plan — a fresh re-plan is not enough.
@@ -482,7 +482,7 @@ pub async fn plan_repair(session_id: &str) -> LhcRepairPlan {
 ///
 /// Requires a prior `/lhc repair` for this session whose action id matches.
 /// Destructive paths use the stored plan's enumerated delete list — never a
-/// freshly constructed plan (Y4).
+/// freshly constructed plan.
 pub async fn execute_repair(session_id: &str, action_id: &str) -> Result<String, String> {
     let plan = pending_repair_plans()
         .lock()
@@ -759,7 +759,7 @@ mod tests {
 
     #[test]
     fn schema_header_check_reads_only_fixed_prefix() {
-        // Z4: validation must accept a file that is huge after a valid header
+        // Validation must accept a file that is huge after a valid header
         // without needing to load the whole body into memory. We only assert
         // the magic path rejects short/non-magic files and accepts magic+junk
         // far enough to open (open may still fail version check).

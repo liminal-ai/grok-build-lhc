@@ -539,7 +539,7 @@ fn crash_mid_batch_no_duplication_on_rerun() {
     // Wait until the detached worker is gone (thread file lock released).
     thread::sleep(Duration::from_millis(200));
 
-    // Discriminating observation (D2): empty bootstrap must see 0 events —
+    // Discriminating observation: empty bootstrap must see 0 events —
     // proves queued work never committed (a calm drain would leave 6).
     let probe = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
     thread::sleep(Duration::from_millis(100));
@@ -853,7 +853,7 @@ fn orphan_thread_file_without_registry_is_refused() {
     let _ = std::fs::remove_file(root.path().join("registry.sqlite-wal"));
     let _ = std::fs::remove_file(root.path().join("registry.sqlite-shm"));
     assert!(thread_file_path(root.path(), sid).exists());
-    // Spawn must not block; refused open unregisters asynchronously (C1/B5).
+    // Spawn must not block; refused open unregisters asynchronously.
     let _handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None);
     wait_registry_gone(sid);
     assert!(
@@ -890,7 +890,7 @@ fn list_events_failure_refuses_open() {
     let thread = thread_file_path(root.path(), sid);
     sqlite_exec(&thread, "PRAGMA foreign_keys=OFF; DROP TABLE event;");
 
-    // Spawn must not block; B2 refuse is observable via unregister (C1).
+    // Spawn must not block; B2 refuse is observable via unregister.
     let _handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None);
     wait_registry_gone(sid);
     assert!(
@@ -950,7 +950,7 @@ fn registry_file_path_disagreement_refuses_open() {
         &format!("UPDATE threads SET file_path = '{decoy_str}';"),
     );
 
-    // Spawn must not block; B5 refuse is observable via unregister (C1).
+    // Spawn must not block; B5 refuse is observable via unregister.
     let _handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None);
     wait_registry_gone(sid);
     assert!(
@@ -4095,7 +4095,7 @@ fn chunk3a_status_on_healthy_store() {
     let r = rt.block_on(status_report(sid));
     assert!(r.enabled);
     assert!(r.capture_active);
-    // Capture alone must not claim LHC is the active engine (Y2).
+    // Capture alone must not claim LHC is the active engine.
     assert_eq!(r.context_engine, ContextEngine::NoServeTurnYet);
     assert!(r.event_count.unwrap_or(0) >= 1);
     assert!(r.health.worker_alive);
@@ -4200,7 +4200,7 @@ fn chunk3a_mid_session_disable_and_reenable() {
     let plan = rt.block_on(plan_repair(sid));
     assert!(!plan.actions.is_empty());
     let _ = rt.block_on(execute_repair(sid, "noop"));
-    // Confirm without a fresh plan must refuse (Y4).
+    // Confirm without a fresh plan must refuse.
     let unbound = rt.block_on(execute_repair(sid, "noop"));
     assert!(
         unbound.is_err(),

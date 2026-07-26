@@ -293,7 +293,7 @@ pub fn unregister_inference_sampler(session_id: &str) {
 
 /// True when a ModelCall inference sampler is registered for `session_id`.
 ///
-/// Used by `/lhc` status and mid-session enable reporting (Z2).
+/// Used by `/lhc` status and mid-session enable reporting.
 pub fn inference_sampler_registered(session_id: &str) -> bool {
     sampler_registry()
         .lock()

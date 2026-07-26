@@ -214,7 +214,7 @@ pub fn resolve_lhc_config(file: &LhcFileConfig) -> ResolvedLhcConfig {
 ///
 /// Default-sourced values must not leak into child processes (Bash / MCP /
 /// subagents) and must not make status claim `(source: env)` for a variable
-/// the user never set (Y3). Gates that need a live env (`is_enabled`,
+/// the user never set. Gates that need a live env (`is_enabled`,
 /// `lhc_root`, compact mode) already fall back to the same defaults when the
 /// variable is absent.
 ///
@@ -265,7 +265,7 @@ pub fn apply_resolved_config(resolved: &ResolvedLhcConfig) {
 
 static CONFIG_PARSE_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
-/// Record a malformed `[lhc]` parse failure for status / diagnostics (Y7).
+/// Record a malformed `[lhc]` parse failure for status / diagnostics.
 pub fn note_config_parse_error(message: impl Into<String>) {
     if let Ok(mut g) = CONFIG_PARSE_ERROR.lock() {
         *g = Some(message.into());

@@ -16,9 +16,9 @@ use crate::idempotency::{
 pub const ACTOR: &str = "grok";
 pub const HARNESS: &str = "grok-build";
 
-/// Max chars of an image URL retained in LHC text payloads (F14).
+/// Max chars of an image URL retained in LHC text payloads.
 const IMAGE_URL_PREVIEW_CHARS: usize = 128;
-/// Max chars of serialized backend tool outputs in a tool_result (A9).
+/// Max chars of serialized backend tool outputs in a tool_result.
 const BACKEND_OUTPUTS_PREVIEW_CHARS: usize = 2048;
 
 /// One mapped LHC event ready for `message_events`.
@@ -113,7 +113,7 @@ pub fn map_item(
     }
 }
 
-/// Exhaustive SyntheticReason mapping driven by `starts_prompt_turn()` (F12).
+/// Exhaustive SyntheticReason mapping driven by `starts_prompt_turn()`.
 fn map_synthetic_user(
     session_id: &str,
     generation: u64,

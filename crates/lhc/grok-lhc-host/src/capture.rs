@@ -21,16 +21,16 @@ use crate::inference::{
 use crate::mapping::{MappedEvent, map_history, map_item, map_model_change};
 use crate::session::LhcSession;
 
-/// Bound on the capture queue (F11 / A6). Must not block the chat-state actor.
+/// Bound on the capture queue. Must not block the chat-state actor.
 pub const CAPTURE_QUEUE_CAP: usize = 1024;
 
-/// Process-wide count of live capture workers — cheap gate for model-change (A9).
+/// Process-wide count of live capture workers — cheap gate for model-change.
 static ACTIVE_CAPTURES: AtomicUsize = AtomicUsize::new(0);
 
 /// Bumped on every successful register / unregister.
 ///
 /// Tees cache `(generation, handle)` so a disabled session can skip the
-/// registry mutex while other sessions are active (AA1). Compare with
+/// registry mutex while other sessions are active. Compare with
 /// [`registry_generation`] before calling [`lookup_session`].
 static REGISTRY_GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -88,7 +88,7 @@ enum CaptureCmd {
         events: Vec<lhc::intake_stream::MessageEventInput>,
         ack: oneshot::Sender<Result<lhc::intake_stream::BatchResult, String>>,
     },
-    /// Block the worker until `release` fires or crash is signaled (B3).
+    /// Block the worker until `release` fires or crash is signaled.
     #[cfg(any(test, feature = "test-util"))]
     Block {
         entered: oneshot::Sender<()>,
@@ -102,16 +102,16 @@ struct CaptureShared {
     session_id: String,
     worker_id: u64,
     tx: mpsc::Sender<CaptureCmd>,
-    /// Always-writable shutdown signal (F4) — never blocked by a full queue.
+    /// Always-writable shutdown signal — never blocked by a full queue.
     shutdown_tx: watch::Sender<bool>,
-    /// Crash signal: worker exits immediately without drain/close (B3).
-    /// Test-only — must not exist in the shipping default-feature build (D4).
+    /// Crash signal: worker exits immediately without drain/close.
+    /// Test-only — must not exist in the shipping default-feature build.
     #[cfg(any(test, feature = "test-util"))]
     crash_tx: watch::Sender<bool>,
     /// Shared with the worker (worker must NOT hold `CaptureShared` / the Sender).
     dropped: Arc<AtomicU64>,
     /// Set when a `ReplaceHistory` was dropped — baseline is stale until a
-    /// successful replace realigns the tracker (A6).
+    /// successful replace realigns the tracker.
     baseline_poisoned: Arc<AtomicBool>,
     /// Test-only: crash the worker after submitting this many events of the
     /// next `ReplaceHistory` (0 = disabled). Exercises mid-apply death.
@@ -413,10 +413,6 @@ impl CaptureHandle {
         CAPTURE_QUEUE_CAP.saturating_sub(self.inner.tx.capacity())
     }
 
-    pub fn baseline_poisoned(&self) -> bool {
-        self.inner.baseline_poisoned.load(Ordering::SeqCst)
-    }
-
     #[cfg(any(test, feature = "test-util"))]
     pub fn flush_blocking(&self) {
         let (tx, rx) = oneshot::channel();
@@ -449,7 +445,7 @@ impl CaptureHandle {
     }
 
     /// Genuine crash: signal the worker to die without drain/close, drop the
-    /// sender (worker does not hold it), detach the join handle (B3).
+    /// sender (worker does not hold it), detach the join handle.
     #[cfg(any(test, feature = "test-util"))]
     pub fn crash_kill(self) {
         let _ = self.inner.crash_tx.send(true);
@@ -531,7 +527,7 @@ impl CaptureHandle {
 
 struct RegistryEntry {
     /// Strong ref — keeps the worker alive when the tee only resolves per call
-    /// via [`lookup_session`] (Y1). Removed on worker unregister / shutdown.
+    /// via [`lookup_session`]. Removed on worker unregister / shutdown.
     shared: Arc<CaptureShared>,
     worker_id: u64,
 }
@@ -579,7 +575,7 @@ fn unregister_worker(session_id: &str, worker_id: u64) {
     }
 }
 
-/// Atomic `(generation, handle)` observed under the registry mutex (AB1).
+/// Atomic `(generation, handle)` observed under the registry mutex.
 ///
 /// Fields are private: the only constructor is [`lookup_session_snapshot`].
 /// The tee cache stores this type so a two-observation assembly cannot stamp
@@ -608,7 +604,7 @@ pub fn lookup_session(session_id: &str) -> Option<CaptureHandle> {
     lookup_session_snapshot(session_id).into_handle()
 }
 
-/// Atomically observe `(generation, handle)` under the registry mutex (AB1).
+/// Atomically observe `(generation, handle)` under the registry mutex.
 ///
 /// Generation is only bumped while this same mutex is held, so the pair is a
 /// true snapshot — never a handle from one instant stamped with a generation
@@ -638,7 +634,7 @@ pub fn any_capture_active() -> bool {
     ACTIVE_CAPTURES.load(Ordering::Relaxed) > 0
 }
 
-/// Monotonic registry generation — bumped on register / unregister (AA1).
+/// Monotonic registry generation — bumped on register / unregister.
 ///
 /// Suitable for the tee's **fast-path compare** only. Do not pair this with a
 /// separately observed handle to stamp the cache — use [`lookup_session_snapshot`].
@@ -748,7 +744,7 @@ pub fn spawn_capture(
                 }
             };
             rt.block_on(async move {
-                // Open refusal must not block the host caller (C1 / F4). Return
+                // Open refusal must not block the host caller. Return
                 // the handle immediately; on refuse the worker unregisters and
                 // exits so `capture_active` becomes false without a rendezvous.
                 let Some((session, mut tracker)) = LhcSession::open(
@@ -763,16 +759,16 @@ pub fn spawn_capture(
                     return;
                 };
 
-                let mut session = Some(session);
+                let mut session = session;
                 // Tip is tracked on the session; item keys always use ITEM_KEY_GENERATION.
 
-                // B1: tracker already seeded from LHC events. Bootstrap submit
+                // Tracker already seeded from LHC events. Bootstrap submit
                 // uses a local map (stable keys) then merge_monotonic.
                 if bootstrap.is_empty() {
-                    if session.as_ref().unwrap().generation > 0 {
+                    if session.generation > 0 {
                         warn!(
                             session_id = %session_id_for_worker,
-                            tip = session.as_ref().unwrap().generation,
+                            tip = session.generation,
                             "LHC: empty bootstrap with existing thread events"
                         );
                     }
@@ -781,7 +777,7 @@ pub fn spawn_capture(
                         map_history(&session_id_for_worker, ITEM_KEY_GENERATION, &bootstrap);
                     tracker.merge_monotonic(&local);
                     let inputs: Vec<_> = events.into_iter().map(|e| e.input).collect();
-                    match session.as_mut().unwrap().submit_events(&inputs).await {
+                    match session.submit_events(&inputs).await {
                         Ok(batch) => {
                             let recorded = batch
                                 .events
@@ -800,9 +796,12 @@ pub fn spawn_capture(
                     }
                 }
 
+                // From here the command loop may `take()` the session on shutdown.
+                let mut session = Some(session);
+
                 loop {
                     // Crash arm exists only under test-util; shipping build awaits
-                    // pending forever so select! stays branch-uniform (D4).
+                    // pending forever so select! stays branch-uniform.
                     let crash = async {
                         #[cfg(any(test, feature = "test-util"))]
                         {
@@ -908,7 +907,7 @@ pub fn spawn_capture(
                         }
                         crashed = crash => {
                             if crashed {
-                                // B3: die immediately — no drain, no close.
+                                // Die immediately — no drain, no close.
                                 let _ = session.take();
                                 break;
                             }
@@ -969,14 +968,14 @@ async fn process_cmd(
                 );
                 return false;
             }
-            // Occurrence advances before submit (B6) — a failed submit leaves a
+            // Occurrence advances before submit — a failed submit leaves a
             // gap so a retry cannot collide with a partially-applied key.
             let mapped = map_item(session_id, ITEM_KEY_GENERATION, &item, tracker);
             let _ = submit_mapped(sess, mapped).await;
             false
         }
         CaptureCmd::ReplaceHistory(items) => {
-            // B1: submit the slice; LHC dedup is the diff. Local map mints the
+            // Submit the slice; LHC dedup is the diff. Local map mints the
             // same keys survivors already have; merge_monotonic keeps rewind
             // occurrence high-water marks.
             let (events, local) = map_history(session_id, ITEM_KEY_GENERATION, &items);
@@ -1115,7 +1114,7 @@ async fn process_cmd(
         CaptureCmd::Block { entered, release } => {
             let _ = entered.send(());
             // Prefer crash over release so crash_kill is not raced by a
-            // subsequent release send (D2).
+            // subsequent release send.
             tokio::select! {
                 biased;
                 _ = crash_rx.changed() => *crash_rx.borrow(),

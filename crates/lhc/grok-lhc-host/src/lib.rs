@@ -59,11 +59,10 @@ pub use runtime_config::{
 };
 pub use serving::{
     LastServeOutcome, ServeDecision, SourceKindIndex, ViewTranslateMode, apply_serve_decision,
-    assign_prompt_indices, assign_prompt_indices_from_tail, body_has_tool_cycle,
-    build_writeback_conversation, clear_last_serve_outcome, decide_substitution, is_band_user,
-    last_serve_outcome, native_prompt_indices, note_last_serve, positional_user_count,
-    session_view_to_items, session_view_to_serve_items, session_view_to_writeback_items,
-    split_system_prefix,
+    assign_prompt_indices_from_tail, body_has_tool_cycle, build_writeback_conversation,
+    clear_last_serve_outcome, decide_substitution, is_band_user, last_serve_outcome,
+    native_prompt_indices, note_last_serve, session_view_to_items, session_view_to_serve_items,
+    session_view_to_writeback_items, split_system_prefix,
 };
 #[cfg(any(test, feature = "test-util"))]
 pub use session::set_force_classify_list_failure;
@@ -117,14 +116,12 @@ pub use equivalence::{
 
 /// Token estimator used by LHC budgets (o200k_base) — for seed sizing in G2.
 pub use lhc::estimate_tokens;
-/// Re-exported so the tripwire compile genuinely links the vendored port.
-pub use lhc::sdk::init_lhc;
 
 /// LHC-HOOK target: model / thinking-level change tee.
 ///
 /// No-op when no capture session is registered (the spawn-time gate, F9).
 /// Suppresses no-op transitions. Host must pass the authoritative previous
-/// model / thinking level (F5).
+/// model / thinking level.
 pub fn capture_model_or_thinking_change(
     session_id: &str,
     previous_model: &str,
@@ -132,8 +129,8 @@ pub fn capture_model_or_thinking_change(
     previous_thinking_level: Option<&str>,
     new_thinking_level: Option<&str>,
 ) {
-    // Cheap process-wide gate before any allocation / mutex (A9). Do not
-    // re-read GROK_LHC — registry presence is the cached gate (F9).
+    // Cheap process-wide gate before any allocation / mutex. Do not
+    // re-read GROK_LHC — registry presence is the cached gate.
     if !any_capture_active() {
         return;
     }
@@ -148,10 +145,10 @@ pub fn capture_model_or_thinking_change(
     handle.model_change(previous_model, new_model, &prev_level, &new_level);
 }
 
-/// Fire-and-forget session teardown. Safe from async contexts (F4).
+/// Fire-and-forget session teardown. Safe from async contexts.
 ///
 /// Also clears the last-serve outcome so `/lhc` cannot keep labeling the
-/// engine as LHC after capture stops (Z1).
+/// engine as LHC after capture stops.
 pub fn shutdown_session(session_id: &str) {
     clear_last_serve_outcome(session_id);
     if let Some(handle) = lookup_session(session_id) {
@@ -179,7 +176,7 @@ pub async fn serve_request_context(
     // Cheap process-wide gate before any allocation / mutex — same principle
     // as hook 3 (`capture_model_or_thinking_change`). Do not re-read GROK_LHC.
     // Do not record a "last serve" for the inactive short-circuit — status
-    // must say "no serve turn yet" until hook 4 actually consults LHC (Y2).
+    // must say "no serve turn yet" until hook 4 actually consults LHC.
     if !any_capture_active() || !capture_active(session_id) {
         return ServeDecision::Native {
             reason: "lhc_inactive",
@@ -271,7 +268,7 @@ pub struct ReplaceCompactWriteback {
 /// `replace_conversation_for_compaction` (see MAPPING.md). Flag-off remains
 /// the rollback at every point.
 ///
-/// **Turn abort (R1):** drop-guard aborts the live port
+/// **Turn abort:** drop-guard aborts the live port
 /// [`lhc::thread_view::CompactAbortSignal`] (`Arc<AtomicBool>`) and the
 /// [`CancellationToken`]. No OS bridge thread — the guard (or any caller)
 /// flips the atomic the port re-reads at `compact_stopped`. The invariant is
@@ -409,8 +406,10 @@ mod tests {
     use xai_grok_sampling_types::ConversationItem;
 
     #[test]
-    fn vendored_lhc_links() {
-        let _ = super::init_lhc;
+    fn vendored_lhc_links_and_runs() {
+        // Prove the vendored port is linked *and* executing, by calling into it
+        // rather than naming a symbol. A symbol reference only proves it resolved.
+        assert!(lhc::estimate_tokens("hello world") > 0);
     }
 
     #[test]

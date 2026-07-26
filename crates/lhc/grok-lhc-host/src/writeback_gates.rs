@@ -4,7 +4,7 @@
 //! (real-inference body) so both subjects run the same instrument.
 //!
 //! Sync [`run_five_gates_on_body`] uses blocking RPCs — **must not** be called
-//! from inside a Tokio runtime (R2). Async tests use
+//! from inside a Tokio runtime. Async tests use
 //! [`run_five_gates_on_body_async`].
 
 use std::collections::BTreeSet;
@@ -264,7 +264,7 @@ pub fn run_five_gates_on_body(
     eprintln!("=== all five hard gates PASS on {label} ===");
 }
 
-/// Async-safe five hard gates — safe to call from `#[tokio::test]` (R2).
+/// Async-safe five hard gates — safe to call from `#[tokio::test]`.
 ///
 /// Uses awaitable capture RPCs only (never `blocking_send` / `blocking_recv`).
 pub async fn run_five_gates_on_body_async(

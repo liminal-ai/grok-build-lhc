@@ -1,7 +1,7 @@
 //! Feature gate: LHC capture is off unless `GROK_LHC` is truthy.
 //!
 //! Truthy set matches [`crate::runtime_config`] (`1` / `true` / `on`,
-//! case-insensitive) so resolve and gate cannot disagree (Y7).
+//! case-insensitive) so resolve and gate cannot disagree.
 
 /// Return whether LHC capture should be installed for a new session.
 ///

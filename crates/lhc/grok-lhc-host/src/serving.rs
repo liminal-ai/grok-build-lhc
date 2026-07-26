@@ -118,7 +118,7 @@ pub enum ServeDecision {
     Native { reason: &'static str },
 }
 
-/// What the last `serve_request_context` call decided for a session (Y2).
+/// What the last `serve_request_context` call decided for a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LastServeOutcome {
     pub substituted: bool,
@@ -159,7 +159,7 @@ pub fn last_serve_outcome(session_id: &str) -> Option<LastServeOutcome> {
         .and_then(|g| g.get(session_id).cloned())
 }
 
-/// Evict the last-serve outcome for `session_id` (Z1).
+/// Evict the last-serve outcome for `session_id`.
 ///
 /// Called on `/lhc off` and session teardown so status cannot keep claiming
 /// LHC after capture is gone.
@@ -197,23 +197,6 @@ pub fn native_prompt_indices(native: &[ConversationItem]) -> Vec<usize> {
             _ => None,
         })
         .collect()
-}
-
-/// Stamp LHC-translated user messages from the **head** of the native index list.
-///
-/// Prefer [`assign_prompt_indices_from_tail`] for serving and write-back.
-pub fn assign_prompt_indices(body: &mut [ConversationItem], indices: &[usize]) {
-    let mut i = 0usize;
-    for item in body.iter_mut() {
-        if let ConversationItem::User(u) = item
-            && u.synthetic_reason.is_none()
-        {
-            if let Some(&pi) = indices.get(i) {
-                u.prompt_index = Some(pi);
-            }
-            i += 1;
-        }
-    }
 }
 
 /// Stamp real LHC user messages from the **tail** of the native index list.
@@ -419,7 +402,7 @@ pub fn build_writeback_conversation(
     if body.is_empty() {
         return Err("empty_lhc_context".into());
     }
-    // Live-tail ToolResult / assistant tool_calls are conserved (Q4) — not an error.
+    // Live-tail ToolResult / assistant tool_calls are conserved — not an error.
     let indices = native_prompt_indices(native_before);
     assign_prompt_indices_from_tail(&mut body, &indices);
     let (system_prefix, _) = split_system_prefix(native_before);
@@ -459,14 +442,6 @@ pub fn body_has_tool_cycle(items: &[ConversationItem]) -> bool {
     })
 }
 
-/// Count positional `User(_)` items (what `truncate_to_prompt_index` counts).
-pub fn positional_user_count(items: &[ConversationItem]) -> usize {
-    items
-        .iter()
-        .filter(|i| matches!(i, ConversationItem::User(_)))
-        .count()
-}
-
 /// Build the all-LHC or all-native decision for one request.
 pub fn decide_substitution(
     native_items: &[ConversationItem],
@@ -487,7 +462,7 @@ pub fn decide_substitution(
             reason: "empty_lhc_context",
         };
     }
-    // Live-tail tool cycles are conserved (Q4) — substitution may carry them.
+    // Live-tail tool cycles are conserved — substitution may carry them.
     let indices = native_prompt_indices(native_items);
     assign_prompt_indices_from_tail(&mut body, &indices);
     let (system_prefix, _) = split_system_prefix(native_items);

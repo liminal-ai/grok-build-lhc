@@ -8,7 +8,7 @@
 //! ```
 //!
 //! `session` is colon-escaped (`:` → `%3A`) so ACP session ids containing `:`
-//! cannot break ordinal seeding or key parsing (A8).
+//! cannot break ordinal seeding or key parsing.
 //!
 //! Conversation-item keys use a **stable** `generation` (always `0` under B1) so
 //! `replace_history` re-submits mint identical keys for survivors and LHC
@@ -21,7 +21,7 @@ use blake3::Hasher;
 use tracing::warn;
 use xai_grok_sampling_types::ConversationItem;
 
-/// Stable generation embedded in conversation-item keys (B1).
+/// Stable generation embedded in conversation-item keys.
 ///
 /// Must not change across `replace_history` or tip advances — otherwise
 /// survivors would re-key and amplify the transcript.
@@ -50,7 +50,7 @@ impl OccurrenceTracker {
         occ
     }
 
-    /// Raise each digest's high-water mark to at least `other`'s (B1).
+    /// Raise each digest's high-water mark to at least `other`'s.
     ///
     /// Never moves a counter downward — required so rewind then re-send of an
     /// identical item allocates a fresh occurrence.
@@ -152,7 +152,7 @@ pub fn max_change_ordinal_from_keys<'a>(keys: impl IntoIterator<Item = &'a str>)
     max
 }
 
-/// Seed an occurrence tracker from stored LHC idempotency keys (B1).
+/// Seed an occurrence tracker from stored LHC idempotency keys.
 ///
 /// Parses `grok:{sid}:g{gen}:{digest}:{occ}:{kind}…` and raises high-water
 /// marks. Model/thinking keys are ignored.
@@ -254,12 +254,14 @@ mod tests {
     }
 
     #[test]
-    fn fallback_digest_has_no_pointer() {
-        let src = include_str!("idempotency.rs");
-        let lib = src.split("#[cfg(test)]").next().unwrap_or(src);
-        assert!(
-            !lib.contains("as usize") && !lib.contains("as *"),
-            "fallback digest must not mix ASLR pointers"
-        );
+    fn item_digest_is_content_addressed_not_identity() {
+        // The key design requires the digest to be a pure function of content:
+        // two independently allocated items with equal content must agree, or a
+        // replayed slice mints fresh keys and dedup stops working.
+        let a = ConversationItem::user("same text");
+        let b = ConversationItem::user("same text");
+        let c = ConversationItem::user("other text");
+        assert_eq!(item_digest(&a), item_digest(&b));
+        assert_ne!(item_digest(&a), item_digest(&c));
     }
 }
