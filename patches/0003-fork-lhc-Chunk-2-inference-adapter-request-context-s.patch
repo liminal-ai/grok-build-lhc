@@ -1,7 +1,7 @@
 From 817472b50e01deb9a39718fd52aecb512f9f5525 Mon Sep 17 00:00:00 2001
 From: Lee Moore <lee.g.moore@gmail.com>
 Date: Sat, 25 Jul 2026 21:09:57 +0000
-Subject: [PATCH 3/4] =?UTF-8?q?fork(lhc):=20Chunk=202=20=E2=80=94=20infere?=
+Subject: [PATCH 3/5] =?UTF-8?q?fork(lhc):=20Chunk=202=20=E2=80=94=20infere?=
  =?UTF-8?q?nce=20adapter,=20request-context=20serving,=20compact=20bridge?=
  =?UTF-8?q?=20with=20write-back?=
 MIME-Version: 1.0

@@ -28,49 +28,27 @@ Split it only if a future chunk changes hooks independently.
 
 ## Regenerating
 
-    git format-patch <first-chunk-commit>~1..<head> \
+    git format-patch <first-chunk-commit>~1..HEAD \
       --output-directory patches --suffix=.patch \
-      -- Cargo.toml \
-         crates/codegen/xai-grok-shell/Cargo.toml \
-         crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs \
-         crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs \
-         crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs \
-         crates/codegen/xai-grok-shell/src/session/acp_session_tests/rewind_cross_compaction_tests.rs \
-         crates/codegen/xai-grok-shell/src/session/compaction.rs \
-         crates/codegen/xai-grok-shell/src/session/lhc_inference.rs \
-         crates/codegen/xai-grok-shell/src/session/mod.rs \
-         crates/codegen/xai-grok-shell/src/session/slash_commands.rs \
-         crates/codegen/xai-grok-shell/src/session/acp_session_impl/slash_exec.rs \
-         crates/codegen/xai-grok-shell/src/config/mod.rs \
-         crates/codegen/xai-grok-shell/src/config/tests.rs \
-         crates/codegen/xai-grok-shell/src/agent/config.rs
+      -- $(git diff --name-only origin/main -- crates/codegen/ Cargo.toml | tr '\n' ' ')
 
-**Regenerate the WHOLE series, not one commit.** This example previously used
-`format-patch -1 <commit>` with only Chunk 1's four paths. Two traps in that:
+**The path list is DERIVED, never hand-maintained.** That `$( )` is the whole
+point: the invariant this file used to merely assert — "the list must equal
+`git diff --name-only origin/main -- crates/codegen/ Cargo.toml`" — is now
+structurally guaranteed instead of checked.
 
-1. Running it after Chunk 2 would silently drop five touchpoints
-   (`turn.rs`, `compaction.rs`, `lhc_inference.rs`, `mod.rs`,
-   `rewind_cross_compaction_tests.rs`) — the recovery drill would restore an
-   incomplete fork and nothing would say so.
-2. `-1 <head>` only captures the newest commit. Root `Cargo.toml`'s
-   workspace-members entry lands in the CHUNK 1 commit, so a single-commit
-   regeneration drops it entirely. Hit for real on 2026-07-25.
+It broke silently twice while hand-maintained:
 
-**When a hook is added, add its file to this list in the same commit.** The
-list must equal `git diff --name-only origin/main -- crates/codegen/ Cargo.toml`.
+1. The documented command still listed only Chunk 1's four paths, so running it
+   after Chunk 2 would drop five touchpoints — including a core-tree regression
+   test — and a history-reset recovery would restore an incomplete fork with
+   nothing to signal it.
+2. It used `-1 <commit>`, a single commit, so regenerating after Chunk 2 dropped
+   root `Cargo.toml`'s workspace-members entry, which lives in the Chunk 1
+   commit. Deleting the old patch removed its only copy.
 
-Delete the old `*.patch` first — a stale patch that still applies is worse
-than no patch at all.
+Regenerate the WHOLE series (`<first>~1..HEAD`), not one commit. Current series:
+five patches, seventeen paths. Verify by rehearsing the drill — `git am --3way`
+onto a fresh clone must apply clean.
 
-## Rehearsal record
 
-2026-07-25, Chunk 1 (fork commit `9ea06ea`). Rehearsed against the **raw
-upstream tip** `6e38642`, which contains no `crates/lhc/` at all — the real
-history-reset shape, not a convenient one:
-
-    git worktree add --detach /tmp/lhc-recovery-test 6e38642
-    cd /tmp/lhc-recovery-test
-    git am /srv/work/grok-build/patches/0001-*.patch
-
-Applied cleanly (exit 0); all three `LHC-HOOK` markers and the
-workspace-members entry restored. Re-rehearse whenever a hook changes.
