@@ -24,7 +24,7 @@ pub trait ChatPersistence: Send + 'static {
     /// Persist a single conversation item (append to chat_history.jsonl).
     fn persist_message(&mut self, item: &ConversationItem);
 
-    // LHC-HOOK 9/9: optional provider usage side-channel for LHC assistant_text (schema v5 / D3)
+    // LHC-HOOK 9/10: optional provider usage side-channel for LHC assistant_text (schema v5 / D3)
     /// Persist a message, optionally carrying the last model call's provider usage.
     ///
     /// Default ignores usage and calls [`Self::persist_message`]. The LHC capture

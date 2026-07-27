@@ -96,6 +96,27 @@ Emitted after:
 signal. Facts populate the payload only — they must **not** enter
 `item_event_key` (rewind/replay dedup depends on key stability).
 
+### G2 delivery (shell → capture)
+
+**Ordering finding:** item-driven capture emits `turn_end` from
+Assistant-without-tools during `persist_message`, which runs *inside* the
+agentic loop — **before** the shell's after-turn fan-out (`turn.rs` match at
+~:924). A pure "stash at after-turn → next `turn_end`" would attach facts to
+the *next* turn. Correct seam:
+
+1. Live `Persist` of a turn_end-emitting item **defers** the `turn_end` event
+   (same key as `map_item` would mint).
+2. Shell hook 10/10 (one site after the after-turn match) barriers on
+   chat-state (`get_conversation_len`) so fire-and-forget assistant persists
+   hit the tee, then delivers `TurnEndFacts`.
+3. Capture attaches facts to the deferred event (consume-once) and submits —
+   one key, facts-bearing. No second event.
+4. If no deferred close exists (cancelled mid-tools), emit a shell-authored
+   `turn_end` (`grok:…:shell_turn_end:{turn_number}`) so facts still land.
+5. Bootstrap / `replace_history` re-maps pass empty facts (scout §4.4).
+6. Observation seams (`list_events` / `flush` / shutdown) release a still-
+   deferred close **empty** so pure adapter tests keep seeing turn boundaries.
+
 **Open case (documented):** a turn aborted with tool calls outstanding and
 *without* a subsequent turn-starting synthetic leaves the LHC turn open until
 the next real `user_prompt` or terminal toolless `Assistant`. Banded compaction

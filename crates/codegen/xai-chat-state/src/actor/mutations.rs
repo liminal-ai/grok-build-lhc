@@ -383,7 +383,7 @@ impl ChatStateActor {
             api_duration_ms,
             cost_usd_ticks,
         );
-        // LHC-HOOK 8/9: stash for the next Assistant → LHC assistant_text.providerUsage
+        // LHC-HOOK 8/10: stash for the next Assistant → LHC assistant_text.providerUsage
         self.state.pending_model_call_usage = Some(usage.clone());
     }
 

@@ -1103,6 +1103,40 @@ impl SessionActor {
                 .await;
             }
         }
+        // LHC-HOOK 10/10: shell turn-outcome → LHC turn_end facts (schema v5 / G2)
+        // One site after the match (not five). Barrier so fire-and-forget
+        // PushAssistantResponse has hit the capture tee before facts enqueue
+        // (capture mpsc FIFO attaches facts to the deferred item-mapped TE).
+        {
+            let _ = self.chat_state_handle.get_conversation_len().await;
+            let outcome_label = match bridge_outcome {
+                xai_tool_protocol::turn_hook::TurnHookOutcome::Completed => "completed",
+                xai_tool_protocol::turn_hook::TurnHookOutcome::Cancelled => "cancelled",
+                xai_tool_protocol::turn_hook::TurnHookOutcome::Error => "error",
+                // non_exhaustive tail — fold like handle.rs:4184-4192 → aborted
+                _ => "error",
+            };
+            let cancellation_category = match &result {
+                Ok(TurnOutcome::StationarityEnded { .. }) => {
+                    Some("action_stationarity".to_string())
+                }
+                Ok(TurnOutcome::Cancelled { category, .. }) => {
+                    cancellation_category_to_wire_string(*category)
+                }
+                _ => None,
+            };
+            let facts = grok_lhc_host::TurnEndFacts::from_shell_outcome(
+                outcome_label,
+                cancellation_category,
+                turn_duration_ms,
+                std::time::SystemTime::now(),
+            );
+            grok_lhc_host::capture_turn_end_facts(
+                self.session_info.id.0.as_ref(),
+                current_prompt_index as u64,
+                facts,
+            );
+        }
         xai_grok_telemetry::session_ctx::log_session_event(
             crate::agent::session_metrics::TurnCompletedLifecycle {
                 session_id: self.session_info.id.0.to_string(),
@@ -2117,7 +2151,7 @@ impl SessionActor {
                 })),
             );
             let mut request = request;
-            // LHC-HOOK 4/9: substitute LHC request context (all-LHC or all-native)
+            // LHC-HOOK 4/10: substitute LHC request context (all-LHC or all-native)
             // Cheap atomic first, then per-session registry — no mutex when off.
             // Hook 4 is instrumented-redundant: observe native vs served (G1);
             // observation never changes the served result.

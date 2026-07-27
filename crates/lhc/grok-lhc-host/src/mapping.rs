@@ -2,6 +2,8 @@
 //!
 //! See `MAPPING.md` for the decision table.
 
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use lhc::intake_stream::MessageEventInput;
 use serde_json::{Map, Value, json};
 use xai_grok_sampling_types::{
@@ -10,7 +12,8 @@ use xai_grok_sampling_types::{
 };
 
 use crate::idempotency::{
-    OccurrenceTracker, item_digest, item_event_key, model_change_key, thinking_level_change_key,
+    OccurrenceTracker, encode_session_id, item_digest, item_event_key, model_change_key,
+    thinking_level_change_key,
 };
 
 pub const ACTOR: &str = "grok";
@@ -41,6 +44,134 @@ pub struct TurnEndFacts {
     pub started_at: Option<String>,
     /// Host wall-clock end (ISO-8601 UTC).
     pub ended_at: Option<String>,
+}
+
+impl TurnEndFacts {
+    /// True when every field is absent (empty payload remains valid).
+    pub fn is_empty(&self) -> bool {
+        self.outcome.is_none()
+            && self.outcome_reason.is_none()
+            && self.started_at.is_none()
+            && self.ended_at.is_none()
+    }
+
+    /// Build facts from the shell turn-end fan-out (schema v5 / G2).
+    ///
+    /// * `outcome_label` — wire label of [`TurnHookOutcome`](xai_tool_protocol):
+    ///   `"completed"` / `"cancelled"` / `"error"`, or any unknown tail.
+    /// * Fold: `completed` → `"completed"`; `cancelled` | `error` | unknown →
+    ///   `"aborted"` (mirrors `handle.rs` folding unknowns to Error, then to
+    ///   schema's two-valued outcome).
+    /// * `outcomeReason` — `cancellation_category` when present, else the
+    ///   outcome label lowercased.
+    /// * `endedAt` = `ended_at` (caller stamps `SystemTime::now()` at the hook);
+    ///   `startedAt` = `ended_at - duration_ms` (scout §2 option a).
+    pub fn from_shell_outcome(
+        outcome_label: &str,
+        cancellation_category: Option<String>,
+        duration_ms: u64,
+        ended_at: SystemTime,
+    ) -> Self {
+        let label = outcome_label.to_ascii_lowercase();
+        let outcome: &'static str = match label.as_str() {
+            "completed" => "completed",
+            // Cancelled, Error, and any non_exhaustive tail → aborted.
+            _ => "aborted",
+        };
+        let outcome_reason = cancellation_category.unwrap_or(label);
+        let started_at = ended_at
+            .checked_sub(Duration::from_millis(duration_ms))
+            .unwrap_or(UNIX_EPOCH);
+        Self {
+            outcome: Some(outcome),
+            outcome_reason: Some(outcome_reason),
+            started_at: Some(format_system_time_iso8601_millis(started_at)),
+            ended_at: Some(format_system_time_iso8601_millis(ended_at)),
+        }
+    }
+}
+
+/// Format `t` as ISO-8601 UTC with millisecond precision (`YYYY-MM-DDTHH:MM:SS.mmmZ`).
+///
+/// Tiny host-local formatter — no chrono dependency (scout §2).
+pub fn format_system_time_iso8601_millis(t: SystemTime) -> String {
+    let dur = t.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let secs = dur.as_secs();
+    let millis = dur.subsec_millis();
+    let (year, month, day, hour, minute, second) = civil_utc_from_unix_secs(secs);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
+/// Civil UTC Y-M-D h:m:s from Unix seconds (Howard Hinnant civil_from_days).
+fn civil_utc_from_unix_secs(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
+    let day_secs = 86_400u64;
+    let days = (secs / day_secs) as i64;
+    let rem = secs % day_secs;
+    let hour = (rem / 3600) as u32;
+    let minute = ((rem % 3600) / 60) as u32;
+    let second = (rem % 60) as u32;
+
+    // days since 1970-01-01 → civil date
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as u32, m as u32, d as u32, hour, minute, second)
+}
+
+/// Apply facts onto an existing mapped `turn_end` event's payload (key unchanged).
+pub fn apply_turn_end_facts(event: &mut MappedEvent, facts: &TurnEndFacts) {
+    if event.input.event_kind != "turn_end" {
+        return;
+    }
+    if let Some(outcome) = facts.outcome {
+        event.input.payload.insert("outcome".into(), json!(outcome));
+    }
+    if let Some(reason) = facts.outcome_reason.as_ref() {
+        event
+            .input
+            .payload
+            .insert("outcomeReason".into(), json!(reason));
+    }
+    if let Some(started) = facts.started_at.as_ref() {
+        event
+            .input
+            .payload
+            .insert("startedAt".into(), json!(started));
+    }
+    if let Some(ended) = facts.ended_at.as_ref() {
+        event.input.payload.insert("endedAt".into(), json!(ended));
+    }
+}
+
+/// Host-authored `turn_end` when the shell ends a turn that never produced a
+/// terminal toolless Assistant (e.g. cancelled mid-tools). Key is shell-scoped
+/// so it never collides with item-mapped keys; not re-minted on bootstrap.
+pub fn shell_turn_end_event(
+    session_id: &str,
+    turn_number: u64,
+    facts: &TurnEndFacts,
+) -> MappedEvent {
+    let sid = encode_session_id(session_id);
+    let key = format!("grok:{sid}:g0:shell_turn_end:{turn_number}");
+    let mut event = MappedEvent {
+        input: MessageEventInput {
+            event_kind: "turn_end".to_string(),
+            idempotency_key: Some(key),
+            actor: ACTOR.to_string(),
+            harness: HARNESS.to_string(),
+            payload: Map::new(),
+            extra: Map::new(),
+        },
+    };
+    apply_turn_end_facts(&mut event, facts);
+    event
 }
 
 /// Map a single conversation item into zero or more LHC events.
@@ -800,6 +931,129 @@ mod tests {
         assert_eq!(map.get("total_tokens"), Some(&json!(12)));
         assert_eq!(map.get("reasoning_tokens"), Some(&json!(1)));
         assert_eq!(map.get("cached_prompt_tokens"), Some(&json!(4)));
+    }
+
+    /// Fold: Completed → completed; Cancelled|Error|unknown-tail → aborted.
+    /// Mutation: map `"cancelled"` → `"completed"` and this fails.
+    #[test]
+    fn shell_outcome_fold_all_variants_including_unknown_tail() {
+        let ended = UNIX_EPOCH + Duration::from_secs(1_720_000_000);
+        let cases: &[(&str, Option<&str>, &str, &str)] = &[
+            ("completed", None, "completed", "completed"),
+            (
+                "completed",
+                Some("action_stationarity"),
+                "completed",
+                "action_stationarity",
+            ),
+            ("cancelled", None, "aborted", "cancelled"),
+            (
+                "cancelled",
+                Some("doom_loop_repetition"),
+                "aborted",
+                "doom_loop_repetition",
+            ),
+            ("error", None, "aborted", "error"),
+            // non_exhaustive tail — same fold as handle.rs unknowns → Error → aborted
+            ("future_variant", None, "aborted", "future_variant"),
+            ("COMPLETED", None, "completed", "completed"), // label lowercased
+        ];
+        for &(label, cat, want_outcome, want_reason) in cases {
+            let facts =
+                TurnEndFacts::from_shell_outcome(label, cat.map(str::to_string), 4_000, ended);
+            assert_eq!(
+                facts.outcome,
+                Some(want_outcome),
+                "label={label:?} cat={cat:?}"
+            );
+            assert_eq!(
+                facts.outcome_reason.as_deref(),
+                Some(want_reason),
+                "label={label:?} cat={cat:?}"
+            );
+            assert_eq!(
+                facts.ended_at.as_deref(),
+                Some("2024-07-03T09:46:40.000Z"),
+                "fixed epoch stamp"
+            );
+            assert_eq!(
+                facts.started_at.as_deref(),
+                Some("2024-07-03T09:46:36.000Z"),
+                "startedAt = endedAt - duration_ms"
+            );
+        }
+    }
+
+    #[test]
+    fn iso8601_formatter_utc_millis_z() {
+        let t = UNIX_EPOCH + Duration::from_millis(0);
+        assert_eq!(
+            format_system_time_iso8601_millis(t),
+            "1970-01-01T00:00:00.000Z"
+        );
+        let t = UNIX_EPOCH + Duration::from_millis(1_704_067_200_000 + 123);
+        // 2024-01-01T00:00:00.123Z
+        assert_eq!(
+            format_system_time_iso8601_millis(t),
+            "2024-01-01T00:00:00.123Z"
+        );
+        let s = format_system_time_iso8601_millis(SystemTime::now());
+        assert!(s.ends_with('Z'), "{s}");
+        assert_eq!(s.len(), 24, "{s}");
+        assert_eq!(&s[10..11], "T");
+    }
+
+    #[test]
+    fn apply_turn_end_facts_preserves_key() {
+        let mut empty = turn_end_event("s", 0, "digest", 0, None, &TurnEndFacts::default());
+        let key = empty.input.idempotency_key.clone();
+        let facts = TurnEndFacts {
+            outcome: Some("completed"),
+            outcome_reason: Some("completed".into()),
+            started_at: Some("2026-07-01T12:00:00.000Z".into()),
+            ended_at: Some("2026-07-01T12:00:04.000Z".into()),
+        };
+        apply_turn_end_facts(&mut empty, &facts);
+        assert_eq!(empty.input.idempotency_key, key);
+        assert_eq!(
+            empty.input.payload.get("outcome"),
+            Some(&json!("completed"))
+        );
+    }
+
+    #[test]
+    fn shell_turn_end_event_carries_facts_and_distinct_key() {
+        let facts = TurnEndFacts {
+            outcome: Some("aborted"),
+            outcome_reason: Some("cancelled".into()),
+            started_at: Some("2026-07-01T12:00:00.000Z".into()),
+            ended_at: Some("2026-07-01T12:00:04.000Z".into()),
+        };
+        let ev = shell_turn_end_event("sess:1", 7, &facts);
+        assert_eq!(ev.input.event_kind, "turn_end");
+        assert_eq!(
+            ev.input.idempotency_key.as_deref(),
+            Some("grok:sess%3A1:g0:shell_turn_end:7")
+        );
+        assert_eq!(ev.input.payload.get("outcome"), Some(&json!("aborted")));
+    }
+
+    /// Replay / bootstrap re-map never reconstructs live host facts.
+    #[test]
+    fn map_history_replay_stays_empty_facts() {
+        let items = vec![
+            ConversationItem::user("hi"),
+            ConversationItem::assistant("bye"),
+        ];
+        let (mapped, _) = map_history("s", 0, &items, &TurnEndFacts::default());
+        let te = mapped
+            .iter()
+            .find(|e| e.input.event_kind == "turn_end")
+            .expect("turn_end");
+        assert!(
+            te.input.payload.is_empty(),
+            "bootstrap/replace re-map must emit empty turn_end payload"
+        );
     }
 
     #[test]

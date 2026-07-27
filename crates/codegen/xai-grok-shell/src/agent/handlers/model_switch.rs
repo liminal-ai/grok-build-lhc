@@ -230,7 +230,7 @@ pub(crate) async fn apply(
         model_id.0.as_ref(),
         applied_effort.map(|eff| eff.to_string()),
     );
-    // LHC-HOOK 3/9: model / thinking-level change tee
+    // LHC-HOOK 3/10: model / thinking-level change tee
     grok_lhc_host::capture_model_or_thinking_change(
         session_id.0.as_ref(),
         previous_model_id.as_ref(),

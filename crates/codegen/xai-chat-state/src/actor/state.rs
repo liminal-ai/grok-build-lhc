@@ -153,7 +153,7 @@ pub(crate) struct ChatState {
     /// persist last_turn_usage). Always overwritten by the most recent turn —
     /// historical turns are not retained here.
     pub last_turn_usage: Option<TokenUsage>,
-    // LHC-HOOK 7/9: last model-call TokenUsage for assistant_text.providerUsage (schema v5 / D3)
+    // LHC-HOOK 7/10: last model-call TokenUsage for assistant_text.providerUsage (schema v5 / D3)
     /// Pending per-model-call usage for the next `Assistant` persist.
     ///
     /// Set by `record_model_call_usage` (FIFO before `PushAssistantResponse` on

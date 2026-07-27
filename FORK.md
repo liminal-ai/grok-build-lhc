@@ -36,16 +36,17 @@ certification) remains.
 
 | # | File | Lines | Purpose | Patch |
 |---|------|-------|---------|-------|
-| 1 | `crates/codegen/xai-grok-shell/Cargo.toml` | `LHC-HOOK 1/9` | dependency on `grok-lhc-host` | _(regen after commit)_ |
-| 2 | `crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs` | `LHC-HOOK 2/9` | wrap persistence in the LHC capture tee (+ inference sampler) | _(regen)_ |
-| 3 | `crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs` | `LHC-HOOK 3/9` | model / thinking-level change tee | _(regen)_ |
-| 4 | `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs` | `LHC-HOOK 4/9` | substitute LHC request context after `build_request` | _(regen)_ |
-| 5 | `crates/codegen/xai-grok-shell/src/session/compaction.rs` | `LHC-HOOK 5/9` | compact bridge decision (LHC I/O at writer choke) | _(regen)_ |
-| 6 | `crates/codegen/xai-grok-shell/src/session/mod.rs` | `LHC-HOOK 6/9` | `mod lhc_inference` declaration | _(regen)_ |
+| 1 | `crates/codegen/xai-grok-shell/Cargo.toml` | `LHC-HOOK 1/10` | dependency on `grok-lhc-host` | _(regen after commit)_ |
+| 2 | `crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs` | `LHC-HOOK 2/10` | wrap persistence in the LHC capture tee (+ inference sampler) | _(regen)_ |
+| 3 | `crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs` | `LHC-HOOK 3/10` | model / thinking-level change tee | _(regen)_ |
+| 4 | `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs` | `LHC-HOOK 4/10` | substitute LHC request context after `build_request` | _(regen)_ |
+| 5 | `crates/codegen/xai-grok-shell/src/session/compaction.rs` | `LHC-HOOK 5/10` | compact bridge decision (LHC I/O at writer choke) | _(regen)_ |
+| 6 | `crates/codegen/xai-grok-shell/src/session/mod.rs` | `LHC-HOOK 6/10` | `mod lhc_inference` declaration | _(regen)_ |
 | 6b | `crates/codegen/xai-grok-shell/src/session/lhc_inference.rs` | new file (shell-local LHC inference transport) | _(regen)_ |
-| 7 | `crates/codegen/xai-chat-state/src/actor/state.rs` | `LHC-HOOK 7/9` | pending model-call `TokenUsage` for `assistant_text.providerUsage` (schema v5 / D3) | _(regen)_ |
-| 8 | `crates/codegen/xai-chat-state/src/actor/mutations.rs` | `LHC-HOOK 8/9` | stash on `RecordModelCallUsage`; consume once on next Assistant persist | _(regen)_ |
-| 9 | `crates/codegen/xai-chat-state/src/persistence.rs` | `LHC-HOOK 9/9` | `ChatPersistence::persist_message_with_provider_usage` side-channel | _(regen)_ |
+| 7 | `crates/codegen/xai-chat-state/src/actor/state.rs` | `LHC-HOOK 7/10` | pending model-call `TokenUsage` for `assistant_text.providerUsage` (schema v5 / D3) | _(regen)_ |
+| 8 | `crates/codegen/xai-chat-state/src/actor/mutations.rs` | `LHC-HOOK 8/10` | stash on `RecordModelCallUsage`; consume once on next Assistant persist | _(regen)_ |
+| 9 | `crates/codegen/xai-chat-state/src/persistence.rs` | `LHC-HOOK 9/10` | `ChatPersistence::persist_message_with_provider_usage` side-channel | _(regen)_ |
+| 10 | `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs` | `LHC-HOOK 10/10` | shell turn-outcome → LHC `turn_end` facts (schema v5 / G2) | _(regen)_ |
 | — | root `Cargo.toml` | workspace-members entry `crates/lhc/grok-lhc-host` (no marker — auto-generated/sorted; asserted in `scripts/check-lhc-hooks.sh`) | adapter workspace membership | _(regen)_ |
 
 ### Chunk 3A authorized touchpoints (not LHC-HOOK markers)
@@ -69,8 +70,13 @@ hook; each hook is regenerated into `patches/` after commit (Lee). Patch
 
 Schema v5 G1 carve-out (hooks 7–9): `xai-chat-state` stashes the last model
 call's `TokenUsage` and passes it through a defaulted trait method so the LHC
-tee can attach `providerUsage` on the next `assistant_text`. No new shell
-runtime hook; G2 owns the `turn.rs` outcome signal.
+tee can attach `providerUsage` on the next `assistant_text`.
+
+Schema v5 G2 (hook 10): shell `turn.rs` after-turn fan-out delivers
+`TurnEndFacts` (outcome fold, `outcomeReason`, ISO `startedAt`/`endedAt`) to
+the capture worker. Item-mapped `turn_end` (Assistant-without-tools) is
+deferred until facts arrive so a facts-bearing close never becomes a second
+event with a different key.
 
 Carve-out (post-`cargo fmt` numstat vs `origin/main` / pre-hook tree):
 

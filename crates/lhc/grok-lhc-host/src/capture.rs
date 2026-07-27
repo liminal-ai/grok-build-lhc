@@ -19,7 +19,8 @@ use crate::inference::{
     LhcInferenceSampler, register_inference_sampler, unregister_inference_sampler,
 };
 use crate::mapping::{
-    MappedEvent, TurnEndFacts, attach_provider_usage, map_history, map_item, map_model_change,
+    MappedEvent, TurnEndFacts, apply_turn_end_facts, attach_provider_usage, map_history, map_item,
+    map_model_change, shell_turn_end_event,
 };
 use crate::session::LhcSession;
 
@@ -45,6 +46,12 @@ enum CaptureCmd {
     Persist {
         item: ConversationItem,
         provider_usage: Option<serde_json::Map<String, serde_json::Value>>,
+    },
+    /// Shell turn-end facts (schema v5 / G2). Attaches to a deferred item-mapped
+    /// `turn_end`, or emits a shell-authored close when none is deferred.
+    TurnEndFacts {
+        turn_number: u64,
+        facts: TurnEndFacts,
     },
     ReplaceHistory(Vec<ConversationItem>),
     ModelChange {
@@ -156,6 +163,28 @@ impl CaptureHandle {
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 self.note_drop("persist_closed");
+            }
+        }
+    }
+
+    /// Deliver shell turn-outcome facts (schema v5 / G2).
+    ///
+    /// Consumed once: attaches to a deferred item-mapped `turn_end` (terminal
+    /// Assistant-without-tools, which maps *before* the shell after-turn
+    /// fan-out), or emits a shell-authored `turn_end` when no close is
+    /// deferred (cancelled mid-tools, etc.).
+    pub fn turn_end_facts(&self, turn_number: u64, facts: TurnEndFacts) {
+        match self
+            .inner
+            .tx
+            .try_send(CaptureCmd::TurnEndFacts { turn_number, facts })
+        {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.note_drop("turn_end_facts");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.note_drop("turn_end_facts_closed");
             }
         }
     }
@@ -821,6 +850,11 @@ pub fn spawn_capture(
 
                 // From here the command loop may `take()` the session on shutdown.
                 let mut session = Some(session);
+                // G2: item-mapped turn_end (Assistant-without-tools) is deferred
+                // until shell after-turn delivers facts — see process_cmd Persist.
+                // Shell hook barriers on chat-state so Persist is enqueued before
+                // TurnEndFacts (capture mpsc FIFO).
+                let mut deferred_turn_end: Option<MappedEvent> = None;
 
                 loop {
                     // Crash arm exists only under test-util; shipping build awaits
@@ -853,6 +887,7 @@ pub fn spawn_capture(
                                         &session_id_for_worker,
                                         &baseline_for_worker,
                                         dropped_for_worker.as_ref(),
+                                        &mut deferred_turn_end,
                                         #[cfg(any(test, feature = "test-util"))]
                                         &mut crash_rx,
                                         #[cfg(any(test, feature = "test-util"))]
@@ -863,6 +898,13 @@ pub fn spawn_capture(
                                         let _ = session.take();
                                         break;
                                     }
+                                }
+                                // Flush any deferred close empty so shutdown does
+                                // not lose the turn boundary (facts never arrived).
+                                if let (Some(s), Some(te)) =
+                                    (session.as_mut(), deferred_turn_end.take())
+                                {
+                                    let _ = submit_mapped(s, vec![te]).await;
                                 }
                                 if let Some(s) = session.take() {
                                     s.close().await;
@@ -879,6 +921,7 @@ pub fn spawn_capture(
                                 &session_id_for_worker,
                                 &baseline_for_worker,
                                 dropped_for_worker.as_ref(),
+                                &mut deferred_turn_end,
                                 #[cfg(any(test, feature = "test-util"))]
                                 &mut crash_rx,
                                 #[cfg(any(test, feature = "test-util"))]
@@ -907,6 +950,7 @@ pub fn spawn_capture(
                                         &session_id_for_worker,
                                         &baseline_for_worker,
                                         dropped_for_worker.as_ref(),
+                                        &mut deferred_turn_end,
                                         #[cfg(any(test, feature = "test-util"))]
                                         &mut crash_rx,
                                         #[cfg(any(test, feature = "test-util"))]
@@ -921,6 +965,11 @@ pub fn spawn_capture(
                                         );
                                         return;
                                     }
+                                }
+                                if let (Some(s), Some(te)) =
+                                    (session.as_mut(), deferred_turn_end.take())
+                                {
+                                    let _ = submit_mapped(s, vec![te]).await;
                                 }
                                 if let Some(s) = session.take() {
                                     s.close().await;
@@ -974,6 +1023,7 @@ async fn process_cmd(
     session_id: &str,
     baseline_poisoned: &AtomicBool,
     dropped: &AtomicU64,
+    deferred_turn_end: &mut Option<MappedEvent>,
     #[cfg(any(test, feature = "test-util"))] crash_rx: &mut watch::Receiver<bool>,
     #[cfg(any(test, feature = "test-util"))] crash_mid_replace_after: &AtomicUsize,
 ) -> bool {
@@ -996,7 +1046,9 @@ async fn process_cmd(
             }
             // Occurrence advances before submit — a failed submit leaves a
             // gap so a retry cannot collide with a partially-applied key.
-            // Live path: empty turn_end facts until G2 wires the shell signal.
+            // Live path maps with empty turn_end facts; terminal Assistant
+            // turn_end is deferred until shell after-turn delivers facts
+            // (item persist is enqueued before the shell hook; see barrier).
             let mut mapped = map_item(
                 session_id,
                 ITEM_KEY_GENERATION,
@@ -1011,10 +1063,62 @@ async fn process_cmd(
             {
                 attach_provider_usage(ev, usage);
             }
+            let mut turn_ends = Vec::new();
+            mapped.retain(|e| {
+                if e.input.event_kind == "turn_end" {
+                    turn_ends.push(e.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            if !turn_ends.is_empty() {
+                // A new close supersedes any still-deferred prior close
+                // (e.g. stop-gate continue after a toolless Assistant).
+                if let Some(prior) = deferred_turn_end.take() {
+                    let _ = submit_mapped(sess, vec![prior]).await;
+                }
+                // Defer the last turn_end (map_item emits at most one).
+                *deferred_turn_end = turn_ends.pop();
+                if !turn_ends.is_empty() {
+                    let _ = submit_mapped(sess, turn_ends).await;
+                }
+            }
             let _ = submit_mapped(sess, mapped).await;
             false
         }
+        CaptureCmd::TurnEndFacts { turn_number, facts } => {
+            if baseline_poisoned.load(Ordering::SeqCst) {
+                let n = dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                error!(
+                    session_id,
+                    dropped = n,
+                    "LHC: refusing turn_end_facts while replace_history baseline is poisoned"
+                );
+                return false;
+            }
+            if let Some(mut te) = deferred_turn_end.take() {
+                // Completed path: item-mapped turn_end (same key) + facts.
+                // Dedup law: one event, one key — never a second facts-bearing
+                // turn_end with a different key for the same close.
+                apply_turn_end_facts(&mut te, &facts);
+                let _ = submit_mapped(sess, vec![te]).await;
+            } else {
+                // No deferred close (cancelled mid-tools, error before
+                // terminal Assistant, etc.): shell-authored turn_end so
+                // host facts still land on this turn before any later
+                // prompt-boundary close.
+                let te = shell_turn_end_event(session_id, turn_number, &facts);
+                let _ = submit_mapped(sess, vec![te]).await;
+            }
+            false
+        }
         CaptureCmd::ReplaceHistory(items) => {
+            // Flush deferred empty first so a live close is not lost and
+            // history re-map keys stay the sole survivors via dedup.
+            if let Some(te) = deferred_turn_end.take() {
+                let _ = submit_mapped(sess, vec![te]).await;
+            }
             // Submit the slice; LHC dedup is the diff. Local map mints the
             // same keys survivors already have; merge_monotonic keeps rewind
             // occurrence high-water marks. Empty facts: history re-map has
@@ -1096,10 +1200,21 @@ async fn process_cmd(
             false
         }
         CaptureCmd::Flush(ack) => {
+            // Release a still-deferred close empty so observers (and hosts
+            // that never deliver shell facts) see the turn boundary.
+            if let Some(te) = deferred_turn_end.take() {
+                let _ = submit_mapped(sess, vec![te]).await;
+            }
             let _ = ack.send(());
             false
         }
         CaptureCmd::ListEvents(ack) => {
+            // Same release: list is the natural observation seam for tests
+            // and status; without it, a deferred turn_end would be invisible
+            // when the shell never delivered facts (pure adapter tests).
+            if let Some(te) = deferred_turn_end.take() {
+                let _ = submit_mapped(sess, vec![te]).await;
+            }
             let _ = ack.send(sess.list_events().await);
             false
         }

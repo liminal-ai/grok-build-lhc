@@ -53,8 +53,9 @@ pub use inference::{
 /// Re-exported so the shell sampler can stamp provenance without depending on `lhc` directly.
 pub use lhc::shared_tech::{InferenceRequestMessage, InferenceRequestRole};
 pub use mapping::{
-    MappedEvent, TurnEndFacts, attach_provider_usage, level_label, map_history, map_item,
-    map_model_change, token_usage_to_provider_usage,
+    MappedEvent, TurnEndFacts, apply_turn_end_facts, attach_provider_usage,
+    format_system_time_iso8601_millis, level_label, map_history, map_item, map_model_change,
+    shell_turn_end_event, token_usage_to_provider_usage,
 };
 pub use runtime_config::{
     ConfigSource, LhcFileConfig, ResolvedLhcConfig, Sourced, applied_config, apply_resolved_config,
@@ -146,6 +147,22 @@ pub fn capture_model_or_thinking_change(
         return;
     }
     handle.model_change(previous_model, new_model, &prev_level, &new_level);
+}
+
+/// LHC-HOOK target: shell turn-outcome facts for `turn_end` (schema v5 / G2).
+///
+/// No-op when no capture session is registered. Delivers host-observed
+/// outcome / timing so the capture worker can attach them to the turn being
+/// closed (deferred item-mapped `turn_end`, or a shell-authored close when
+/// the turn never produced a terminal toolless Assistant).
+pub fn capture_turn_end_facts(session_id: &str, turn_number: u64, facts: TurnEndFacts) {
+    if !any_capture_active() {
+        return;
+    }
+    let Some(handle) = lookup_session(session_id) else {
+        return;
+    };
+    handle.turn_end_facts(turn_number, facts);
 }
 
 /// Fire-and-forget session teardown. Safe from async contexts.

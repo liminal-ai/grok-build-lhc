@@ -441,7 +441,7 @@ pub(crate) async fn spawn_session_actor(
         conversation.clone(),
         chat_state_sampling_config,
         actor_pruning_config,
-        // LHC-HOOK 2/9: wrap persistence in the LHC capture tee (+ inference sampler)
+        // LHC-HOOK 2/10: wrap persistence in the LHC capture tee (+ inference sampler)
         grok_lhc_host::tee_chat_persistence(
             session_info.id.0.as_ref(),
             session_info.cwd.as_ref(),

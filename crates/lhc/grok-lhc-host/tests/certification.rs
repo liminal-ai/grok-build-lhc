@@ -4583,3 +4583,295 @@ async fn chunk3a_stuck_worker_health_is_degraded() {
         None => unsafe { std::env::remove_var("GROK_LHC_ROOT") },
     }
 }
+
+// ── Schema v5 / G2: shell turn-outcome facts ────────────────────────────
+
+/// Ordering pin: facts attach to the turn they describe (the deferred
+/// item-mapped turn_end from terminal Assistant), not the next turn.
+/// Mutation: if deferral is removed and facts only stash for the *next*
+/// turn_end, turn A's TE stays empty and turn B carries A's outcome.
+#[test]
+fn g2_turn_end_facts_land_on_described_turn_not_next() {
+    let root = TempDir::new().unwrap();
+    let sid = "cert-g2-ordering";
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+
+    handle.persist(&ConversationItem::user("q1"));
+    handle.persist(&ConversationItem::assistant("a1"));
+    // Do NOT list/flush before facts — that would release the deferred TE empty.
+    let facts_a = grok_lhc_host::TurnEndFacts {
+        outcome: Some("completed"),
+        outcome_reason: Some("completed".into()),
+        started_at: Some("2026-07-01T12:00:00.000Z".into()),
+        ended_at: Some("2026-07-01T12:00:04.000Z".into()),
+    };
+    handle.turn_end_facts(1, facts_a);
+    handle.flush_blocking();
+
+    let after_a = wait_events(&handle, 3); // user + assistant_text + turn_end
+    let te_a = after_a
+        .iter()
+        .filter_map(|e| {
+            e.turn_end_payload()
+                .map(|p| (e.idempotency_key().to_string(), p.clone()))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(te_a.len(), 1, "exactly one turn_end after turn A");
+    let (key_a, payload_a) = &te_a[0];
+    assert_eq!(
+        payload_a.outcome.map(|o| o.as_str()),
+        Some("completed"),
+        "turn A TE must carry completed — mutation: next-turn stash leaves this empty"
+    );
+    assert_eq!(payload_a.outcome_reason.as_deref(), Some("completed"));
+    assert_eq!(
+        payload_a.started_at.as_deref(),
+        Some("2026-07-01T12:00:00.000Z")
+    );
+    assert_eq!(
+        payload_a.ended_at.as_deref(),
+        Some("2026-07-01T12:00:04.000Z")
+    );
+
+    // Turn B: different facts; must not see turn A's outcome.
+    handle.persist(&ConversationItem::user("q2"));
+    handle.persist(&ConversationItem::assistant("a2"));
+    let facts_b = grok_lhc_host::TurnEndFacts {
+        outcome: Some("aborted"),
+        outcome_reason: Some("cancelled".into()),
+        started_at: Some("2026-07-01T12:01:00.000Z".into()),
+        ended_at: Some("2026-07-01T12:01:02.000Z".into()),
+    };
+    handle.turn_end_facts(2, facts_b);
+    handle.flush_blocking();
+
+    let after_b = wait_events(&handle, 6);
+    let tes: Vec<_> = after_b
+        .iter()
+        .filter_map(|e| {
+            e.turn_end_payload()
+                .map(|p| (e.idempotency_key().to_string(), p.clone()))
+        })
+        .collect();
+    assert_eq!(tes.len(), 2, "two turn_ends total");
+    let te_b = tes.iter().find(|(k, _)| k != key_a).expect("turn B TE");
+    assert_eq!(te_b.1.outcome.map(|o| o.as_str()), Some("aborted"));
+    assert_eq!(te_b.1.outcome_reason.as_deref(), Some("cancelled"));
+    // Turn A payload unchanged (consume-once; no second event with different key).
+    let te_a_again = tes.iter().find(|(k, _)| k == key_a).unwrap();
+    assert_eq!(te_a_again.1.outcome.map(|o| o.as_str()), Some("completed"));
+
+    handle.shutdown_blocking();
+}
+
+/// Consume-once: a second TurnEndFacts without a new deferred TE emits a
+/// shell-authored close (aborted-mid-tools path), not a re-write of the first.
+#[test]
+fn g2_turn_end_facts_consume_once_deferred() {
+    let root = TempDir::new().unwrap();
+    let sid = "cert-g2-consume-once";
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+
+    handle.persist(&ConversationItem::user("q"));
+    handle.persist(&ConversationItem::assistant("a"));
+    handle.turn_end_facts(
+        1,
+        grok_lhc_host::TurnEndFacts {
+            outcome: Some("completed"),
+            outcome_reason: Some("completed".into()),
+            started_at: Some("2026-07-01T12:00:00.000Z".into()),
+            ended_at: Some("2026-07-01T12:00:01.000Z".into()),
+        },
+    );
+    // Second delivery with no new item TE → shell-authored close.
+    handle.turn_end_facts(
+        1,
+        grok_lhc_host::TurnEndFacts {
+            outcome: Some("aborted"),
+            outcome_reason: Some("error".into()),
+            started_at: Some("2026-07-01T12:00:00.000Z".into()),
+            ended_at: Some("2026-07-01T12:00:09.000Z".into()),
+        },
+    );
+    handle.flush_blocking();
+    let ev = wait_events(&handle, 4); // user + asst + item TE + shell TE
+    let tes: Vec<_> = ev.iter().filter_map(|e| e.turn_end_payload()).collect();
+    assert_eq!(tes.len(), 2);
+    assert_eq!(tes[0].outcome.map(|o| o.as_str()), Some("completed"));
+    assert_eq!(tes[1].outcome.map(|o| o.as_str()), Some("aborted"));
+    // Keys must differ (dedup law: facts-bearing never a second event with *same*
+    // close identity rewritten — shell key is distinct).
+    let keys: Vec<_> = ev
+        .iter()
+        .filter(|e| e.turn_end_payload().is_some())
+        .map(|e| e.idempotency_key().to_string())
+        .collect();
+    assert_ne!(keys[0], keys[1]);
+    handle.shutdown_blocking();
+}
+
+/// Replay / replace_history re-map stays empty-facts (scout §4.4).
+#[test]
+fn g2_replace_history_remap_stays_empty_facts() {
+    let root = TempDir::new().unwrap();
+    let sid = "cert-g2-replay-empty";
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+
+    let user = ConversationItem::user("q");
+    let asst = ConversationItem::assistant("a");
+    handle.persist(&user);
+    handle.persist(&asst);
+    handle.turn_end_facts(
+        1,
+        grok_lhc_host::TurnEndFacts {
+            outcome: Some("completed"),
+            outcome_reason: Some("completed".into()),
+            started_at: Some("2026-07-01T12:00:00.000Z".into()),
+            ended_at: Some("2026-07-01T12:00:04.000Z".into()),
+        },
+    );
+    handle.flush_blocking();
+    let live = wait_events(&handle, 3);
+    let live_te = live
+        .iter()
+        .find_map(|e| e.turn_end_payload())
+        .expect("live TE");
+    assert_eq!(live_te.outcome.map(|o| o.as_str()), Some("completed"));
+    let live_key = live
+        .iter()
+        .find(|e| e.turn_end_payload().is_some())
+        .unwrap()
+        .idempotency_key()
+        .to_string();
+
+    // Replace with the same items — re-map uses empty facts; dedup keeps live payload.
+    handle.replace_history(&[user, asst]);
+    handle.flush_blocking();
+    thread::sleep(Duration::from_millis(50));
+    let after = handle.list_events_blocking().unwrap();
+    let te = after
+        .iter()
+        .find(|e| e.idempotency_key() == live_key)
+        .and_then(|e| e.turn_end_payload())
+        .expect("survivor TE");
+    assert_eq!(
+        te.outcome.map(|o| o.as_str()),
+        Some("completed"),
+        "live facts must survive replace re-map (dedup; empty remap must not win)"
+    );
+    handle.shutdown_blocking();
+}
+
+/// Populated-facts turn_end round-trips through submit_raw (scout §5.2).
+#[test]
+fn g2_submit_raw_populated_turn_end_facts_round_trip() {
+    use lhc::intake_stream::MessageEventInput;
+    use serde_json::{Map, json};
+
+    let root = TempDir::new().unwrap();
+    let sid = "cert-g2-submit-raw-facts";
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+
+    let mut te_payload = Map::new();
+    te_payload.insert("outcome".into(), json!("aborted"));
+    te_payload.insert("outcomeReason".into(), json!("doom_loop_repetition"));
+    te_payload.insert("startedAt".into(), json!("2026-07-01T12:00:00.000Z"));
+    te_payload.insert("endedAt".into(), json!("2026-07-01T12:00:04.000Z"));
+
+    let events = vec![
+        MessageEventInput {
+            event_kind: "user_prompt".into(),
+            idempotency_key: Some(format!("grok:{sid}:g2raw:u0")),
+            actor: "grok".into(),
+            harness: "grok-build".into(),
+            payload: json!({ "text": "raw turn" }).as_object().cloned().unwrap(),
+            extra: Map::new(),
+        },
+        MessageEventInput {
+            event_kind: "assistant_text".into(),
+            idempotency_key: Some(format!("grok:{sid}:g2raw:a0")),
+            actor: "grok".into(),
+            harness: "grok-build".into(),
+            payload: json!({ "text": "answer" }).as_object().cloned().unwrap(),
+            extra: Map::new(),
+        },
+        MessageEventInput {
+            event_kind: "turn_end".into(),
+            idempotency_key: Some(format!("grok:{sid}:g2raw:te0")),
+            actor: "grok".into(),
+            harness: "grok-build".into(),
+            payload: te_payload,
+            extra: Map::new(),
+        },
+    ];
+    let batch = handle.submit_raw_blocking(events).expect("submit_raw");
+    assert!(
+        batch
+            .events
+            .iter()
+            .all(|e| matches!(e.outcome, BatchEventOutcome::Recorded)),
+        "{batch:?}"
+    );
+    handle.flush_blocking();
+    let ev = wait_events(&handle, 3);
+    let te = ev
+        .iter()
+        .find_map(|e| e.turn_end_payload())
+        .expect("turn_end");
+    assert_eq!(te.outcome.map(|o| o.as_str()), Some("aborted"));
+    assert_eq!(te.outcome_reason.as_deref(), Some("doom_loop_repetition"));
+    assert_eq!(te.started_at.as_deref(), Some("2026-07-01T12:00:00.000Z"));
+    assert_eq!(te.ended_at.as_deref(), Some("2026-07-01T12:00:04.000Z"));
+    handle.shutdown_blocking();
+}
+
+/// Aborted mid-tools (no terminal Assistant) → shell-authored turn_end with facts.
+#[test]
+fn g2_aborted_without_terminal_assistant_emits_shell_turn_end() {
+    let root = TempDir::new().unwrap();
+    let sid = "cert-g2-shell-te";
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+
+    handle.persist(&ConversationItem::user("q"));
+    let asst = ConversationItem::Assistant(xai_grok_sampling_types::AssistantItem {
+        content: "calling".into(),
+        tool_calls: vec![ToolCall {
+            id: "c1".into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        }],
+        model_id: None,
+        model_fingerprint: None,
+        reasoning_effort: None,
+    });
+    handle.persist(&asst);
+    // No terminal toolless assistant — after-turn still delivers facts.
+    handle.turn_end_facts(
+        3,
+        grok_lhc_host::TurnEndFacts {
+            outcome: Some("aborted"),
+            outcome_reason: Some("cancelled".into()),
+            started_at: Some("2026-07-01T12:00:00.000Z".into()),
+            ended_at: Some("2026-07-01T12:00:02.000Z".into()),
+        },
+    );
+    handle.flush_blocking();
+    // user_prompt + assistant_text + tool_call + shell turn_end
+    let ev = wait_events(&handle, 4);
+    let te = ev
+        .iter()
+        .find_map(|e| e.turn_end_payload())
+        .expect("shell turn_end");
+    assert_eq!(te.outcome.map(|o| o.as_str()), Some("aborted"));
+    assert_eq!(te.outcome_reason.as_deref(), Some("cancelled"));
+    let te_key = ev
+        .iter()
+        .find(|e| e.turn_end_payload().is_some())
+        .unwrap()
+        .idempotency_key();
+    assert!(
+        te_key.contains("shell_turn_end"),
+        "expected shell-authored key, got {te_key}"
+    );
+    handle.shutdown_blocking();
+}
