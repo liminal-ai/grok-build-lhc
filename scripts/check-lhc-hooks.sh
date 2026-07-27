@@ -11,7 +11,7 @@ fail=0
 # Every core touchpoint carries a `LHC-HOOK <n>/<total>` marker. The
 # expected total lives here and in FORK.md's touchpoint inventory — update
 # BOTH in the same commit as any hook change.
-EXPECTED_HOOKS=6
+EXPECTED_HOOKS=9
 actual=$(grep -rl "LHC-HOOK" crates bin prod 2>/dev/null \
   | grep -v "^crates/lhc/" | xargs -r grep -o "LHC-HOOK [0-9]*/[0-9]*" | wc -l)
 if [ "$actual" -ne "$EXPECTED_HOOKS" ]; then

@@ -13,13 +13,14 @@ use std::sync::Arc;
 
 use tokio::sync::oneshot;
 use xai_chat_state::{ChatPersistence, StrictAppendAck, StrictAppendError};
-use xai_grok_sampling_types::ConversationItem;
+use xai_grok_sampling_types::{ConversationItem, TokenUsage};
 
 use crate::capture::{
     CaptureHandle, RegistrySnapshot, lookup_session_snapshot, registry_generation, spawn_capture,
 };
 use crate::gating::is_enabled;
 use crate::inference::LhcInferenceSampler;
+use crate::mapping::token_usage_to_provider_usage;
 
 /// Wrap `inner` with an LHC-resolving tee.
 ///
@@ -99,7 +100,17 @@ impl LhcTeePersistence {
 
 impl ChatPersistence for LhcTeePersistence {
     fn persist_message(&mut self, item: &ConversationItem) {
-        self.with_handle(|h| h.persist(item));
+        self.persist_message_with_provider_usage(item, None);
+    }
+
+    fn persist_message_with_provider_usage(
+        &mut self,
+        item: &ConversationItem,
+        provider_usage: Option<&TokenUsage>,
+    ) {
+        let usage_map = provider_usage.and_then(token_usage_to_provider_usage);
+        self.with_handle(|h| h.persist_with_provider_usage(item, usage_map));
+        // Inner (disk) path does not need usage — chat_history.jsonl is native shape.
         self.inner.persist_message(item);
     }
 

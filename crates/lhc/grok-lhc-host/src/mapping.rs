@@ -5,8 +5,8 @@
 use lhc::intake_stream::MessageEventInput;
 use serde_json::{Map, Value, json};
 use xai_grok_sampling_types::{
-    BackendToolCallItem, BackendToolKind, ContentPart, ConversationItem, SyntheticReason, ToolCall,
-    ToolResultItem, reasoning_item_text, rs,
+    BackendToolCallItem, BackendToolKind, ContentPart, ConversationItem, SyntheticReason,
+    TokenUsage, ToolCall, ToolResultItem, reasoning_item_text, rs,
 };
 
 use crate::idempotency::{
@@ -27,12 +27,35 @@ pub struct MappedEvent {
     pub input: MessageEventInput,
 }
 
+/// Host-observed facts for a `turn_end` payload (schema v5 / D1–D2).
+///
+/// All fields optional — empty payload remains valid for hosts that omit them.
+/// Shape mirrors vendored `TurnEndPayload` optionals. G1 threads the param
+/// default-empty; G2 wires the shell turn-boundary signal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnEndFacts {
+    /// `"completed"` or `"aborted"`.
+    pub outcome: Option<&'static str>,
+    pub outcome_reason: Option<String>,
+    /// Host wall-clock start (ISO-8601 UTC).
+    pub started_at: Option<String>,
+    /// Host wall-clock end (ISO-8601 UTC).
+    pub ended_at: Option<String>,
+}
+
 /// Map a single conversation item into zero or more LHC events.
+///
+/// `turn_end_facts` populates optional `turn_end` payload fields when this
+/// item emits a `turn_end`. Facts must **not** enter the idempotency key
+/// (rewind/replay dedup depends on key stability). Pass
+/// [`TurnEndFacts::default`] when the host has no facts (bootstrap/replace
+/// re-map, and live path until G2 wires the shell signal).
 pub fn map_item(
     session_id: &str,
     generation: u64,
     item: &ConversationItem,
     tracker: &mut OccurrenceTracker,
+    turn_end_facts: &TurnEndFacts,
 ) -> Vec<MappedEvent> {
     let digest = item_digest(item);
     let occ = tracker.next(&digest);
@@ -61,7 +84,15 @@ pub fn map_item(
                     None,
                 )]
             }
-            Some(reason) => map_synthetic_user(session_id, generation, &digest, occ, reason, user),
+            Some(reason) => map_synthetic_user(
+                session_id,
+                generation,
+                &digest,
+                occ,
+                reason,
+                user,
+                turn_end_facts,
+            ),
         },
         ConversationItem::Assistant(assistant) => {
             let mut out = Vec::new();
@@ -81,7 +112,14 @@ pub fn map_item(
                 out.push(tool_call_event(session_id, generation, &digest, occ, tc));
             }
             if assistant.tool_calls.is_empty() {
-                out.push(turn_end_event(session_id, generation, &digest, occ, None));
+                out.push(turn_end_event(
+                    session_id,
+                    generation,
+                    &digest,
+                    occ,
+                    None,
+                    turn_end_facts,
+                ));
             }
             out
         }
@@ -121,6 +159,7 @@ fn map_synthetic_user(
     occ: u64,
     reason: &SyntheticReason,
     user: &xai_grok_sampling_types::UserItem,
+    turn_end_facts: &TurnEndFacts,
 ) -> Vec<MappedEvent> {
     let text = content_parts_text(&user.content);
     // Exhaustive on SyntheticReason — no `_ =>`.
@@ -160,7 +199,14 @@ fn map_synthetic_user(
         // Close prior (possibly aborted) turn, then record the synthetic wake
         // as a runtime_note — never user_prompt (not real user input).
         vec![
-            turn_end_event(session_id, generation, digest, occ, Some("pre_synthetic")),
+            turn_end_event(
+                session_id,
+                generation,
+                digest,
+                occ,
+                Some("pre_synthetic"),
+                turn_end_facts,
+            ),
             note,
         ]
     } else {
@@ -169,15 +215,25 @@ fn map_synthetic_user(
 }
 
 /// Map a full history slice; returns events and the aligned occurrence tracker.
+///
+/// Bootstrap / `replace_history` re-maps pass [`TurnEndFacts::default`] — live
+/// host facts are not reconstructed from history (see scouting report §4.4).
 pub fn map_history(
     session_id: &str,
     generation: u64,
     items: &[ConversationItem],
+    turn_end_facts: &TurnEndFacts,
 ) -> (Vec<MappedEvent>, OccurrenceTracker) {
     let mut tracker = OccurrenceTracker::new();
     let mut out = Vec::new();
     for item in items {
-        out.extend(map_item(session_id, generation, item, &mut tracker));
+        out.extend(map_item(
+            session_id,
+            generation,
+            item,
+            &mut tracker,
+            turn_end_facts,
+        ));
     }
     (out, tracker)
 }
@@ -240,18 +296,54 @@ fn turn_end_event(
     digest: &str,
     occ: u64,
     part: Option<&str>,
+    facts: &TurnEndFacts,
 ) -> MappedEvent {
+    // Key stability: facts must NOT enter the key (scout §4.3 / load-bearing
+    // for rewind/replay dedup).
     let key = item_event_key(session_id, generation, digest, occ, "turn_end", part);
+    let mut payload = Map::new();
+    if let Some(outcome) = facts.outcome {
+        payload.insert("outcome".into(), json!(outcome));
+    }
+    if let Some(reason) = facts.outcome_reason.as_ref() {
+        payload.insert("outcomeReason".into(), json!(reason));
+    }
+    if let Some(started) = facts.started_at.as_ref() {
+        payload.insert("startedAt".into(), json!(started));
+    }
+    if let Some(ended) = facts.ended_at.as_ref() {
+        payload.insert("endedAt".into(), json!(ended));
+    }
     MappedEvent {
         input: MessageEventInput {
             event_kind: "turn_end".to_string(),
             idempotency_key: Some(key),
             actor: ACTOR.to_string(),
             harness: HARNESS.to_string(),
-            payload: Map::new(),
+            payload,
             extra: Map::new(),
         },
     }
+}
+
+/// Serialize a host `TokenUsage` into a free-form JSON object for
+/// `assistant_text.providerUsage` (verbatim; no field filter).
+pub fn token_usage_to_provider_usage(usage: &TokenUsage) -> Option<Map<String, Value>> {
+    match serde_json::to_value(usage) {
+        Ok(Value::Object(map)) => Some(map),
+        _ => None,
+    }
+}
+
+/// Attach optional `providerUsage` to a mapped `assistant_text` event.
+pub fn attach_provider_usage(event: &mut MappedEvent, usage: &Map<String, Value>) {
+    if event.input.event_kind != "assistant_text" {
+        return;
+    }
+    event
+        .input
+        .payload
+        .insert("providerUsage".into(), Value::Object(usage.clone()));
 }
 
 fn tool_call_event(
@@ -517,10 +609,20 @@ mod tests {
     use super::*;
     use xai_grok_sampling_types::{ConversationItem, SyntheticReason, synthesized_reasoning_item};
 
+    fn empty_facts() -> TurnEndFacts {
+        TurnEndFacts::default()
+    }
+
     #[test]
     fn real_user_is_user_prompt() {
         let mut t = OccurrenceTracker::new();
-        let ev = map_item("s", 0, &ConversationItem::user("hi"), &mut t);
+        let ev = map_item(
+            "s",
+            0,
+            &ConversationItem::user("hi"),
+            &mut t,
+            &empty_facts(),
+        );
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].input.event_kind, "user_prompt");
     }
@@ -540,9 +642,15 @@ mod tests {
                 u.synthetic_reason = Some(reason.clone());
             }
             let mut t = OccurrenceTracker::new();
-            let ev = map_item("s", 0, &item, &mut t);
+            let ev = map_item("s", 0, &item, &mut t, &empty_facts());
             assert_eq!(ev.len(), 2, "{reason:?}");
             assert_eq!(ev[0].input.event_kind, "turn_end");
+            // Empty facts → empty payload (schema v5: empty stays valid).
+            assert!(
+                ev[0].input.payload.is_empty(),
+                "default facts must omit all turn_end fields: {:?}",
+                ev[0].input.payload
+            );
             assert_eq!(ev[1].input.event_kind, "runtime_note");
         }
     }
@@ -555,7 +663,7 @@ mod tests {
                 u.synthetic_reason = Some(reason);
             }
             let mut t = OccurrenceTracker::new();
-            let ev = map_item("s", 0, &item, &mut t);
+            let ev = map_item("s", 0, &item, &mut t, &empty_facts());
             assert_eq!(ev.len(), 1);
             assert_eq!(ev[0].input.event_kind, "runtime_note");
         }
@@ -564,8 +672,21 @@ mod tests {
     #[test]
     fn assistant_without_tools_emits_turn_end() {
         let mut t = OccurrenceTracker::new();
-        let ev = map_item("s", 0, &ConversationItem::assistant("done"), &mut t);
-        assert!(ev.iter().any(|e| e.input.event_kind == "turn_end"));
+        let ev = map_item(
+            "s",
+            0,
+            &ConversationItem::assistant("done"),
+            &mut t,
+            &empty_facts(),
+        );
+        let te = ev
+            .iter()
+            .find(|e| e.input.event_kind == "turn_end")
+            .expect("turn_end");
+        assert!(
+            te.input.payload.is_empty(),
+            "default facts → empty turn_end payload"
+        );
     }
 
     #[test]
@@ -582,15 +703,110 @@ mod tests {
             model_fingerprint: None,
             reasoning_effort: None,
         });
-        let ev = map_item("s", 0, &item, &mut t);
+        let ev = map_item("s", 0, &item, &mut t, &empty_facts());
         assert!(!ev.iter().any(|e| e.input.event_kind == "turn_end"));
+    }
+
+    #[test]
+    fn turn_end_empty_payload_when_no_facts() {
+        let event = turn_end_event("s", 0, "digest", 0, None, &TurnEndFacts::default());
+        assert_eq!(event.input.event_kind, "turn_end");
+        assert!(event.input.payload.is_empty());
+    }
+
+    #[test]
+    fn turn_end_carries_v5_host_facts() {
+        let facts = TurnEndFacts {
+            outcome: Some("aborted"),
+            outcome_reason: Some("interrupted".into()),
+            started_at: Some("2026-07-01T12:00:00.000Z".into()),
+            ended_at: Some("2026-07-01T12:00:04.000Z".into()),
+        };
+        let event = turn_end_event("s", 0, "digest", 0, None, &facts);
+        assert_eq!(event.input.payload.get("outcome"), Some(&json!("aborted")));
+        assert_eq!(
+            event.input.payload.get("outcomeReason"),
+            Some(&json!("interrupted"))
+        );
+        assert_eq!(
+            event.input.payload.get("startedAt"),
+            Some(&json!("2026-07-01T12:00:00.000Z"))
+        );
+        assert_eq!(
+            event.input.payload.get("endedAt"),
+            Some(&json!("2026-07-01T12:00:04.000Z"))
+        );
+        assert!(event.input.extra.is_empty());
+    }
+
+    /// Facts must not enter the idempotency key — load-bearing for rewind/replay dedup.
+    #[test]
+    fn turn_end_facts_do_not_enter_idempotency_key() {
+        let empty = turn_end_event("s", 0, "digest", 0, None, &TurnEndFacts::default());
+        let facts = TurnEndFacts {
+            outcome: Some("completed"),
+            outcome_reason: Some("ok".into()),
+            started_at: Some("2026-07-01T12:00:00.000Z".into()),
+            ended_at: Some("2026-07-01T12:00:04.000Z".into()),
+        };
+        let populated = turn_end_event("s", 0, "digest", 0, None, &facts);
+        assert_eq!(
+            empty.input.idempotency_key, populated.input.idempotency_key,
+            "facts-bearing and facts-empty turn_end must share the same key"
+        );
+        assert!(empty.input.payload.is_empty());
+        assert!(!populated.input.payload.is_empty());
+    }
+
+    #[test]
+    fn provider_usage_attaches_only_to_assistant_text() {
+        let mut t = OccurrenceTracker::new();
+        let mut events = map_item(
+            "s",
+            0,
+            &ConversationItem::assistant("hello"),
+            &mut t,
+            &empty_facts(),
+        );
+        assert_eq!(events[0].input.event_kind, "assistant_text");
+        let usage = json!({"prompt_tokens": 11, "completion_tokens": 3})
+            .as_object()
+            .cloned()
+            .unwrap();
+        attach_provider_usage(&mut events[0], &usage);
+        assert_eq!(
+            events[0].input.payload.get("providerUsage"),
+            Some(&Value::Object(usage.clone()))
+        );
+        // turn_end must not receive the attach (kind gate).
+        if let Some(te) = events.iter_mut().find(|e| e.input.event_kind == "turn_end") {
+            attach_provider_usage(te, &usage);
+            assert!(te.input.payload.get("providerUsage").is_none());
+        }
+    }
+
+    #[test]
+    fn token_usage_to_provider_usage_is_verbatim_object() {
+        let usage = TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 2,
+            total_tokens: 12,
+            reasoning_tokens: 1,
+            cached_prompt_tokens: 4,
+        };
+        let map = token_usage_to_provider_usage(&usage).expect("object");
+        assert_eq!(map.get("prompt_tokens"), Some(&json!(10)));
+        assert_eq!(map.get("completion_tokens"), Some(&json!(2)));
+        assert_eq!(map.get("total_tokens"), Some(&json!(12)));
+        assert_eq!(map.get("reasoning_tokens"), Some(&json!(1)));
+        assert_eq!(map.get("cached_prompt_tokens"), Some(&json!(4)));
     }
 
     #[test]
     fn reasoning_is_assistant_thinking() {
         let mut t = OccurrenceTracker::new();
         let item = ConversationItem::Reasoning(synthesized_reasoning_item("think"));
-        let ev = map_item("s", 0, &item, &mut t);
+        let ev = map_item("s", 0, &item, &mut t, &empty_facts());
         assert_eq!(ev[0].input.event_kind, "assistant_thinking");
     }
 
@@ -606,7 +822,7 @@ mod tests {
 
     #[test]
     fn map_history_returns_aligned_tracker() {
-        let (ev, mut t) = map_history("s", 0, &[ConversationItem::user("a")]);
+        let (ev, mut t) = map_history("s", 0, &[ConversationItem::user("a")], &empty_facts());
         assert_eq!(ev.len(), 1);
         // Next identical item gets occ=1
         let d = item_digest(&ConversationItem::user("a"));

@@ -154,7 +154,15 @@ impl ChatStateActor {
                 "ChatState: push_message updated estimated_tokens_since_model"
             );
         }
-        self.persistence.persist_message(&item);
+        // Consume pending model-call usage once on next Assistant persist
+        // (paired with the hook-8 stash in record_model_call_usage).
+        let provider_usage = if matches!(item, ConversationItem::Assistant(_)) {
+            self.state.pending_model_call_usage.take()
+        } else {
+            None
+        };
+        self.persistence
+            .persist_message_with_provider_usage(&item, provider_usage.as_ref());
         self.state.conversation.push(item);
     }
 
@@ -375,6 +383,8 @@ impl ChatStateActor {
             api_duration_ms,
             cost_usd_ticks,
         );
+        // LHC-HOOK 8/9: stash for the next Assistant → LHC assistant_text.providerUsage
+        self.state.pending_model_call_usage = Some(usage.clone());
     }
 
     pub(super) fn record_subagent_usage(

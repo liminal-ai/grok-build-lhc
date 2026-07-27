@@ -52,7 +52,10 @@ pub use inference::{
 };
 /// Re-exported so the shell sampler can stamp provenance without depending on `lhc` directly.
 pub use lhc::shared_tech::{InferenceRequestMessage, InferenceRequestRole};
-pub use mapping::{MappedEvent, level_label, map_history, map_item, map_model_change};
+pub use mapping::{
+    MappedEvent, TurnEndFacts, attach_provider_usage, level_label, map_history, map_item,
+    map_model_change, token_usage_to_provider_usage,
+};
 pub use runtime_config::{
     ConfigSource, LhcFileConfig, ResolvedLhcConfig, Sourced, applied_config, apply_resolved_config,
     clear_config_parse_error, config_parse_error, note_config_parse_error, resolve_lhc_config,

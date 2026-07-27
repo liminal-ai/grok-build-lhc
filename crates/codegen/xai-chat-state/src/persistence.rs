@@ -8,7 +8,7 @@
 use std::io;
 
 use tokio::sync::{mpsc, oneshot};
-use xai_grok_sampling_types::ConversationItem;
+use xai_grok_sampling_types::{ConversationItem, TokenUsage};
 
 use crate::commands::{StrictAppendAck, StrictAppendError};
 
@@ -23,6 +23,21 @@ use crate::commands::{StrictAppendAck, StrictAppendError};
 pub trait ChatPersistence: Send + 'static {
     /// Persist a single conversation item (append to chat_history.jsonl).
     fn persist_message(&mut self, item: &ConversationItem);
+
+    // LHC-HOOK 9/9: optional provider usage side-channel for LHC assistant_text (schema v5 / D3)
+    /// Persist a message, optionally carrying the last model call's provider usage.
+    ///
+    /// Default ignores usage and calls [`Self::persist_message`]. The LHC capture
+    /// tee overrides this to attach `providerUsage` on `assistant_text` events.
+    /// Usage is host fact — never interpreted by chat-state itself.
+    fn persist_message_with_provider_usage(
+        &mut self,
+        item: &ConversationItem,
+        provider_usage: Option<&TokenUsage>,
+    ) {
+        let _ = provider_usage;
+        self.persist_message(item);
+    }
 
     /// Persist one working-directory switch generation and report commit status.
     fn persist_working_directory_switch_and_ack(
@@ -44,8 +59,13 @@ pub trait ChatPersistence: Send + 'static {
 /// A record of a persistence call, sent over a channel to the test.
 #[derive(Debug, Clone)]
 pub enum PersistenceRecord {
-    /// A single message was persisted.
+    /// A single message was persisted (no provider usage attached).
     Message(ConversationItem),
+    /// A message persisted with the actor's pending model-call usage (schema v5).
+    ///
+    /// Emitted only when the actor calls
+    /// [`ChatPersistence::persist_message_with_provider_usage`] with `Some`.
+    MessageWithProviderUsage(ConversationItem, TokenUsage),
     /// A persistence-acknowledged switch append was requested.
     AcknowledgedMessage(ConversationItem),
     /// The full history was replaced.
@@ -128,12 +148,14 @@ impl MockPersistenceReceiver {
         }
     }
 
-    /// Collect all `Message` items received so far (drains the channel).
+    /// Collect all `Message` / `MessageWithProviderUsage` items received so far
+    /// (drains the channel).
     pub fn messages(&mut self) -> Vec<ConversationItem> {
         self.drain()
             .into_iter()
             .filter_map(|r| match r {
-                PersistenceRecord::Message(item) => Some(item),
+                PersistenceRecord::Message(item)
+                | PersistenceRecord::MessageWithProviderUsage(item, _) => Some(item),
                 _ => None,
             })
             .collect()
@@ -143,6 +165,24 @@ impl MockPersistenceReceiver {
 impl ChatPersistence for MockChatPersistence {
     fn persist_message(&mut self, item: &ConversationItem) {
         let _ = self.tx.send(PersistenceRecord::Message(item.clone()));
+    }
+
+    fn persist_message_with_provider_usage(
+        &mut self,
+        item: &ConversationItem,
+        provider_usage: Option<&TokenUsage>,
+    ) {
+        match provider_usage {
+            Some(usage) => {
+                let _ = self.tx.send(PersistenceRecord::MessageWithProviderUsage(
+                    item.clone(),
+                    usage.clone(),
+                ));
+            }
+            None => {
+                let _ = self.tx.send(PersistenceRecord::Message(item.clone()));
+            }
+        }
     }
 
     fn persist_working_directory_switch_and_ack(

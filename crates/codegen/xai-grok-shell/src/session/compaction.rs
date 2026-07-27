@@ -2071,7 +2071,7 @@ impl SessionActor {
                 trigger_info.tokens_used,
                 trigger_info.context_window,
             );
-            // LHC-HOOK 5/6: auto-compact decision; LHC I/O at writer choke only
+            // LHC-HOOK 5/9: auto-compact decision; LHC I/O at writer choke only
             return Some(trigger_info);
         }
         None

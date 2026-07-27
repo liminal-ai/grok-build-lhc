@@ -7,10 +7,10 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 
-use grok_lhc_host::{map_history, map_model_change};
+use grok_lhc_host::{TurnEndFacts, map_history, map_model_change};
 use lhc::intake_stream::{
-    ModelChangePayload, TextPayload, ThinkingLevelChangePayload, ToolCallPayload,
-    ToolResultPayload, TurnEndPayload,
+    AssistantTextPayload, ModelChangePayload, TextPayload, ThinkingLevelChangePayload,
+    ToolCallPayload, ToolResultPayload, TurnEndPayload,
 };
 use serde_json::{Map, Value, json};
 use xai_grok_sampling_types::{
@@ -64,7 +64,14 @@ fn assert_lhc_payload_shapes(events: &[grok_lhc_host::MappedEvent]) {
     for e in events {
         let v = Value::Object(e.input.payload.clone());
         match e.input.event_kind.as_str() {
-            "user_prompt" | "assistant_text" | "assistant_thinking" | "runtime_note" => {
+            // assistant_text is schema-v5 `AssistantTextPayload` (optional
+            // providerUsage); shared TextPayload is deny_unknown_fields and
+            // panics when usage is present.
+            "assistant_text" => {
+                let _: AssistantTextPayload = serde_json::from_value(v)
+                    .unwrap_or_else(|err| panic!("assistant_text payload decode failed: {err}"));
+            }
+            "user_prompt" | "assistant_thinking" | "runtime_note" => {
                 let _: TextPayload = serde_json::from_value(v).unwrap_or_else(|err| {
                     panic!("{} payload decode failed: {err}", e.input.event_kind)
                 });
@@ -196,7 +203,7 @@ fn golden_covers_every_event_kind_and_mapping_row() {
         ConversationItem::working_directory_switch("/tmp/moved", 1),
     ];
 
-    let (mapped, _) = map_history("golden-session", 0, &history);
+    let (mapped, _) = map_history("golden-session", 0, &history, &TurnEndFacts::default());
     assert_lhc_payload_shapes(&mapped);
 
     let mut kinds: BTreeSet<_> = mapped.iter().map(|e| e.input.event_kind.clone()).collect();
@@ -301,7 +308,7 @@ fn golden_every_synthetic_reason() {
         }
         items.push(item);
     }
-    let (mapped, _) = map_history("synth-session", 0, &items);
+    let (mapped, _) = map_history("synth-session", 0, &items, &TurnEndFacts::default());
     // 5 turn-starters → turn_end+note; 10 plain notes → 20 events.
     assert_eq!(mapped.len(), 20);
     let turn_ends = mapped
@@ -322,8 +329,18 @@ fn golden_every_synthetic_reason() {
 #[test]
 fn map_item_idempotency_keys_stable_across_replay() {
     let item = ConversationItem::user("stable");
-    let (a, _) = map_history("s", 0, std::slice::from_ref(&item));
-    let (b, _) = map_history("s", 0, std::slice::from_ref(&item));
+    let (a, _) = map_history(
+        "s",
+        0,
+        std::slice::from_ref(&item),
+        &TurnEndFacts::default(),
+    );
+    let (b, _) = map_history(
+        "s",
+        0,
+        std::slice::from_ref(&item),
+        &TurnEndFacts::default(),
+    );
     assert_eq!(
         a[0].input.idempotency_key, b[0].input.idempotency_key,
         "replay must reuse keys"

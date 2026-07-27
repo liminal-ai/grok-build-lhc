@@ -453,6 +453,66 @@ async fn record_token_usage_emits_event() {
     assert_eq!(tokens, 1000);
 }
 
+/// Pending model-call usage is consumed once on the next Assistant persist.
+/// A second Assistant without an intervening `RecordModelCallUsage` gets none.
+#[tokio::test]
+async fn pending_model_call_usage_consumed_once_on_assistant_persist() {
+    use xai_grok_sampling_types::TokenUsage;
+
+    let mut h = TestHarness::new();
+    let usage = TokenUsage {
+        prompt_tokens: 100,
+        completion_tokens: 20,
+        total_tokens: 120,
+        reasoning_tokens: 5,
+        cached_prompt_tokens: 40,
+    };
+
+    h.handle
+        .record_model_call_usage(Some("m".into()), usage.clone(), None, None);
+    // Sync: wait for actor to process RecordModelCallUsage before PushAssistant.
+    let _ = h.handle.get_conversation().await;
+
+    h.handle
+        .push_assistant_response(ConversationItem::assistant("first"));
+    let _ = h.handle.get_conversation().await;
+
+    h.handle
+        .push_assistant_response(ConversationItem::assistant("second"));
+    let _ = h.handle.get_conversation().await;
+
+    let records = h.persistence_rx.drain();
+    let mut assistant_records = records.into_iter().filter(|r| {
+        matches!(
+            r,
+            PersistenceRecord::Message(ConversationItem::Assistant(_))
+                | PersistenceRecord::MessageWithProviderUsage(ConversationItem::Assistant(_), _)
+        )
+    });
+
+    match assistant_records.next() {
+        Some(PersistenceRecord::MessageWithProviderUsage(item, got)) => {
+            assert_eq!(item.text_content(), "first");
+            assert_eq!(got.prompt_tokens, usage.prompt_tokens);
+            assert_eq!(got.completion_tokens, usage.completion_tokens);
+            assert_eq!(got.total_tokens, usage.total_tokens);
+            assert_eq!(got.reasoning_tokens, usage.reasoning_tokens);
+            assert_eq!(got.cached_prompt_tokens, usage.cached_prompt_tokens);
+        }
+        other => panic!("first assistant should carry usage, got {other:?}"),
+    }
+    match assistant_records.next() {
+        Some(PersistenceRecord::Message(item)) => {
+            assert_eq!(item.text_content(), "second");
+        }
+        Some(PersistenceRecord::MessageWithProviderUsage(_, u)) => {
+            panic!("second assistant must not carry usage, got {u:?}");
+        }
+        other => panic!("expected plain Message for second assistant, got {other:?}"),
+    }
+    assert!(assistant_records.next().is_none());
+}
+
 #[tokio::test]
 async fn record_last_turn_usage_round_trip() {
     use xai_grok_sampling_types::TokenUsage;

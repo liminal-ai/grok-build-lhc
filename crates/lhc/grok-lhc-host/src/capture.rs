@@ -18,7 +18,9 @@ use crate::idempotency::{ITEM_KEY_GENERATION, OccurrenceTracker};
 use crate::inference::{
     LhcInferenceSampler, register_inference_sampler, unregister_inference_sampler,
 };
-use crate::mapping::{MappedEvent, map_history, map_item, map_model_change};
+use crate::mapping::{
+    MappedEvent, TurnEndFacts, attach_provider_usage, map_history, map_item, map_model_change,
+};
 use crate::session::LhcSession;
 
 /// Bound on the capture queue. Must not block the chat-state actor.
@@ -39,7 +41,11 @@ static REGISTRY_GENERATION: AtomicU64 = AtomicU64::new(0);
 static REGISTRY_LOOKUPS: AtomicU64 = AtomicU64::new(0);
 
 enum CaptureCmd {
-    Persist(ConversationItem),
+    /// Live item persist; optional verbatim provider usage for `assistant_text`.
+    Persist {
+        item: ConversationItem,
+        provider_usage: Option<serde_json::Map<String, serde_json::Value>>,
+    },
     ReplaceHistory(Vec<ConversationItem>),
     ModelChange {
         previous_model: String,
@@ -130,7 +136,20 @@ pub struct CaptureHandle {
 
 impl CaptureHandle {
     pub fn persist(&self, item: &ConversationItem) {
-        match self.inner.tx.try_send(CaptureCmd::Persist(item.clone())) {
+        self.persist_with_provider_usage(item, None);
+    }
+
+    /// Persist an item, optionally attaching verbatim provider usage on the
+    /// mapped `assistant_text` event (schema v5 / D3).
+    pub fn persist_with_provider_usage(
+        &self,
+        item: &ConversationItem,
+        provider_usage: Option<serde_json::Map<String, serde_json::Value>>,
+    ) {
+        match self.inner.tx.try_send(CaptureCmd::Persist {
+            item: item.clone(),
+            provider_usage,
+        }) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.note_drop("persist");
@@ -773,8 +792,12 @@ pub fn spawn_capture(
                         );
                     }
                 } else {
-                    let (events, local) =
-                        map_history(&session_id_for_worker, ITEM_KEY_GENERATION, &bootstrap);
+                    let (events, local) = map_history(
+                        &session_id_for_worker,
+                        ITEM_KEY_GENERATION,
+                        &bootstrap,
+                        &TurnEndFacts::default(),
+                    );
                     tracker.merge_monotonic(&local);
                     let inputs: Vec<_> = events.into_iter().map(|e| e.input).collect();
                     match session.submit_events(&inputs).await {
@@ -958,7 +981,10 @@ async fn process_cmd(
         return true;
     };
     match cmd {
-        CaptureCmd::Persist(item) => {
+        CaptureCmd::Persist {
+            item,
+            provider_usage,
+        } => {
             if baseline_poisoned.load(Ordering::SeqCst) {
                 let n = dropped.fetch_add(1, Ordering::Relaxed) + 1;
                 error!(
@@ -970,15 +996,35 @@ async fn process_cmd(
             }
             // Occurrence advances before submit — a failed submit leaves a
             // gap so a retry cannot collide with a partially-applied key.
-            let mapped = map_item(session_id, ITEM_KEY_GENERATION, &item, tracker);
+            // Live path: empty turn_end facts until G2 wires the shell signal.
+            let mut mapped = map_item(
+                session_id,
+                ITEM_KEY_GENERATION,
+                &item,
+                tracker,
+                &TurnEndFacts::default(),
+            );
+            if let Some(usage) = provider_usage.as_ref()
+                && let Some(ev) = mapped
+                    .iter_mut()
+                    .find(|e| e.input.event_kind == "assistant_text")
+            {
+                attach_provider_usage(ev, usage);
+            }
             let _ = submit_mapped(sess, mapped).await;
             false
         }
         CaptureCmd::ReplaceHistory(items) => {
             // Submit the slice; LHC dedup is the diff. Local map mints the
             // same keys survivors already have; merge_monotonic keeps rewind
-            // occurrence high-water marks.
-            let (events, local) = map_history(session_id, ITEM_KEY_GENERATION, &items);
+            // occurrence high-water marks. Empty facts: history re-map has
+            // no live turn-boundary signal (scout §4.4).
+            let (events, local) = map_history(
+                session_id,
+                ITEM_KEY_GENERATION,
+                &items,
+                &TurnEndFacts::default(),
+            );
             tracker.merge_monotonic(&local);
             #[cfg(any(test, feature = "test-util"))]
             {

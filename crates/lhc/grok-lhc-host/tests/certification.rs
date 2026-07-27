@@ -675,7 +675,12 @@ fn batch_skip_reports_duplicate_idempotency_key() {
     let sid = "cert-dup-skip";
     let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
     let item = ConversationItem::user("dup");
-    let (mapped, _) = grok_lhc_host::map_history(sid, 0, std::slice::from_ref(&item));
+    let (mapped, _) = grok_lhc_host::map_history(
+        sid,
+        0,
+        std::slice::from_ref(&item),
+        &grok_lhc_host::TurnEndFacts::default(),
+    );
     handle.persist(&item);
     handle.flush_blocking();
     let _ = wait_exact(&handle, 1);

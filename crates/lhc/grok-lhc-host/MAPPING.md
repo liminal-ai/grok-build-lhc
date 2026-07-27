@@ -90,11 +90,33 @@ Emitted after:
 2. A turn-starting synthetic (see table) — closes a prior turn that may have
    been aborted with tool calls outstanding.
 
+`map_item` / `map_history` / `turn_end_event` take a `TurnEndFacts` parameter
+(schema v5 / D1–D2): optional `outcome`, `outcomeReason`, `startedAt`,
+`endedAt`. G1 threads the param default-empty; G2 wires the shell turn-boundary
+signal. Facts populate the payload only — they must **not** enter
+`item_event_key` (rewind/replay dedup depends on key stability).
+
 **Open case (documented):** a turn aborted with tool calls outstanding and
 *without* a subsequent turn-starting synthetic leaves the LHC turn open until
 the next real `user_prompt` or terminal toolless `Assistant`. Banded compaction
 sees a long turn in that window. Certification covers the synthetic-wake close
 path; the pure-abort-without-wake path is intentional host silence.
+
+## `assistant_text.providerUsage` (schema v5 / D3)
+
+Per model call, the host's verbatim `TokenUsage` JSON object rides the
+`assistant_text` event that ends that call:
+
+1. `RecordModelCallUsage` stashes usage on `ChatStateActor`
+   (`pending_model_call_usage`).
+2. FIFO: the next `PushAssistantResponse` on the same actor channel takes the
+   slot once and passes it through `ChatPersistence::persist_message_with_provider_usage`.
+3. The LHC tee serializes via `token_usage_to_provider_usage` and attaches
+   `providerUsage` on the mapped `assistant_text` event.
+
+A second `Assistant` without an intervening `RecordModelCallUsage` gets no
+usage. Bootstrap / `replace_history` re-maps never carry live usage (side
+channel is not part of history).
 
 ## `replace_history` (Chunk 1 decision — B1)
 

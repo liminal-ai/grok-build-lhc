@@ -153,6 +153,14 @@ pub(crate) struct ChatState {
     /// persist last_turn_usage). Always overwritten by the most recent turn —
     /// historical turns are not retained here.
     pub last_turn_usage: Option<TokenUsage>,
+    // LHC-HOOK 7/9: last model-call TokenUsage for assistant_text.providerUsage (schema v5 / D3)
+    /// Pending per-model-call usage for the next `Assistant` persist.
+    ///
+    /// Set by `record_model_call_usage` (FIFO before `PushAssistantResponse` on
+    /// the same actor channel). Taken once when the next `Assistant` is
+    /// persisted — a second `Assistant` without an intervening record gets
+    /// `None`. Not persisted across restore/snapshot; LHC-only side channel.
+    pub pending_model_call_usage: Option<TokenUsage>,
     /// Billing for the open prompt (cleared on next prompt; not persisted).
     pub prompt_usage: Option<UsageLedger>,
     /// Lifetime session billing (not persisted).
@@ -240,6 +248,7 @@ impl ChatState {
             estimated_tokens_since_model: 0,
             estimate_at_last_response: initial_tokens,
             last_turn_usage: None,
+            pending_model_call_usage: None,
             prompt_usage: None,
             session_usage: UsageLedger::default(),
             turn_capture: None,

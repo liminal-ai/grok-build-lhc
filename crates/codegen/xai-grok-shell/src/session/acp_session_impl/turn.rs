@@ -2117,7 +2117,7 @@ impl SessionActor {
                 })),
             );
             let mut request = request;
-            // LHC-HOOK 4/6: substitute LHC request context (all-LHC or all-native)
+            // LHC-HOOK 4/9: substitute LHC request context (all-LHC or all-native)
             // Cheap atomic first, then per-session registry — no mutex when off.
             // Hook 4 is instrumented-redundant: observe native vs served (G1);
             // observation never changes the served result.
