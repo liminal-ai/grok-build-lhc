@@ -218,14 +218,20 @@ durable representation of the fork.
 
 1. `git fetch upstream && git checkout lhc && git merge upstream/main`
 2. Expected recurring conflict: root `Cargo.toml` is auto-generated and
-   sorted; from Chunk 1 on, our `crates/lhc/grok-lhc-host` members entry
-   (patch 0001) will collide. Resolution rule: take upstream's list, re-add
-   our single entry in sort order. Never hand-resolve anything else in that
-   file.
-3. `scripts/check-lhc-hooks.sh` — all three layers green (or golden layer
-   SKIP before Chunk 1 lands).
-4. Fast-forward `main` to `upstream/main`, push both branches.
-5. Sync commit body records: upstream range, tripwire results, smoke verdict.
+   sorted; our `crates/lhc/grok-lhc-host` members entry will collide.
+   Resolution rule: take upstream's list, re-add our single entry in sort
+   order. Never hand-resolve anything else in that file.
+3. `scripts/check-lhc-hooks.sh` — all layers green.
+4. Fast-forward `main` to `upstream/main`.
+5. **Advance the patch base.** `patches/BASE` names the upstream commit the
+   state diff is generated from; a merge moves the tree past it. Rewrite
+   `BASE` with the new `main` and regenerate `0001-lhc-touchpoints.patch`
+   (`patches/README.md`). This step is **part of the sync**, not cleanup
+   after it — the codex-lhc fork learned this the hard way (its `patch-repro`
+   gate failed at the first real sync for exactly this omission).
+6. Push both branches.
+7. Sync commit body records: upstream range, tripwire results, smoke verdict.
+   Append an entry to the Sync record section above.
 
 ## History-reset recovery drill
 
