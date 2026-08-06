@@ -46,7 +46,7 @@ pub(crate) struct ShellLhcInferenceSampler {
 }
 
 impl ShellLhcInferenceSampler {
-    pub fn new(
+    pub(crate) fn new(
         base_config: SamplerConfig,
         auth_manager: Option<Arc<AuthManager>>,
         session_id: impl Into<String>,

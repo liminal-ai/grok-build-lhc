@@ -2434,7 +2434,7 @@ index 339718e..007c902 100644
          prompt_index_at_compaction: usize,
 diff --git a/crates/codegen/xai-grok-shell/src/session/lhc_inference.rs b/crates/codegen/xai-grok-shell/src/session/lhc_inference.rs
 new file mode 100644
-index 0000000..781ac00
+index 0000000..a080ff2
 --- /dev/null
 +++ b/crates/codegen/xai-grok-shell/src/session/lhc_inference.rs
 @@ -0,0 +1,417 @@
@@ -2486,7 +2486,7 @@ index 0000000..781ac00
 +}
 +
 +impl ShellLhcInferenceSampler {
-+    pub fn new(
++    pub(crate) fn new(
 +        base_config: SamplerConfig,
 +        auth_manager: Option<Arc<AuthManager>>,
 +        session_id: impl Into<String>,
