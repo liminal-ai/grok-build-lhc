@@ -924,6 +924,7 @@ mod tests {
             total_tokens: 12,
             reasoning_tokens: 1,
             cached_prompt_tokens: 4,
+            cache_creation_prompt_tokens: 3,
         };
         let map = token_usage_to_provider_usage(&usage).expect("object");
         assert_eq!(map.get("prompt_tokens"), Some(&json!(10)));
@@ -931,6 +932,7 @@ mod tests {
         assert_eq!(map.get("total_tokens"), Some(&json!(12)));
         assert_eq!(map.get("reasoning_tokens"), Some(&json!(1)));
         assert_eq!(map.get("cached_prompt_tokens"), Some(&json!(4)));
+        assert_eq!(map.get("cache_creation_prompt_tokens"), Some(&json!(3)));
     }
 
     /// Fold: Completed → completed; Cancelled|Error|unknown-tail → aborted.

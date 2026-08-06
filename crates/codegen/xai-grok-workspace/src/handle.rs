@@ -2634,14 +2634,18 @@ impl WorkspaceHandle {
             let overrides_map: HashMap<String, McpClientTimeoutOverrides> = HashMap::new();
             let meta_config_map = McpMetaConfigMap::new();
             let oauth_config_map = McpOAuthConfigMap::new();
+            let ctx = xai_grok_mcp::servers::McpSpawnCtx::for_session(
+                &session_id_owned,
+                &event_writer,
+                xai_grok_mcp::servers::OauthInteractivity::Interactive,
+                None,
+            );
             rt_handle.block_on(xai_grok_mcp::servers::start_mcp_servers(
                 configs,
-                Some(&session_id_owned),
                 &overrides_map,
                 &meta_config_map,
                 &oauth_config_map,
-                &event_writer,
-                xai_grok_mcp::servers::OauthInteractivity::Interactive,
+                &ctx,
             ))
         })
         .await
@@ -3501,16 +3505,30 @@ impl WorkspaceHandle {
                 let mut any_attempt = false;
                 let mut any_success = false;
                 let session_ids = tracker_for_status.known_sessions();
-                for sid in &session_ids {
+                let mut publish = session_ids.clone();
+                for sid in last_sent.keys().filter_map(|k| k.as_ref()) {
+                    if !publish.contains(sid) {
+                        publish.push(sid.clone());
+                    }
+                }
+                let mut closed: Vec<String> = Vec::new();
+                for sid in &publish {
                     let payload = tracker_for_status.snapshot_session(sid);
                     let key = Some(sid.clone());
+                    let ended = !session_ids.iter().any(|s| s == sid);
                     if last_sent.get(&key).map(dedup_key) == Some(dedup_key(&payload)) {
+                        if ended {
+                            closed.push(sid.clone());
+                        }
                         continue;
                     }
                     if let Some(ok) = send_status(&server_conn, payload.clone()).await {
                         any_attempt = true;
                         if ok {
                             any_success = true;
+                            if ended {
+                                closed.push(sid.clone());
+                            }
                             last_sent.insert(key, payload);
                             last_successful_send = std::time::Instant::now();
                         }
@@ -3518,7 +3536,10 @@ impl WorkspaceHandle {
                 }
                 last_sent.retain(|k, _| match k {
                     None => true,
-                    Some(sid) => session_ids.iter().any(|s| s == sid),
+                    Some(sid) => {
+                        session_ids.iter().any(|s| s == sid)
+                            || (any_success && !closed.contains(sid))
+                    }
                 });
                 let payload = tracker_for_status.snapshot();
                 let needs_send = last_sent.get(&None).map(dedup_key) != Some(dedup_key(&payload));
@@ -7602,6 +7623,7 @@ pub(crate) mod tests {
                 timeout_ms: 10_000,
                 source_dir: std::path::PathBuf::from("/tmp"),
                 extra_env: std::collections::HashMap::new(),
+                layer: xai_grok_hooks::config::HookProvenance::File,
             };
             handle.shared.hook_registry.write().append_specs(vec![spec]);
         }

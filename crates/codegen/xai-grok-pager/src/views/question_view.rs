@@ -24,6 +24,7 @@ pub use xai_grok_tools::implementations::grok_build::ask_user_question::{
 
 use unicode_width::UnicodeWidthStr;
 
+use crate::input::key::RowWalk;
 use crate::render::line_utils::{byte_offset_at_width, truncate_line, truncate_str};
 use crate::render::wrapping::word_wrap_lines_with_joiners;
 use crate::syntax::get_syntect;
@@ -54,6 +55,19 @@ pub enum QuestionSelection {
     Single(Option<usize>),
     /// Multi-choice: zero or more options toggled on.
     Multi(HashSet<usize>),
+}
+
+/// A cursor move within one question's answer rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorMotion {
+    Next,
+    Prev,
+    HalfPageDown,
+    HalfPageUp,
+    PageDown,
+    PageUp,
+    First,
+    Last,
 }
 
 /// Focus mode within the question view.
@@ -88,19 +102,6 @@ pub enum LocalQuestionKind {
         /// path back to `dispatch_fork_resolved` without a global mailbox.
         directive: Option<String>,
     },
-    /// Shown on first prompt from a non-project directory.
-    ProjectSelect {
-        /// Index-aligned with the leading question options. Direct lookup by
-        /// selection index.
-        resolved_paths: Vec<std::path::PathBuf>,
-        /// The original cwd (fallback on cancel/skip).
-        original_cwd: std::path::PathBuf,
-        /// The prompt text the user typed (stashed to re-send after selection).
-        stashed_prompt: String,
-        /// Option index of the "Don't ask me again" entry. Selecting it
-        /// continues in `original_cwd` and persists the opt-out.
-        dont_ask_index: usize,
-    },
     /// Modal opened by `/new` to resolve the worktree question.
     /// On submit, the selected option index is translated into an
     /// [`crate::app::actions::Action::NewSessionAnswered`].
@@ -131,6 +132,7 @@ pub enum LocalQuestionKind {
         target: crate::app::actions::DoctorFixTarget,
         plan: Box<crate::diagnostics::FixPlan>,
     },
+    DeleteCurrentSession,
 }
 
 // ── State ──────────────────────────────────────────────────────────────
@@ -200,6 +202,11 @@ pub struct QuestionViewState {
     /// while the user is answering questions — the time spent in the
     /// question view is subtracted from the turn elapsed display.
     pub opened_at: Instant,
+    /// Wall-clock twin of `opened_at` (UTC ms). `Instant` is suspend-blind,
+    /// so a pause netted against the wall-anchored turn span must itself be
+    /// measured on the wall clock, or a suspend during an open question
+    /// would read as worked time.
+    pub opened_at_wall_ms: i64,
     /// When `true`, the freeform "Other" input row is hidden. Used by
     /// locally-driven questions (e.g. credit-limit upsell) that only
     /// offer fixed options with no free-text fallback.
@@ -271,6 +278,7 @@ impl QuestionViewState {
             bottom_panel_index: None,
             local_kind: None,
             opened_at: Instant::now(),
+            opened_at_wall_ms: chrono::Utc::now().timestamp_millis(),
             no_freeform: false,
         }
     }
@@ -323,6 +331,40 @@ impl QuestionViewState {
             .get(self.active_tab)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Move the cursor within the active question, clamped at both ends.
+    pub fn move_cursor(&mut self, motion: CursorMotion) {
+        let last = self.total_items(self.active_tab).saturating_sub(1);
+        let cursor = self.cursor();
+        let target = match motion {
+            CursorMotion::Next => cursor + 1,
+            CursorMotion::Prev => cursor.saturating_sub(1),
+            CursorMotion::HalfPageDown => cursor + (last / 2).max(1),
+            CursorMotion::HalfPageUp => cursor.saturating_sub((last.max(1) / 2).max(1)),
+            CursorMotion::PageDown => cursor + last.max(1),
+            CursorMotion::PageUp => cursor.saturating_sub(last.max(1)),
+            CursorMotion::First => 0,
+            CursorMotion::Last => last,
+        };
+        self.set_cursor(target.min(last));
+    }
+
+    /// Walk one answer row of the active question, wrapping at both ends.
+    pub fn walk_cursor(&mut self, walk: RowWalk) {
+        let target = walk.step(self.cursor(), self.total_items(self.active_tab));
+        self.set_cursor(target);
+    }
+
+    pub fn clear_selection(&mut self, q_idx: usize) {
+        match self.selections.get_mut(q_idx) {
+            Some(QuestionSelection::Multi(selected)) => selected.clear(),
+            Some(QuestionSelection::Single(selected)) => *selected = None,
+            None => {}
+        }
+        if let Some(freeform_selected) = self.per_question_freeform_selected.get_mut(q_idx) {
+            *freeform_selected = false;
+        }
     }
 
     /// Set cursor position for the active question, clamped to valid range.
@@ -802,15 +844,13 @@ impl QuestionViewState {
     }
 
     /// True when the active tab has any option selected, or its free-form
-    /// answer marked selected. Drives the graduated `Esc` back-out: when
-    /// nothing is selected, `Esc` (which only clears the selection) has
-    /// nothing to do, so it can fall through to the dashboard back-out.
+    /// answer marked selected.
     pub fn active_tab_has_selection(&self) -> bool {
-        let idx = self.active_tab;
-        let option_selected = !self.selected_labels(idx).is_empty();
+        let q_idx = self.active_tab;
+        let option_selected = !self.selected_labels(q_idx).is_empty();
         let freeform_selected = self
             .per_question_freeform_selected
-            .get(idx)
+            .get(q_idx)
             .copied()
             .unwrap_or(false);
         option_selected || freeform_selected

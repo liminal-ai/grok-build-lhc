@@ -110,7 +110,10 @@ async fn shutdown_workflows(session: &SessionActor) {
         return;
     }
     match tokio::time::timeout(std::time::Duration::from_secs(2), ack).await {
-        Ok(Ok(())) => {}
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(error))) => {
+            tracing::warn!(%error, "workflow shutdown persistence flush failed")
+        }
         Ok(Err(_)) => {
             tracing::warn!("workflow shutdown persistence actor dropped flush ack")
         }
@@ -412,7 +415,17 @@ pub(super) async fn run_session(
                     }
                     let (turn_succeeded, suppress_goal_continuation, infra_pause_message) =
                         SessionActor::post_turn_goal_degradation_plan(&result);
-                    session.handle_completion(prompt_id, result).await;
+                    // A `RemovedFromQueue` completion never started a turn, so
+                    // there is nothing to summarize below.
+                    let turn_ran = !matches!(
+                        &result,
+                        Ok(PromptTurnOk {
+                            completion_kind: PromptCompletionKind::RemovedFromQueue,
+                            ..
+                        })
+                    );
+                    let completed_prompt_id = prompt_id.clone();
+                    let owned_completion = session.handle_completion(prompt_id, result).await;
                     // Drain any monitor events that were routed to the mid-turn buffer
                     // but arrived after the turn ended (race between is_turn_active and buffer push).
                     session.drain_monitor_buffer_to_pending().await;
@@ -433,11 +446,9 @@ pub(super) async fn run_session(
                     // aimed at the turn that just completed. That holds
                     // because this arm runs in the same serialized actor loop
                     // as `SessionCommand::Interject` (no live turn's buffer
-                    // can be stolen mid-stream), and the Cancel arm clears
-                    // the buffer before its completion arrives. If the
-                    // select arms are ever reordered or the Cancel clear
-                    // moves, re-audit this flush.
-                    if session.flush_stranded_interjections().await {
+                    // can be stolen mid-stream), and both cancel paths drain
+                    // the buffer before their completion arrives.
+                    if session.flush_stranded_interjections().await > 0 {
                         tracing::info!("Flushed stranded interjection(s) into prompt turns");
                     }
                     SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
@@ -457,6 +468,17 @@ pub(super) async fn run_session(
                         tokio::task::spawn_local(async move {
                             s.maybe_fire_laziness_check().await;
                         });
+                    }
+                    // Per-turn dashboard summary (display-only side-call);
+                    // spawned so the actor loop keeps accepting commands.
+                    // `turn_succeeded` keeps cancelled/errored/refused turns
+                    // from triggering a fresh model call (a user who hit
+                    // Ctrl+C wants model activity to stop), and
+                    // `owned_completion` keeps a stale completion — a turn
+                    // the Cancel path already finalized — from summarizing
+                    // work the user aborted.
+                    if turn_ran && turn_succeeded && owned_completion {
+                        session.restart_turn_summary(completed_prompt_id);
                     }
                 }
                 maybe_cmd = cmd_rx.recv() => {
@@ -666,7 +688,23 @@ pub(super) async fn run_session(
                                 None => (None, None),
                             };
                             let cancel_for_send_now = session
-                                .queue_input(prompt_blocks, prompt_id, prompt_mode, trace_gcs_config, artifact_tracker, client_identifier, screen_mode, verbatim, json_schema, send_now, task_wake_fallback, tool_overrides_update, respond_to, persist_ack, parsed_prompt_tx)
+                                .queue_input(QueueInputRequest {
+                                    prompt_blocks,
+                                    prompt_id,
+                                    prompt_mode,
+                                    trace_gcs_config,
+                                    artifact_tracker,
+                                    client_identifier,
+                                    screen_mode,
+                                    verbatim,
+                                    json_schema,
+                                    send_now,
+                                    task_wake_fallback,
+                                    tool_overrides_update,
+                                    respond_to,
+                                    persist_ack,
+                                    parsed_prompt_tx,
+                                })
                                 .await;
                             if cancel_for_send_now {
                                 session.cancel_turn_for_send_now(&mut replay_buffer).await;
@@ -889,7 +927,7 @@ pub(super) async fn run_session(
                                     // Cap to prevent unbounded growth during long tool calls.
                                     const MAX_BUFFER_EVENTS: usize = 50;
                                     buffer.push_capped(
-                                        xai_grok_tools::implementations::grok_build::task::types::MonitorEventNotification {
+                                        xai_grok_tools::implementations::grok_build::monitor::types::MonitorEventNotification {
                                             task_id: task_id.clone(),
                                             event_text,
                                             // Tag with this session's id so the
@@ -956,12 +994,7 @@ pub(super) async fn run_session(
                             }
                             SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
                         }
-                        SessionCommand::Cancel {
-                            cancel_subagents,
-                            kill_background_tasks,
-                            rewind_if_pristine,
-                            trigger,
-                        } => {
+                        SessionCommand::Cancel(options) => {
                             // Flush the actor-owned replay buffer before tearing
                             // down the running turn so any streamed chunks
                             // (notably AgentThoughtChunk reasoning text) still
@@ -974,18 +1007,17 @@ pub(super) async fn run_session(
                             if let Some(notification) = replay_buffer.flush() {
                                 session.emit_buffered(notification).await;
                             }
-                            // Clear pending interjections — the turn is being
-                            // cancelled, so they have no active turn to inject into.
+                            // Clear, don't flush: converting interjections to
+                            // prompt turns would restart the model after a stop.
                             session.pending_interjections.clear();
-                            let suppress_task_wakes = trigger.as_deref() == Some("ctrl_c");
-                            session
-                                .cancel_running_task(
-                                    cancel_subagents,
-                                    kill_background_tasks,
-                                    rewind_if_pristine,
-                                    trigger,
-                                )
-                                .await;
+                            // Do not abort turn summary here. Summaries spawn only
+                            // after a successful turn, so an in-flight call describes
+                            // that prior success. Cancel targets the current turn;
+                            // under show-until-replaced the prior line should still
+                            // finish. New real prompts and rewind abort separately.
+                            let suppress_task_wakes =
+                                matches!(options.trigger, Some(crate::session::CancelTrigger::CtrlC));
+                            session.cancel_running_task(options).await;
 
                             // Auto-pause active goal on Ctrl+C so timers stop
                             // and the pager shows "paused" instead of "active".
@@ -1446,11 +1478,16 @@ pub(super) async fn run_session(
 
                             let session_for_mcp = session.clone();
                             let sname = server_name.clone();
+                            let session_cwd = session.session_info.cwd.clone();
                             tokio::task::spawn_local(async move {
                                 session_for_mcp.ensure_mcp_tools_initialized().await;
-                                if let Err(e) = crate::util::config::save_mcp_server_enabled(
-                                    &sname, enabled,
-                                ).await {
+                                if let Err(e) = crate::util::config::save_mcp_server_enabled_in(
+                                    &sname,
+                                    enabled,
+                                    std::path::Path::new(&session_cwd),
+                                )
+                                .await
+                                {
                                     tracing::warn!(
                                         server = sname.as_str(),
                                         error = %e,
@@ -1778,8 +1815,7 @@ pub(super) async fn run_session(
                                 .send((availability.workflows, availability.workflow_management));
                         }
                         SessionCommand::ListAvailableCommands { respond_to } => {
-                            let bridge = session.agent.borrow().tool_bridge().clone();
-                            let skills = bridge.slash_skills().await;
+                            let skills = session.slash_skills_for_resolve().await;
                             let tool_names = session.registered_tool_names().await;
                             let has_runs = !session.workflow_tracker().await.lock().list().is_empty();
                             let availability =
@@ -2093,7 +2129,7 @@ pub(super) async fn run_session(
                                 PersistenceMsg::GitHead { commit, branch },
                             );
                         }
-                        SessionCommand::Shutdown => {
+                        SessionCommand::Shutdown(kind) => {
                             shutdown_workflows(&session).await;
                             // Flush the actor-owned replay buffer so any
                             // streamed chunks still pending at shutdown
@@ -2105,6 +2141,22 @@ pub(super) async fn run_session(
                             // Cancel, CopyFile, and FlushComplete arms.
                             if let Some(notification) = replay_buffer.flush() {
                                 session.emit_buffered(notification).await;
+                            }
+                            // Session is ending: do not leave a side-call
+                            // holding an Arc into this actor.
+                            session.abort_turn_summary();
+                            // This arm returns; an unanswered turn would race
+                            // teardown and report `EndTurn` for unfinished work.
+                            if kind == crate::session::ShutdownKind::CancelRunningTurn {
+                                session
+                                    .cancel_running_task(crate::session::CancelOptions {
+                                        cancel_subagents: true,
+                                        kill_background_tasks: true,
+                                        rewind_if_no_output: false,
+                                        trigger: Some(crate::session::CancelTrigger::Shutdown),
+                                        user_initiated: false,
+                                    })
+                                    .await;
                             }
                             // Drop any queued synthetic auto-wake prompts and pending
                             // notifications before running hooks. Without this, a

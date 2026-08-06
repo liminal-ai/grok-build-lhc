@@ -23,7 +23,7 @@ fn test_actor_with_remote_sync(
     remote_sync: Option<RemoteSync>,
 ) -> ActorGuard {
     let (tx, rx) = mpsc::unbounded_channel();
-    let summary_tx = tx.clone();
+    let (disk_full_tx, disk_full_rx) = tokio::sync::watch::channel(false);
     let sampling_client = OaiCompatClient::new(xai_grok_sampler::SamplerConfig::default()).unwrap();
     let task = tokio::spawn(
         SessionPersistence {
@@ -32,21 +32,25 @@ fn test_actor_with_remote_sync(
             pending_notification: None,
             rx,
             remote_sync,
+            // Resumed-style actor for these tests; upgrade backfill is fresh-only.
+            created_fresh: false,
             relay_sync: None,
             summary: crate::session::summary::SummaryGenerator::new(
                 crate::session::summary::SummaryConfig {
                     sampling_client,
                     model: String::new(),
-                    persistence_tx: summary_tx,
+                    persistence_tx: tx.downgrade(),
                 },
             ),
             registry_title_sync: None,
             gateway: None,
+            disk_full_tx,
+            disk_full_notified: false,
         }
         .run(),
     );
     ActorGuard {
-        handle: PersistenceHandle { tx, noop: false },
+        handle: PersistenceHandle::from_parts_for_test(tx, disk_full_rx),
         task,
     }
 }
@@ -62,6 +66,37 @@ fn notification(info: &Info, text: &str) -> acp::SessionNotification {
 
 fn neutral_update(info: &Info, text: &str) -> SessionUpdate {
     SessionUpdate::Acp(Box::new(notification(info, text)))
+}
+
+#[tokio::test]
+async fn writeback_backfill_is_fresh_only_and_acp_only() {
+    let info = Info {
+        id: acp::SessionId::new("wb-backfill"),
+        cwd: "/test".into(),
+    };
+
+    // Fresh session: every ACP update is queued to the writeback sync.
+    let (sync, mut observed) = RemoteSync::test_observer();
+    let updates = vec![neutral_update(&info, "a"), neutral_update(&info, "b")];
+    let n = backfill_updates_to_sync(true, updates, &sync);
+    assert_eq!(n, 2, "a fresh session backfills its full local ACP history");
+    for _ in 0..2 {
+        tokio::time::timeout(std::time::Duration::from_secs(1), observed.recv())
+            .await
+            .expect("backfilled notification not observed within 1s")
+            .expect("observer channel closed unexpectedly");
+    }
+
+    // Resumed session: nothing is backfilled (prior history may already be synced).
+    let (sync2, mut observed2) = RemoteSync::test_observer();
+    let n2 = backfill_updates_to_sync(false, vec![neutral_update(&info, "a")], &sync2);
+    assert_eq!(n2, 0, "a resumed session is forward-only, no backfill");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), observed2.recv())
+            .await
+            .is_err(),
+        "resumed session must not re-send any prior history",
+    );
 }
 
 fn break_summary_writes(dir: &std::path::Path) {
@@ -311,5 +346,95 @@ async fn durable_append_drains_pending_update_in_fifo_order() {
         })
         .collect::<Vec<_>>();
     assert_eq!(texts, ["before", "durable"]);
+    actor.stop().await;
+}
+
+async fn flush_ack(handle: &PersistenceHandle) -> io::Result<()> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    handle
+        .tx
+        .send(PersistenceMsg::FlushAndAck { respond_to: tx })
+        .unwrap();
+    rx.await.unwrap()
+}
+
+async fn probe_writable(handle: &PersistenceHandle) -> io::Result<()> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    handle
+        .tx
+        .send(PersistenceMsg::ProbeWritable { respond_to: tx })
+        .unwrap();
+    rx.await.unwrap()
+}
+
+#[tokio::test]
+async fn successful_append_clears_disk_full_latch() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("disk-full-clear"),
+        cwd: "/test".into(),
+    };
+    let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let fail_flag = fail.clone();
+    let storage = Arc::new(JsonlStorageAdapter::with_update_append_probe(
+        dir.path().to_path_buf(),
+        move |_| {
+            if fail_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(io::Error::from(io::ErrorKind::StorageFull))
+            } else {
+                Ok(())
+            }
+        },
+    ));
+    storage
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let actor = test_actor(info.clone(), storage);
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Update(neutral_update(&info, "chunk")))
+        .unwrap();
+    assert!(flush_ack(&actor.handle).await.is_err());
+    assert!(actor.handle.is_disk_full());
+
+    fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Update(neutral_update(&info, "recovered")))
+        .unwrap();
+    assert!(flush_ack(&actor.handle).await.is_ok());
+    assert!(!actor.handle.is_disk_full());
+    actor.stop().await;
+}
+
+#[tokio::test]
+async fn successful_probe_writable_clears_disk_full_latch() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = Info {
+        id: acp::SessionId::new("disk-full-probe"),
+        cwd: "/test".into(),
+    };
+    let storage = Arc::new(JsonlStorageAdapter::with_update_append_probe(
+        dir.path().to_path_buf(),
+        |_| Err(io::Error::from(io::ErrorKind::StorageFull)),
+    ));
+    storage
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let actor = test_actor(info.clone(), storage);
+    actor
+        .handle
+        .tx
+        .send(PersistenceMsg::Update(neutral_update(&info, "chunk")))
+        .unwrap();
+    assert!(flush_ack(&actor.handle).await.is_err());
+    assert!(actor.handle.is_disk_full());
+
+    assert!(probe_writable(&actor.handle).await.is_ok());
+    assert!(!actor.handle.is_disk_full());
     actor.stop().await;
 }

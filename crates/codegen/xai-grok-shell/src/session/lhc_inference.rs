@@ -34,7 +34,7 @@ use crate::sampling::{SamplerConfig, SamplingError};
 const LHC_INFERENCE_MODEL_ENV: &str = "GROK_LHC_INFERENCE_MODEL";
 
 /// Inference sampler wired at LHC tee/open (hook 2).
-pub struct ShellLhcInferenceSampler {
+pub(crate) struct ShellLhcInferenceSampler {
     /// Template config (URL, backend, headers). Model is **not** taken from
     /// `base_config.model` for derivation calls — see [`Self::model_slug`].
     base_config: SamplerConfig,
@@ -65,14 +65,14 @@ impl ShellLhcInferenceSampler {
         }
     }
 
-    pub fn into_arc(self) -> Arc<dyn LhcInferenceSampler> {
+    pub(crate) fn into_arc(self) -> Arc<dyn LhcInferenceSampler> {
         Arc::new(self)
     }
 
     /// Resolved derivation model: env/config override, else `grok-4.5`.
     ///
     /// Never falls back to the session's `base_config.model`.
-    pub fn model_slug(&self) -> String {
+    pub(crate) fn model_slug(&self) -> String {
         if let Some(ref m) = self.dedicated_model {
             return m.clone();
         }
@@ -87,7 +87,7 @@ impl ShellLhcInferenceSampler {
     }
 
     /// Fixed thinking level for derivation calls (ruling).
-    pub fn thinking_level(&self) -> ReasoningEffort {
+    pub(crate) fn thinking_level(&self) -> ReasoningEffort {
         ReasoningEffort::Low
     }
 
@@ -171,7 +171,7 @@ impl ShellLhcInferenceSampler {
 
 fn classify_sampling_error(err: &SamplingError) -> LhcInferenceErrorKind {
     match err {
-        SamplingError::Auth(_) => LhcInferenceErrorKind::Auth,
+        SamplingError::Auth { .. } => LhcInferenceErrorKind::Auth,
         SamplingError::IdleTimeout { .. } => LhcInferenceErrorKind::Timeout,
         SamplingError::EmptyResponse { .. } | SamplingError::MaxTokensTruncation => {
             LhcInferenceErrorKind::Refusal

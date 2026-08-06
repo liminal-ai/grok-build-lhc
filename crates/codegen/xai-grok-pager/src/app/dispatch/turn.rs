@@ -93,10 +93,13 @@ pub(super) fn dispatch_cancel_turn(app: &mut AppView) -> Vec<Effect> {
                 rewind_if_pristine: false,
             }];
         }
-        if !agent.session.state.is_turn_running() {
+        if !agent.session.state.is_turn_running() && !agent.session.state.is_compact_running() {
             return vec![];
         }
-        if let Some(stop) = resolved_pref {
+        if agent.session.state.is_compact_running() {
+            // No subagent picker for `/compact` — just stop the generation.
+            resolved_pref.or(Some(true))
+        } else if let Some(stop) = resolved_pref {
             Some(stop)
         } else {
             // Check all running subagents, not just those from the current turn.
@@ -183,6 +186,22 @@ pub(super) fn do_cancel_turn(app: &mut AppView, cancel_subagents: bool) -> Vec<E
     let Some(agent) = app.agents.get_mut(&id) else {
         return vec![];
     };
+    if agent.session.state.is_compact_running() {
+        agent.session.cancel_compact_command();
+        agent.cancel_turn_view = None;
+        agent.cancel_turn_buttons.clear();
+        drain_permission_queue(agent);
+        let Some(session_id) = agent.session.session_id.clone() else {
+            return vec![];
+        };
+        agent.clear_send_now_expectation();
+        return vec![Effect::CancelTurn {
+            session_id,
+            cancel_subagents,
+            trigger: agent.cancel_trigger_hint.take(),
+            rewind_if_pristine: false,
+        }];
+    }
     if !agent.session.state.is_turn_running() {
         return vec![];
     }
@@ -388,13 +407,11 @@ pub(crate) fn reconcile_overdue_turn_ends(app: &mut AppView) -> Option<Vec<Effec
                 // Rate limits drive a dedicated driver UX via the retry
                 // notifications (already delivered); no extra marker.
                 Some("rate_limit") => None,
-                Some("error") => Some(SessionEvent::TurnFailed {
-                    error: pending
-                        .agent_result
-                        .clone()
-                        .unwrap_or_else(|| "unknown error".into()),
-                    elapsed: Some(elapsed),
-                }),
+                Some("error") => crate::app::turn_completion::turn_failed_event(
+                    &agent.scrollback,
+                    pending.agent_result.as_deref(),
+                    elapsed,
+                ),
                 _ => Some(SessionEvent::TurnCompleted {
                     elapsed: Some(elapsed),
                 }),
@@ -540,12 +557,6 @@ pub(super) fn dispatch_demote_to_background(app: &mut AppView) -> Vec<Effect> {
         tool_call_id,
     }]
 }
-
-// TODO: Add dispatch_cancel_command() once xai-grok-shell supports proper
-// server-side cancellation for /compact. Currently, the compaction handler
-// uses spawn_local with no cancellation token, and blindly replaces the
-// conversation history when done — so prompts sent after a client-side
-// cancel would be lost.
 
 // TaskResult handlers.
 

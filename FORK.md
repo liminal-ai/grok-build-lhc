@@ -26,7 +26,8 @@ certification) remains.
 - `crates/lhc/vendor/long-horizon-context/` — submodule, pinned to certified
   commits of the `lhc-rs-port` branch only (Phase 2 acceptance `358c8d1` or
   later). Never copy the port in; bump the pin and record it here.
-  Current pin: `614543a`.
+  Current pin: `a3deafd` (band-walk skip + brief fallback cap; same pin as the
+  codex-lhc fork, gate-passed there 2026-08-06).
 - `patches/` — every core touchpoint as a re-appliable `format-patch` file
   (see `patches/README.md`). The history-reset recovery path.
 - `scripts/check-lhc-hooks.sh` — the three-layer tripwire (sentinel count,
@@ -171,6 +172,39 @@ compact commits and **before** `replace_conversation_for_compaction`, then
 reopen the real host with old native and confirm the same idempotency.
 The production choke still uses `params: None`; live Replace must produce
 bands under real budgets for that kill test to be meaningful.
+
+## Sync record
+
+### 2026-08-06 — `6e38642..a5589e9` (11 squash commits, ~119k insertions)
+
+First real upstream sync on `lhc`. Ancestry intact (no history reset). Four
+conflicts, all in fork-touched files, resolved per contract:
+
+- `session/mod.rs` — took upstream's `pub(crate)` on `inference_metrics`,
+  kept hook 6.
+- `session/compaction.rs` — hook 5 writer choke stays first; upstream's new
+  compaction cancel scope (`self.compaction.cancel.enter()`) enters after it,
+  on the native path only.
+- `session/slash_commands.rs` — kept `LhcSlashOp` block (upstream side empty).
+- `config/tests.rs` — kept both our `[lhc]` config tests and upstream's new
+  `from_remote_gated_requires_xai_auth_for_writeback`.
+
+Sync repairs (in the merge commit):
+
+- `SamplingError::Auth` became a struct variant → `{ .. }` match in
+  `lhc_inference.rs`; visibility tightened to `pub(crate)` for upstream's
+  `unreachable_pub` lint.
+- Upstream `TokenUsage` gained `cache_creation_prompt_tokens` — production
+  mapping serializes verbatim (field flows through automatically); adapter
+  test initializer + assertion extended.
+- Upstream's own `tool_layer_images_bridge_tests.rs` (squash `ed6d543`)
+  landed without `use base64::Engine` in scope — does not compile as
+  published; added the function-local import (upstream bug, not fork drift).
+
+Vendor pin advanced `614543a` → `a3deafd` in the same sync. Tripwire: ALL
+GREEN (sentinel 10/10, compile, fmt ×2, unit 164, golden 5, certification 97,
+chunk3b 10, pin policy). Patch series regenerated (first regen to include the
+G1/G2 hook commits).
 
 ## Upstream model (read before your first sync)
 

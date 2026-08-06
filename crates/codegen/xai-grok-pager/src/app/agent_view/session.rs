@@ -19,6 +19,13 @@ use ratatui::layout::Rect;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 impl AgentView {
+    /// Live mutation of the turn-summary display field. Always bumps
+    /// [`Self::last_turn_summary_gen`] so a concurrent disk hydrate that
+    /// captured an older generation cannot overwrite this write.
+    pub(crate) fn set_last_turn_summary(&mut self, summary: Option<String>) {
+        self.last_turn_summary = summary;
+        self.last_turn_summary_gen = self.last_turn_summary_gen.wrapping_add(1);
+    }
     /// Bind this view to a root session id, resetting the per-session
     /// reconnect cursor and both dedup highwaters (ACP + xAI) when the id
     /// actually changes — all three are meaningless against another session's
@@ -99,6 +106,7 @@ impl AgentView {
             session_reload: None,
             unexpected_replay_drops: 0,
             replayed_terminal_prompts: HashSet::new(),
+            failed_wake_marker_for: None,
             active_pane: ActivePane::Prompt,
             prompt_mode: PromptMode::Normal,
             prompt_input_mode: PromptInputMode::Normal,
@@ -116,6 +124,10 @@ impl AgentView {
             context_state: None,
             chat_kind: false,
             app_chat_mode: false,
+            #[cfg(feature = "local-workspace")]
+            workspace_mode: crate::views::welcome::WelcomeWorkspaceMode::Sandbox,
+            #[cfg(feature = "local-workspace")]
+            workspace_mode_cli_locked: false,
             credit_balance: None,
             auto_topup: None,
             goal_state: None,
@@ -125,14 +137,15 @@ impl AgentView {
             cleared_workflow_runs: std::collections::HashSet::new(),
             show_workflows: false,
             workflows_view: crate::views::workflows::WorkflowsViewState::default(),
-            parked_wait_marker_for: None,
             pending_stop_hooks: None,
             last_cleared_goal_id: None,
             show_goal_detail: false,
             turn_start_ms: None,
+            turn_start_ms_prompt: None,
             turn_started_at: None,
             first_activity_logged_for: None,
             turn_paused_duration: std::time::Duration::ZERO,
+            turn_paused_wall: std::time::Duration::ZERO,
             self_interjection_ids: std::collections::HashSet::new(),
             last_active_at: Some(Instant::now()),
             current_branch: None,
@@ -194,6 +207,7 @@ impl AgentView {
             hit_plan_button: Default::default(),
             hit_plan_approval_status: Default::default(),
             hit_follow_indicator: Default::default(),
+            hit_response_top_indicator: Default::default(),
             hit_cwd: Default::default(),
             hit_cancel_button: Default::default(),
             hit_watching_cue: Default::default(),
@@ -262,6 +276,7 @@ impl AgentView {
             deferred_session_mode: None,
             pending_extensions_fetch: false,
             in_dashboard_overlay: false,
+            overlay_can_cycle: false,
             mcp_init_progress: None,
             acp_synced_generation: 0,
             hovered_permission_item: None,
@@ -270,6 +285,7 @@ impl AgentView {
             next_perm_req_id: 0,
             permission_stashed_prompt: None,
             permission_stashed_pane: None,
+            permission_pattern_edit: None,
             plan_approval_view: None,
             latest_inline_plan_content: None,
             plan_comments: Vec::new(),
@@ -296,7 +312,9 @@ impl AgentView {
             is_subagent_view: false,
             hit_subagent_frame_close: Default::default(),
             sharing_enabled: false,
+            scheduler_background_loops: None,
             billing_surface_visible: false,
+            usage_command_visible: true,
             input_log: crate::input_log::InputRingBuffer::new(),
             esc_pressed_at: None,
             rewind_suppress_deadline: None,
@@ -306,11 +324,14 @@ impl AgentView {
             pending_recap_entry: None,
             display_name: None,
             generated_session_title: None,
+            last_turn_summary: None,
+            last_turn_summary_gen: 0,
             pending_effects: Vec::new(),
             paste_probe_in_flight: 0,
             deferred_send: None,
             pending_turn_end_reconcile: None,
             expect_send_now_cancel: None,
+            front_message_committed: true,
             optimistic_queue_ids: std::collections::HashSet::new(),
             send_now_awaiting_confirm: None,
             send_now_painted_blocks: std::collections::HashMap::new(),
@@ -347,16 +368,34 @@ impl AgentView {
         child_view.mark_as_subagent_view();
         self.subagent_views.insert(child_sid, child_view);
     }
-    /// Clear `turn_started_at` and stamp `last_active_at` to "now".
+    /// Clear the turn-timing fields and stamp `last_active_at` to "now".
     ///
     /// Call this from every site that ends a turn (success, failure,
-    /// cancellation, reconnect cleanup). Centralised so the two
-    /// fields cannot drift apart at the ~10 termination call sites
-    /// across `dispatch.rs` and `event_loop.rs`.
+    /// cancellation, reconnect cleanup). Centralised so the fields cannot
+    /// drift apart at the ~10 termination call sites across `dispatch.rs`
+    /// and `event_loop.rs`. The wall anchor is cleared so a later turn that
+    /// reuses a prompt id (stash-and-resubmit after `/login`) can never
+    /// wall-max against a previous attempt's anchor in
+    /// [`honest_turn_elapsed`].
     pub fn mark_turn_finished(&mut self) {
         self.turn_started_at = None;
         self.turn_paused_duration = std::time::Duration::ZERO;
+        self.turn_paused_wall = std::time::Duration::ZERO;
+        self.turn_start_ms = None;
+        self.turn_start_ms_prompt = None;
         self.last_active_at = Some(Instant::now());
+    }
+    /// Absorb a closing/replaced question view's open span into the turn's
+    /// pause totals, on both clocks — a close site that updated only the
+    /// `Instant` pause would resurface suspend time as worked time in
+    /// [`honest_turn_elapsed`].
+    pub(crate) fn record_question_pause(
+        &mut self,
+        qv: &crate::views::question_view::QuestionViewState,
+    ) {
+        self.turn_paused_duration += qv.opened_at.elapsed();
+        self.turn_paused_wall +=
+            wall_since_ms(qv.opened_at_wall_ms, chrono::Utc::now().timestamp_millis());
     }
     /// Invalidate and clear a minimal `/btw` lifecycle at a session boundary.
     pub(crate) fn clear_minimal_btw_lifecycle(&mut self) {
@@ -374,6 +413,7 @@ impl AgentView {
         self.unexpected_replay_drops = 0;
         self.pending_stop_hooks = None;
         self.clear_send_now_expectation();
+        self.front_message_committed = true;
         self.optimistic_queue_ids.clear();
         self.send_now_awaiting_confirm = None;
         self.send_now_painted_blocks.clear();
@@ -461,6 +501,7 @@ impl AgentView {
         {
             self.expect_send_now_cancel = None;
         }
+        self.front_message_committed = false;
         self.session.start_turn(&mut self.scrollback);
     }
     /// Adopt the in-flight turn another client is driving, conveyed by the
@@ -470,6 +511,7 @@ impl AgentView {
     pub(crate) fn adopt_running_prompt(&mut self, prompt_id: String) {
         self.start_turn_boundary(Some(&prompt_id));
         self.session.tracker.clear_user_echo_skip();
+        self.front_message_committed = true;
         self.session.current_prompt_id = Some(prompt_id.clone());
         self.turn_started_at = Some(Instant::now());
         self.scrollback.enable_follow_with_preserve();
@@ -634,18 +676,26 @@ impl AgentView {
         self.reset_follow_ups_for_reload();
         dropped_heavy
     }
-    /// Effective turn elapsed time, excluding time spent in question views.
-    ///
-    /// Subtracts both the accumulated `turn_paused_duration` (from previously
-    /// closed question views) and the time elapsed since the current question
-    /// view opened (if one is active).
+    /// Effective turn elapsed time, excluding time spent in question views
+    /// (accumulated pauses plus the currently open one, on both clocks).
     pub fn turn_elapsed(&self) -> Option<std::time::Duration> {
-        let raw = self.turn_started_at?.elapsed();
-        let mut paused = self.turn_paused_duration;
+        let instant_elapsed = self.turn_started_at?.elapsed();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut instant_paused = self.turn_paused_duration;
+        let mut wall_paused = self.turn_paused_wall;
         if let Some(qv) = &self.question_view {
-            paused += qv.opened_at.elapsed();
+            instant_paused += qv.opened_at.elapsed();
+            wall_paused += wall_since_ms(qv.opened_at_wall_ms, now_ms);
         }
-        Some(raw.saturating_sub(paused))
+        Some(honest_turn_elapsed(TurnElapsedParams {
+            instant_elapsed,
+            instant_paused,
+            wall_anchor_ms: self.turn_start_ms,
+            wall_paused,
+            anchor_prompt: self.turn_start_ms_prompt.as_deref(),
+            current_prompt: self.session.current_prompt_id.as_deref(),
+            now_ms,
+        }))
     }
     /// Turn activity for the status spinner, with the implicit "no activity"
     /// gap during a running inference turn resolved into an explicit
@@ -916,6 +966,12 @@ impl AgentView {
             .slash_controller
             .set_billing_surface_visible(visible);
     }
+    pub fn set_usage_command_visible(&mut self, visible: bool) {
+        self.usage_command_visible = visible;
+        self.prompt
+            .slash_controller
+            .set_usage_command_visible(visible);
+    }
     /// Replace the restricted slash-command deny list in this agent's
     /// registry (e.g. `/usage` denied on the free / X Basic tiers). Deny
     /// wins over every `set_*_visible` gate.
@@ -943,6 +999,7 @@ impl AgentView {
         &mut self,
         sharing_enabled: bool,
         billing_surface_visible: bool,
+        usage_command_visible: bool,
         chat_mode: bool,
         screen_mode: crate::app::ScreenMode,
         announcements: &[xai_grok_announcements::RemoteAnnouncement],
@@ -950,6 +1007,7 @@ impl AgentView {
     ) {
         self.set_sharing_enabled(sharing_enabled);
         self.set_billing_surface_visible(billing_surface_visible);
+        self.set_usage_command_visible(usage_command_visible);
         self.app_chat_mode = chat_mode;
         self.prompt.set_screen_mode(screen_mode);
         self.set_dashboard_visible(crate::views::dashboard::dashboard_enabled());
@@ -966,6 +1024,168 @@ impl AgentView {
     /// gated on the runtime voice gate (GA default on; kill switch may hide).
     pub fn set_voice_mode_available(&mut self, available: bool) {
         self.prompt.set_voice_visible(available);
+    }
+}
+/// Inputs for [`honest_turn_elapsed`]: the turn span and pause total measured
+/// on each clock, plus the wire anchor's provenance. `now_ms` is injected so
+/// tests control the wall clock.
+struct TurnElapsedParams<'a> {
+    instant_elapsed: std::time::Duration,
+    instant_paused: std::time::Duration,
+    /// `turnStartMs` wire anchor (UTC ms) and the prompt id it was stamped
+    /// for; the anchor counts only when that id matches the running prompt
+    /// (interleaved deltas can re-stamp it with another prompt's anchor).
+    wall_anchor_ms: Option<i64>,
+    wall_paused: std::time::Duration,
+    anchor_prompt: Option<&'a str>,
+    current_prompt: Option<&'a str>,
+    now_ms: i64,
+}
+/// Turn elapsed for [`AgentView::turn_elapsed`], honest across OS suspends
+/// (`Instant` pauses while the machine sleeps; the wall clock keeps
+/// counting). Each span is netted against pauses measured on its own clock,
+/// and the larger net wins; the tests below enumerate the guard cases.
+fn honest_turn_elapsed(params: TurnElapsedParams<'_>) -> std::time::Duration {
+    let instant_net = params.instant_elapsed.saturating_sub(params.instant_paused);
+    let (Some(start_ms), Some(anchor_prompt), Some(current_prompt)) = (
+        params.wall_anchor_ms,
+        params.anchor_prompt,
+        params.current_prompt,
+    ) else {
+        return instant_net;
+    };
+    if anchor_prompt != current_prompt {
+        return instant_net;
+    }
+    let wall_net = wall_since_ms(start_ms, params.now_ms).saturating_sub(params.wall_paused);
+    instant_net.max(wall_net)
+}
+/// Wall-clock span since `start_ms`, clamped to zero when `start_ms`
+/// postdates `now_ms` (skew) so a wall span can never go negative.
+fn wall_since_ms(start_ms: i64, now_ms: i64) -> std::time::Duration {
+    std::time::Duration::from_millis(u64::try_from(now_ms.saturating_sub(start_ms)).unwrap_or(0))
+}
+#[cfg(test)]
+mod honest_turn_elapsed_tests {
+    use super::*;
+    use std::time::Duration;
+    const NOW_MS: i64 = 1_700_000_000_000;
+    const MIN: u64 = 60;
+    const HOUR: u64 = 3_600;
+    /// Valid same-prompt anchor context with zero spans; tests override the
+    /// fields under test via struct-update syntax.
+    fn base() -> TurnElapsedParams<'static> {
+        TurnElapsedParams {
+            instant_elapsed: Duration::ZERO,
+            instant_paused: Duration::ZERO,
+            wall_anchor_ms: None,
+            wall_paused: Duration::ZERO,
+            anchor_prompt: Some("p1"),
+            current_prompt: Some("p1"),
+            now_ms: NOW_MS,
+        }
+    }
+    #[test]
+    fn no_wall_anchor_keeps_instant_net() {
+        assert_eq!(
+            honest_turn_elapsed(TurnElapsedParams {
+                instant_elapsed: Duration::from_secs(5 * MIN),
+                instant_paused: Duration::from_secs(MIN),
+                ..base()
+            }),
+            Duration::from_secs(4 * MIN)
+        );
+    }
+    #[test]
+    fn suspend_outside_questions_defers_to_wall_net() {
+        assert_eq!(
+            honest_turn_elapsed(TurnElapsedParams {
+                instant_elapsed: Duration::from_secs(4 * MIN),
+                wall_anchor_ms: Some(NOW_MS - 2 * HOUR as i64 * 1_000),
+                ..base()
+            }),
+            Duration::from_secs(2 * HOUR)
+        );
+    }
+    #[test]
+    fn suspend_while_question_open_is_not_worked_time() {
+        assert_eq!(
+            honest_turn_elapsed(TurnElapsedParams {
+                instant_elapsed: Duration::from_secs(10 * MIN),
+                instant_paused: Duration::from_secs(5 * MIN),
+                wall_anchor_ms: Some(NOW_MS - (2 * HOUR as i64 + 10 * MIN as i64) * 1_000),
+                wall_paused: Duration::from_secs(2 * HOUR + 5 * MIN),
+                ..base()
+            }),
+            Duration::from_secs(5 * MIN)
+        );
+    }
+    #[test]
+    fn instant_net_bounds_below_after_backward_wall_jump() {
+        assert_eq!(
+            honest_turn_elapsed(TurnElapsedParams {
+                instant_elapsed: Duration::from_secs(5 * MIN),
+                wall_anchor_ms: Some(NOW_MS - 1_000),
+                ..base()
+            }),
+            Duration::from_secs(5 * MIN)
+        );
+    }
+    #[test]
+    fn foreign_prompt_anchor_falls_back_to_instant_net() {
+        assert_eq!(
+            honest_turn_elapsed(TurnElapsedParams {
+                instant_elapsed: Duration::from_secs(10 * MIN),
+                instant_paused: Duration::from_secs(4 * MIN),
+                wall_anchor_ms: Some(NOW_MS - 2 * HOUR as i64 * 1_000),
+                anchor_prompt: Some("p-other"),
+                ..base()
+            }),
+            Duration::from_secs(6 * MIN)
+        );
+    }
+    #[test]
+    fn missing_current_prompt_ignores_anchor() {
+        assert_eq!(
+            honest_turn_elapsed(TurnElapsedParams {
+                instant_elapsed: Duration::from_secs(MIN),
+                wall_anchor_ms: Some(NOW_MS - 2 * HOUR as i64 * 1_000),
+                current_prompt: None,
+                ..base()
+            }),
+            Duration::from_secs(MIN)
+        );
+    }
+    #[test]
+    fn future_wall_anchor_is_ignored() {
+        assert_eq!(
+            honest_turn_elapsed(TurnElapsedParams {
+                instant_elapsed: Duration::from_secs(MIN),
+                wall_anchor_ms: Some(NOW_MS + 60_000),
+                ..base()
+            }),
+            Duration::from_secs(MIN)
+        );
+    }
+    #[test]
+    fn turn_elapsed_reflects_wall_span_for_current_prompt() {
+        let mut view = test_agent_view(Some("s1"), std::path::PathBuf::from("/tmp"));
+        view.turn_started_at = Some(Instant::now());
+        view.turn_start_ms = Some(chrono::Utc::now().timestamp_millis() - 60_000);
+        view.turn_start_ms_prompt = Some("p1".to_string());
+        view.session.current_prompt_id = Some("p1".to_string());
+        assert!(view.turn_elapsed().unwrap() >= Duration::from_secs(59));
+    }
+    #[test]
+    fn turn_elapsed_nets_wall_pauses_against_wall_span() {
+        let mut view = test_agent_view(Some("s1"), std::path::PathBuf::from("/tmp"));
+        view.turn_started_at = Some(Instant::now());
+        view.turn_start_ms = Some(chrono::Utc::now().timestamp_millis() - 60_000);
+        view.turn_start_ms_prompt = Some("p1".to_string());
+        view.session.current_prompt_id = Some("p1".to_string());
+        view.turn_paused_wall = Duration::from_secs(45);
+        let elapsed = view.turn_elapsed().unwrap();
+        assert!(elapsed >= Duration::from_secs(14) && elapsed <= Duration::from_secs(16));
     }
 }
 #[cfg(test)]
@@ -1427,6 +1647,15 @@ mod status_window_tests {
         let mut agent = test_agent_view(Some("s1"), std::path::PathBuf::from("/tmp"));
         agent.start_turn_boundary(None);
         assert!(agent.session.state.is_turn_running());
+    }
+    #[test]
+    fn adopt_running_prompt_marks_front_committed() {
+        let mut agent = test_agent_view(Some("s1"), std::path::PathBuf::from("/tmp"));
+        agent.start_turn_boundary(Some("p-local"));
+        assert!(!agent.front_message_committed);
+        agent.adopt_running_prompt("p-run".into());
+        assert!(agent.front_message_committed);
+        assert!(agent.expects_send_now_cancel());
     }
     #[test]
     fn session_rebind_and_replay_invalidate_minimal_btw() {
