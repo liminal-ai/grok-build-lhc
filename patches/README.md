@@ -2,23 +2,57 @@
 
 Every core-file touchpoint (an `LHC-HOOK` marked insertion outside
 `crates/lhc/`) is maintained BOTH as normal commits on the `lhc` branch AND
-as a `git format-patch` file here, regenerated whenever a hook changes.
+as a re-appliable patch here, regenerated after any hook change and after
+every upstream sync.
 
 On a normal upstream sync these files are redundant. They exist for the day
 upstream resets history (this repo is a daily monorepo squash-sync; ancestry
 is not guaranteed): fresh clone of new upstream -> re-add `crates/lhc/` ->
-`git am patches/*.patch` -> `scripts/check-lhc-hooks.sh`. The full drill is
-in /FORK.md.
+apply the patch -> `scripts/check-lhc-hooks.sh`. The full drill is in
+/FORK.md.
 
-Series (Chunk 1 — generated, and the drill is **rehearsed**):
-- `0001-fork-lhc-Chunk-1-*.patch` — all four core touchpoints in one patch:
-  root `Cargo.toml` workspace-members entry, shell `Cargo.toml` dependency
-  (`LHC-HOOK 1/3`), persistence tee in `spawn.rs` (`2/3`), model /
-  thinking-level tee in `model_switch.rs` (`3/3`).
+## Model: ONE state diff from ONE recorded base
 
-One patch rather than three: the four edits land in a single commit, and
-`git am` of one file is a shorter recovery than three that must be ordered.
-Split it only if a future chunk changes hooks independently.
+- `BASE` — the upstream commit the diff was generated against (always the
+  `main` == `upstream/main` of the last sync).
+- `0001-lhc-touchpoints.patch` — `git diff` of every fork-owned core-file
+  delta, path list derived (see below).
+
+Apply with:
+
+    git apply --3way patches/0001-lhc-touchpoints.patch
+
+This replaced the original `git format-patch` per-chunk series on
+2026-08-06, at the first real upstream sync, because commit-anchored
+patches rot: the hook commits carry old upstream context, so `git am
+--3way` re-hits every conflict the sync itself already resolved (rehearsal
+failed at patch 2 of 7 on `compaction.rs` + `mod.rs`). A state diff from
+the recorded BASE applies clean by construction, because it is derived
+from exactly that tree. The codex-lhc sister fork hit the same failure
+class through its Chunk 2 and made the same ruling (`patches/lhc/BASE`
+there; "regenerating against whatever HEAD happens to be is what broke
+this series").
+
+The cost: per-chunk history shape is no longer in `patches/` — it lives in
+the `lhc` branch itself and in the fork tags/records. Recovery restores
+the touchpoints as one commit.
+
+## Regenerating (after any hook change; after every sync)
+
+    git rev-parse main > patches/BASE
+    git diff main..HEAD \
+      -- $(git diff --name-only main -- crates/codegen/ Cargo.toml | tr '\n' ' ') \
+      > patches/0001-lhc-touchpoints.patch
+
+**`main` must already be fast-forwarded to `upstream/main`** (sync drill
+step 4) so BASE records the actual current base.
+
+**The path list is DERIVED, never hand-maintained.** That `$( )` is the
+whole point: the invariant this file used to merely assert — "the list must
+equal `git diff --name-only main -- crates/codegen/ Cargo.toml`" — is
+structurally guaranteed instead of checked. It broke silently twice while
+hand-maintained (dropped five touchpoints after Chunk 2; dropped the root
+`Cargo.toml` workspace entry by regenerating a single commit).
 
 **Deliberately excluded** — do not add them:
 - `crates/lhc/**` — fork-owned; the drill re-adds that directory wholesale
@@ -26,29 +60,9 @@ Split it only if a future chunk changes hooks independently.
 - `Cargo.lock` — regenerate with `cargo check` after applying.
 - `FORK.md`, `patches/`, `scripts/check-lhc-hooks.sh` — fork-owned, copied.
 
-## Regenerating
+## Verifying
 
-    git format-patch <first-chunk-commit>~1..HEAD \
-      --output-directory patches --suffix=.patch \
-      -- $(git diff --name-only origin/main -- crates/codegen/ Cargo.toml | tr '\n' ' ')
-
-**The path list is DERIVED, never hand-maintained.** That `$( )` is the whole
-point: the invariant this file used to merely assert — "the list must equal
-`git diff --name-only origin/main -- crates/codegen/ Cargo.toml`" — is now
-structurally guaranteed instead of checked.
-
-It broke silently twice while hand-maintained:
-
-1. The documented command still listed only Chunk 1's four paths, so running it
-   after Chunk 2 would drop five touchpoints — including a core-tree regression
-   test — and a history-reset recovery would restore an incomplete fork with
-   nothing to signal it.
-2. It used `-1 <commit>`, a single commit, so regenerating after Chunk 2 dropped
-   root `Cargo.toml`'s workspace-members entry, which lives in the Chunk 1
-   commit. Deleting the old patch removed its only copy.
-
-Regenerate the WHOLE series (`<first>~1..HEAD`), not one commit. Current series:
-five patches, seventeen paths. Verify by rehearsing the drill — `git am --3way`
-onto a fresh clone must apply clean.
-
-
+Rehearse the drill: worktree (or fresh clone) at raw `upstream/main`,
+`git apply --3way` the patch, then assert the sentinel count (10/10
+`LHC-HOOK` markers) and the root `Cargo.toml` workspace entry. Rehearsed
+green 2026-08-06 against `a5589e9`.

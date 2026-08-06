@@ -236,7 +236,8 @@ implausibly large, upstream reset. Do not merge. Instead:
 2. Copy `crates/lhc/` (or re-add the submodule + adapter), `patches/`,
    `scripts/check-lhc-hooks.sh`, `FORK.md` from the old tree — these are
    fork-owned, upstream never touches them.
-3. `git am patches/*.patch` for every core touchpoint.
+3. `git apply --3way patches/0001-lhc-touchpoints.patch` — one state diff
+   from `patches/BASE` (model changed 2026-08-06; see patches/README.md).
 4. `scripts/check-lhc-hooks.sh` — green means the fork is whole.
 5. Force-update `origin/lhc`; keep the old tree until green.
 
