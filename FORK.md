@@ -24,10 +24,13 @@ certification) remains.
 - `crates/lhc/grok-lhc-host/` — the adapter crate (capture mapping, compact
   bridge, ModelCall). Fork-only; workspace member from Chunk 1.
 - `crates/lhc/vendor/long-horizon-context/` — submodule, pinned to certified
-  commits of the `lhc-rs-port` branch only (Phase 2 acceptance `358c8d1` or
-  later). Never copy the port in; bump the pin and record it here.
-  Current pin: `a3deafd` (band-walk skip + brief fallback cap; same pin as the
-  codex-lhc fork, gate-passed there 2026-08-06).
+  commits of the SDK repo's `main` only (Phase 2 acceptance `358c8d1` or
+  later; the historical `lhc-rs-port` working branch was retired into `main`
+  2026-08-08). Never copy the port in; bump the pin and record it here.
+  Current pin: `c136899` (tag `vendor-pin/grok-a3deafd-token-hotfix`:
+  `a3deafd` + capture-totality token-counting hotfix, applied live
+  2026-08-08 after a special-token panic; bump to the signed R1–R6 wave tip
+  `65580ea` opens the grok fork wave).
 - `patches/` — every core touchpoint as a re-appliable `format-patch` file
   (see `patches/README.md`). The history-reset recovery path.
 - `scripts/check-lhc-hooks.sh` — the three-layer tripwire (sentinel count,
