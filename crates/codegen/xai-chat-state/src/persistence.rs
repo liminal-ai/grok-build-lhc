@@ -17,14 +17,16 @@ use crate::commands::{StrictAppendAck, StrictAppendError};
 /// Captured at the response boundary and attached to `assistant_thinking` /
 /// `assistant_text` LHC events. Partial identity is allowed (`model`/`api` may
 /// be absent); complete identity is required to re-emit opaque reasoning on
-/// serve. Never invent missing fields from later config.
+/// serve. Never invent missing fields from later config. API must be the
+/// frozen sampler-attempt backend, not a post-response config sample.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostAssistantIdentity {
     /// Wave B provider label (`"xai"` for Grok).
     pub provider: String,
     /// Resolved response model (`AssistantItem.model_id`) when present.
     pub model: Option<String>,
-    /// Normalized API backend label for the call that produced the response.
+    /// Normalized API backend label for the sampler attempt that produced
+    /// the response (frozen at prepare; not live chat-state config).
     pub api: Option<String>,
 }
 

@@ -82,11 +82,15 @@ Wave B identity (hooks 7–9 + hook 4, same markers): host-observed
 **usage-independently** before response items are pushed (`record_response_identity`);
 cloned onto preceding `Reasoning` persists; taken once on trailing `Assistant`.
 Provider is `xai`; model is resolved `AssistantItem.model_id` when present
-(never invented); API is the actor's live `sampling_config.api_backend` at the
-response boundary, normalized to `chat_completions` / `responses` / `messages`.
-Bootstrap/replace re-map never invents identity. Hook 4 passes live request
-identity into serve so opaque `encrypted_content` is re-emitted only when
-stored identity is complete and exactly matches the live request.
+(never invented). **API is the frozen sampler-attempt backend** from
+`prepare_sampler_for_turn` (the config enqueued via FIFO `UpdateConfig` before
+that attempt's `Submit`) — never a later sample of live `sampling_config`
+(which can change under concurrent `SetSessionModel`). Normalized to
+`chat_completions` / `responses` / `messages`. Each auth-retry /
+compact-resubmit freezes its own attempt. Bootstrap/replace re-map never
+invents identity. Hook 4 passes that same frozen attempt identity into serve
+so opaque `encrypted_content` is re-emitted only when stored identity is
+complete and exactly matches the attempt that will submit.
 
 Schema v5 G2 (hook 10): shell `turn.rs` after-turn fan-out delivers
 `TurnEndFacts` (outcome fold, `outcomeReason`, ISO `startedAt`/`endedAt`) to
@@ -196,11 +200,15 @@ Identity/signature slice only (still pin `dd251ec`; `main` stays `8a14c91`).
 No retrieval tools; no SDK/vendor source changes. No new LHC-HOOK markers —
 extends hooks 7–9 (side channel) and hook 4 (live identity on serve).
 
-- Live capture: provider `xai`, resolved `AssistantItem.model_id`, live
-  `ApiBackend` label → same identity on `assistant_thinking` + `assistant_text`
-  for one response (usage-independent; no cross-response leak).
+- Live capture: provider `xai`, resolved `AssistantItem.model_id`, **frozen
+  attempt** `ApiBackend` label → same identity on `assistant_thinking` +
+  `assistant_text` for one response (usage-independent; no cross-response leak).
+- Exact-attempt freeze: `prepare_sampler_for_turn` returns identity from the
+  config it pushes into the sampler; hook-4 gate and response stamp both use
+  it so a mid-flight `SetSessionModel` cannot mislabel provenance or admit
+  encrypted reasoning for the wrong backend.
 - Serve/write-back: re-emit `encrypted_content` only when stored identity is
-  complete and matches live request identity; otherwise visible reasoning
+  complete and matches frozen attempt identity; otherwise visible reasoning
   without ciphertext. Restore stored model onto `AssistantItem.model_id`.
 - Bootstrap/replace: never invent identity from current config.
 - Maintenance: pin-drift check in `scripts/check-lhc-hooks.sh` tracks

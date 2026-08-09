@@ -526,13 +526,9 @@ async fn pending_identity_shared_with_reasoning_and_consumed_on_assistant() {
     use xai_grok_sampling_types::{ApiBackend, ConversationItem, synthesized_reasoning_item};
 
     let mut h = TestHarness::new();
-    // Stamp a responses backend so identity.api is observable.
-    let mut cfg = h.handle.get_sampling_config().await.unwrap();
-    cfg.api_backend = ApiBackend::Responses;
-    h.handle.update_sampling_config(cfg);
-    let _ = h.handle.get_conversation().await;
-
-    h.handle.record_response_identity(Some("grok-4".into()));
+    // Explicit frozen attempt API (not live config).
+    h.handle
+        .record_response_identity(Some("grok-4".into()), Some(ApiBackend::Responses));
     let _ = h.handle.get_conversation().await;
 
     h.handle
@@ -583,21 +579,19 @@ async fn pending_identity_shared_with_reasoning_and_consumed_on_assistant() {
 #[tokio::test]
 async fn identity_does_not_leak_across_model_change() {
     use crate::HostAssistantIdentity;
-    use xai_grok_sampling_types::ApiBackend;
+    use xai_grok_sampling_types::{ApiBackend, ConversationItem};
 
     let mut h = TestHarness::new();
-    let mut cfg = h.handle.get_sampling_config().await.unwrap();
-    cfg.api_backend = ApiBackend::Responses;
-    h.handle.update_sampling_config(cfg);
-    let _ = h.handle.get_conversation().await;
 
-    h.handle.record_response_identity(Some("model-a".into()));
+    h.handle
+        .record_response_identity(Some("model-a".into()), Some(ApiBackend::Responses));
     let _ = h.handle.get_conversation().await;
     h.handle
         .push_assistant_response(ConversationItem::assistant("a"));
     let _ = h.handle.get_conversation().await;
 
-    h.handle.record_response_identity(Some("model-b".into()));
+    h.handle
+        .record_response_identity(Some("model-b".into()), Some(ApiBackend::ChatCompletions));
     let _ = h.handle.get_conversation().await;
     h.handle
         .push_assistant_response(ConversationItem::assistant("b"));
@@ -627,6 +621,60 @@ async fn identity_does_not_leak_across_model_change() {
     );
     assert_eq!(ids[1].0, "b");
     assert_eq!(ids[1].1.model.as_deref(), Some("model-b"));
+    assert_eq!(ids[1].1.api.as_deref(), Some("chat_completions"));
+}
+
+/// Wave B race: after attempt API is frozen, a concurrent config switch must
+/// not re-label the response. Production path stamps the frozen attempt API,
+/// never the post-switch live `sampling_config`.
+#[tokio::test]
+async fn response_identity_uses_frozen_attempt_api_despite_config_switch() {
+    use crate::HostAssistantIdentity;
+    use xai_grok_sampling_types::{ApiBackend, ConversationItem};
+
+    let mut h = TestHarness::new();
+
+    // Attempt frozen under Responses / model-a (prepare_sampler_for_turn).
+    let frozen_api = ApiBackend::Responses;
+    let frozen_model = "model-a".to_string();
+
+    // Concurrent SetSessionModel: live config becomes ChatCompletions / model-b
+    // while the sampler attempt is still in flight.
+    let mut cfg = h.handle.get_sampling_config().await.unwrap();
+    cfg.api_backend = ApiBackend::ChatCompletions;
+    cfg.model = "model-b".into();
+    h.handle.update_sampling_config(cfg);
+    let _ = h.handle.get_conversation().await;
+
+    // Response arrives; stamp with frozen attempt facts (not live config).
+    h.handle
+        .record_response_identity(Some(frozen_model.clone()), Some(frozen_api));
+    let _ = h.handle.get_conversation().await;
+    h.handle
+        .push_assistant_response(ConversationItem::assistant_with_model(
+            "answer",
+            &frozen_model,
+        ));
+    let _ = h.handle.get_conversation().await;
+
+    let records = h.persistence_rx.drain();
+    let id = records.into_iter().find_map(|r| match r {
+        PersistenceRecord::MessageWithCaptureFacts {
+            item: ConversationItem::Assistant(_),
+            identity: Some(id),
+            ..
+        } => Some(id),
+        _ => None,
+    });
+    assert_eq!(
+        id,
+        Some(HostAssistantIdentity {
+            provider: "xai".into(),
+            model: Some("model-a".into()),
+            api: Some("responses".into()),
+        }),
+        "must stamp frozen attempt API/model, not post-switch live config"
+    );
 }
 
 #[tokio::test]

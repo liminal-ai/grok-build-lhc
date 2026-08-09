@@ -101,7 +101,11 @@ pub enum ChatStateCommand {
 
     /// Stash host-observed assistant identity for the current model response.
     /// Usage-independent — fires even when the provider reports no token usage.
-    RecordResponseIdentity { model_id: Option<String> },
+    /// `attempt_api` is the frozen sampler-attempt backend (not live config).
+    RecordResponseIdentity {
+        model_id: Option<String>,
+        attempt_api: Option<xai_grok_sampling_types::ApiBackend>,
+    },
 
     /// Subagent usage into session (and prompt when attributable). Replies when applied.
     RecordSubagentUsage {

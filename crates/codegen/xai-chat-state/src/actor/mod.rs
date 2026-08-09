@@ -183,8 +183,11 @@ impl ChatStateActor {
             } => {
                 self.record_model_call_usage(model_id, &usage, api_duration_ms, cost_usd_ticks);
             }
-            ChatStateCommand::RecordResponseIdentity { model_id } => {
-                self.record_response_identity(model_id);
+            ChatStateCommand::RecordResponseIdentity {
+                model_id,
+                attempt_api,
+            } => {
+                self.record_response_identity(model_id, attempt_api);
             }
             ChatStateCommand::RecordSubagentUsage {
                 by_model,

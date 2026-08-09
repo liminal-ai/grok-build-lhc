@@ -25,9 +25,10 @@ use xai_grok_sampling_types::{ConversationItem, ToolCall, synthesized_reasoning_
 
 /// Live request identity for safe opaque-reasoning replay (Wave B).
 ///
-/// Built from the request about to be sent (provider `xai`, request model,
-/// live API backend). Missing or incomplete identity suppresses
-/// `encrypted_content` re-emission.
+/// Built from the **frozen sampler attempt** about to submit (provider `xai`,
+/// outgoing request model, API backend prepared for that attempt). Missing or
+/// incomplete identity suppresses `encrypted_content` re-emission. Must not
+/// be sampled from mutable chat-state config after prepare.
 pub type LiveRequestIdentity = HostAssistantIdentity;
 
 /// `message_id` → recorded [`MessageKind`], fetched once per translation.

@@ -149,23 +149,32 @@ Host-observed provenance for one model response, attached to both
 |---|---|---|
 | `provider` | constant `"xai"` | Wave B provider label |
 | `model` | `AssistantItem.model_id` when present | Resolved response model; **never** filled from current config |
-| `api` | `sampling_config.api_backend` at response boundary | Normalized: `chat_completions` / `responses` / `messages` |
+| `api` | Frozen sampler-attempt `api_backend` | From `prepare_sampler_for_turn` (FIFO config for that submit); **never** post-response live `sampling_config` |
 
 ### Capture lifecycle (Grok — no Codex capture-slot queue)
 
 Grok already has an installed tee and chat-state actor before response
 persistence:
 
-1. After a model response arrives, `record_response_token_usage` **always**
-   calls `record_response_identity(model_id)` (usage-independent), then
-   optionally stashes usage when present.
-2. Response items are pushed in order (reasoning / backend / trailing
+1. Before hook-4 / submit, `prepare_sampler_for_turn` reconstructs config,
+   enqueues `UpdateConfig` on the sampler actor, and freezes
+   `SamplerAttemptIdentity { api_backend, model }` from that prepared config.
+   The subsequent `Submit` is processed on the same FIFO channel, so this
+   freeze is the actor configuration used for the attempt. Auth-retry and
+   compact/resubmit each freeze again.
+2. After a model response arrives, `record_response_token_usage` **always**
+   calls `record_response_identity(model_id, Some(attempt_api))`
+   (usage-independent), then optionally stashes usage when present. API is
+   the frozen attempt backend — not a re-read of chat-state config (which
+   can change under concurrent `SetSessionModel` while the turn awaits the
+   sampler).
+3. Response items are pushed in order (reasoning / backend / trailing
    Assistant). On each `Reasoning` persist the pending identity is
    **cloned**; on the trailing `Assistant` it is **taken** (consume-once).
-3. The LHC tee attaches identity onto mapped `assistant_thinking` and
+4. The LHC tee attaches identity onto mapped `assistant_thinking` and
    `assistant_text` events only. Partial identity is allowed (omit empty
    fields). A second response without a new stamp gets no identity.
-4. Bootstrap / `replace_history` re-maps never invent identity from current
+5. Bootstrap / `replace_history` re-maps never invent identity from current
    config (side channel is not part of history).
 
 ### Serve / write-back (opaque signature gate)
@@ -174,8 +183,9 @@ SDK exports stored provenance and signatures verbatim; **host** owns replay
 policy:
 
 - Re-emit `Reasoning.encrypted_content` from `thinkingSignature` only when
-  stored identity is complete **and** exactly matches the live request
-  identity (hook 4: provider `xai`, request model, live API).
+  stored identity is complete **and** exactly matches the **frozen sampler
+  attempt** identity (hook 4: provider `xai`, outgoing request model, API
+  from `prepare_sampler_for_turn` — not a later live-config sample).
 - Mismatch or missing either side: keep visible reasoning text/shape,
   drop `encrypted_content` (avoids Grok's terminal wrong-model 400).
 - Restore stored `model` onto reconstructed `AssistantItem.model_id`.

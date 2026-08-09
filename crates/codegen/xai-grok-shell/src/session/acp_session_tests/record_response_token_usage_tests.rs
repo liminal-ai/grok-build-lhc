@@ -56,7 +56,11 @@ async fn updates_chat_state_total_tokens_from_response_usage() {
             let _sync = actor.chat_state_handle.get_total_tokens().await;
             assert_eq!(actor.chat_state_handle.get_total_tokens().await, 0);
 
-            actor.record_response_token_usage(&response_with_usage(150_000), None);
+            actor.record_response_token_usage(
+                &response_with_usage(150_000),
+                None,
+                xai_grok_sampling_types::ApiBackend::ChatCompletions,
+            );
 
             assert_eq!(actor.chat_state_handle.get_total_tokens().await, 150_000);
             let prompt = actor
@@ -93,7 +97,11 @@ async fn preserves_total_tokens_when_response_has_no_usage() {
             let actor = create_test_actor(99_999, 256_000, 85, gateway_tx, persistence_tx).await;
             let _sync = actor.chat_state_handle.get_total_tokens().await;
 
-            actor.record_response_token_usage(&response_without_usage(), None);
+            actor.record_response_token_usage(
+                &response_without_usage(),
+                None,
+                xai_grok_sampling_types::ApiBackend::ChatCompletions,
+            );
 
             assert_eq!(actor.chat_state_handle.get_total_tokens().await, 99_999);
         })
@@ -135,7 +143,11 @@ async fn build_session_info_used_reflects_recorded_response() {
                 .push_user_message_and_ack(ConversationItem::user("hello hello hello hello"))
                 .await;
 
-            actor.record_response_token_usage(&response_with_usage(120_000), None);
+            actor.record_response_token_usage(
+                &response_with_usage(120_000),
+                None,
+                xai_grok_sampling_types::ApiBackend::ChatCompletions,
+            );
 
             let info = actor.build_session_info().await;
             assert_eq!(info.context.used, 120_000);
@@ -214,6 +226,83 @@ async fn build_session_info_sources_show_model_fingerprint_from_catalog() {
         .await;
 }
 
+/// Wave B race (production-shaped shell path): after `prepare_sampler_for_turn`
+/// freezes attempt identity, a concurrent sampling_config switch must not
+/// change hook-4 live identity or the API passed into response stamping.
+#[tokio::test(flavor = "current_thread")]
+async fn frozen_attempt_identity_survives_config_switch_before_stamp() {
+    use xai_grok_sampling_types::{ApiBackend, ConversationItem, ConversationResponse};
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+
+            let mut cfg = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("config");
+            cfg.api_backend = ApiBackend::Responses;
+            cfg.model = "model-a".into();
+            actor.chat_state_handle.update_sampling_config(cfg);
+
+            // Exact prepare point that enqueues UpdateConfig on the sampler FIFO.
+            let attempt = actor.prepare_sampler_for_turn().await;
+            assert_eq!(attempt.api_backend, ApiBackend::Responses);
+            assert_eq!(attempt.model, "model-a");
+
+            // Concurrent SetSessionModel (chat-state only; sampler still holds freeze).
+            let mut switched = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("config");
+            switched.api_backend = ApiBackend::ChatCompletions;
+            switched.model = "model-b".into();
+            actor.chat_state_handle.update_sampling_config(switched);
+            let live_now = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("config");
+            assert_eq!(live_now.api_backend, ApiBackend::ChatCompletions);
+
+            // Hook-4 path: live_request_identity from frozen attempt.
+            let live = attempt.live_request_identity(Some("model-a".into()));
+            assert_eq!(live.provider, "xai");
+            assert_eq!(live.model.as_deref(), Some("model-a"));
+            assert_eq!(
+                live.api.as_deref(),
+                Some("responses"),
+                "hook-4 must gate on frozen attempt API, not post-switch config"
+            );
+
+            // Response stamp path: pass frozen attempt API (not live config).
+            let response = ConversationResponse {
+                items: vec![ConversationItem::assistant_with_model("ok", "model-a")],
+                stop_reason: None,
+                usage: None,
+                cost_usd_ticks: None,
+                message_chunks_emitted: 1,
+                doom_loop_signals: Vec::new(),
+                stop_message: None,
+                message_id: None,
+                raw_stop_reason: None,
+                stop_sequence: None,
+            };
+            actor.record_response_token_usage(&response, None, attempt.api_backend.clone());
+            let _ = actor.chat_state_handle.get_conversation().await;
+            // Stamped pending identity is proven end-to-end in xai-chat-state
+            // `response_identity_uses_frozen_attempt_api_despite_config_switch`.
+            assert_eq!(attempt.api_backend, ApiBackend::Responses);
+        })
+        .await;
+}
+
 /// `record_response_token_usage` must also stash the per-turn `TokenUsage`
 /// in chat state so the next `PromptResponse._meta` can carry input/output
 /// token counts to the bot's telemetry layer.
@@ -237,7 +326,11 @@ async fn stashes_per_turn_usage_in_chat_state() {
             );
 
             // Use existing fixture: total=200_000 → prompt=199_950, completion=50.
-            actor.record_response_token_usage(&response_with_usage(200_000), None);
+            actor.record_response_token_usage(
+                &response_with_usage(200_000),
+                None,
+                xai_grok_sampling_types::ApiBackend::ChatCompletions,
+            );
 
             let stashed = actor
                 .chat_state_handle

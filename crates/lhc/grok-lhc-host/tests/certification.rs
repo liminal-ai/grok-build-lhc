@@ -5072,6 +5072,96 @@ fn wave_b_serve_signature_gate_and_model_restore() {
     }
 }
 
+/// Wave B race: hook-4 signature admission must use the frozen sampler-attempt
+/// backend, not a later live config. Stored identity matches the attempt that
+/// will submit; a concurrent API switch after freeze must not suppress a match
+/// or admit under the wrong backend.
+#[test]
+fn wave_b_hook4_signature_uses_frozen_attempt_backend_despite_config_switch() {
+    use lhc::shared_tech::view::{SessionAssistantMessage, SessionAssistantPart};
+    use xai_grok_sampling_types::reasoning_item_text;
+
+    // Frozen at prepare_sampler_for_turn (FIFO UpdateConfig → Submit).
+    let frozen_live = grok_lhc_host::LiveRequestIdentity {
+        provider: "xai".into(),
+        model: Some("grok-4".into()),
+        api: Some("responses".into()),
+    };
+    // What a post-freeze SetSessionModel would put into live chat-state —
+    // must NOT drive admission.
+    let post_switch_live = grok_lhc_host::LiveRequestIdentity {
+        provider: "xai".into(),
+        model: Some("grok-5".into()),
+        api: Some("chat_completions".into()),
+    };
+
+    let matching = SessionThreadView {
+        thread_id: "t".into(),
+        entries: vec![SessionThreadViewEntry::Message(
+            SessionThreadViewMessage::Assistant(SessionAssistantMessage {
+                content: vec![
+                    SessionAssistantPart {
+                        type_: SessionAssistantPartType::Thinking,
+                        text: None,
+                        thinking: Some("visible plan".into()),
+                        thinking_signature: Some("enc-keep".into()),
+                        tool_call_id: None,
+                        tool_name: None,
+                        arguments: None,
+                    },
+                    SessionAssistantPart {
+                        type_: SessionAssistantPartType::Text,
+                        text: Some("done".into()),
+                        thinking: None,
+                        thinking_signature: None,
+                        tool_call_id: None,
+                        tool_name: None,
+                        arguments: None,
+                    },
+                ],
+                source_messages: vec![SessionThreadViewEntrySource {
+                    message_id: "a1".into(),
+                    idempotency_key: None,
+                }],
+                provider: Some("xai".into()),
+                model: Some("grok-4".into()),
+                api: Some("responses".into()),
+            }),
+        )],
+    };
+    let kinds = SourceKindIndex::assume_sourced_users_are_prompts(&matching);
+
+    // Exact-attempt frozen identity admits encrypted_content.
+    let items = grok_lhc_host::session_view_to_serve_items(&matching, &kinds, Some(&frozen_live))
+        .expect("serve with frozen attempt");
+    match &items[0] {
+        ConversationItem::Reasoning(r) => {
+            assert_eq!(
+                r.encrypted_content.as_deref(),
+                Some("enc-keep"),
+                "frozen attempt backend must admit signature"
+            );
+            assert!(reasoning_item_text(r).contains("visible plan"));
+        }
+        other => panic!("expected Reasoning, got {other:?}"),
+    }
+
+    // If hook-4 wrongly read post-switch config, signature would be suppressed.
+    let items_wrong =
+        grok_lhc_host::session_view_to_serve_items(&matching, &kinds, Some(&post_switch_live))
+            .expect("serve with post-switch live");
+    match &items_wrong[0] {
+        ConversationItem::Reasoning(r) => {
+            assert_eq!(
+                r.encrypted_content, None,
+                "post-switch backend must not admit (proves gate is identity-sensitive)"
+            );
+            assert!(reasoning_item_text(r).contains("visible plan"));
+        }
+        other => panic!("expected Reasoning without signature, got {other:?}"),
+    }
+}
+
 /// Wave B Slice 2 — bootstrap/replace re-map does not invent identity.
 #[test]
 fn wave_b_replace_history_does_not_invent_identity() {

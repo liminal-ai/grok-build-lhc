@@ -2198,6 +2198,11 @@ impl SessionActor {
                 })),
             );
             let mut request = request;
+            // Freeze sampler attempt identity before hook-4 and submit so
+            // signature admission and response stamping share the exact
+            // config this attempt will use (FIFO UpdateConfig → Submit).
+            // Auth-retry / compact-resubmit re-enter this loop and freeze again.
+            let attempt_identity = self.prepare_sampler_for_turn().await;
             // LHC-HOOK 4/10: substitute LHC request context after build_request
             // (+ live identity for signature gate). Cheap atomic first, then
             // per-session registry — no mutex when off. Instrumented-redundant
@@ -2207,22 +2212,8 @@ impl SessionActor {
             {
                 let native_items = std::mem::take(&mut request.items);
                 let tools_before = request.tools.len();
-                let live_identity = {
-                    let cfg = self.chat_state_handle.get_sampling_config().await;
-                    let model = request
-                        .model
-                        .clone()
-                        .or_else(|| cfg.as_ref().map(|c| c.model.clone()))
-                        .filter(|m| !m.is_empty());
-                    let api = cfg.as_ref().map(|c| {
-                        grok_lhc_host::api_backend_label(c.api_backend.clone()).to_string()
-                    });
-                    Some(grok_lhc_host::LiveRequestIdentity {
-                        provider: grok_lhc_host::HostAssistantIdentity::PROVIDER_XAI.to_string(),
-                        model,
-                        api,
-                    })
-                };
+                let live_identity =
+                    Some(attempt_identity.live_request_identity(request.model.clone()));
                 let decision = grok_lhc_host::serve_request_context(
                     self.session_info.id.0.as_ref(),
                     &native_items,
@@ -2509,7 +2500,11 @@ impl SessionActor {
                     },
                 );
             }
-            self.record_response_token_usage(&response, Some(model_duration_ms));
+            self.record_response_token_usage(
+                &response,
+                Some(model_duration_ms),
+                attempt_identity.api_backend.clone(),
+            );
             let response_completed = self.response_completed_update(&response);
             if let Some(pt) = prompt_timing.take() {
                 let mcp_count = self.mcp_state.lock().await.configs.len() as u32;

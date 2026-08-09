@@ -11,21 +11,24 @@ index 95549a5..987f8ac 100644
      "third_party/dagre_rust",
      "third_party/graphlib_rust",
 diff --git a/crates/codegen/xai-chat-state/src/actor/mod.rs b/crates/codegen/xai-chat-state/src/actor/mod.rs
-index 1c6cf26..1d37c7d 100644
+index 1c6cf26..0b9e516 100644
 --- a/crates/codegen/xai-chat-state/src/actor/mod.rs
 +++ b/crates/codegen/xai-chat-state/src/actor/mod.rs
-@@ -183,6 +183,9 @@ impl ChatStateActor {
+@@ -183,6 +183,12 @@ impl ChatStateActor {
              } => {
                  self.record_model_call_usage(model_id, &usage, api_duration_ms, cost_usd_ticks);
              }
-+            ChatStateCommand::RecordResponseIdentity { model_id } => {
-+                self.record_response_identity(model_id);
++            ChatStateCommand::RecordResponseIdentity {
++                model_id,
++                attempt_api,
++            } => {
++                self.record_response_identity(model_id, attempt_api);
 +            }
              ChatStateCommand::RecordSubagentUsage {
                  by_model,
                  attribute_to_prompt,
 diff --git a/crates/codegen/xai-chat-state/src/actor/mutations.rs b/crates/codegen/xai-chat-state/src/actor/mutations.rs
-index 030ede8..fcd2ea4 100644
+index 030ede8..fbbbdee 100644
 --- a/crates/codegen/xai-chat-state/src/actor/mutations.rs
 +++ b/crates/codegen/xai-chat-state/src/actor/mutations.rs
 @@ -154,7 +154,25 @@ impl ChatStateActor {
@@ -55,7 +58,7 @@ index 030ede8..fcd2ea4 100644
          self.state.conversation.push(item);
      }
  
-@@ -375,6 +393,29 @@ impl ChatStateActor {
+@@ -375,6 +393,32 @@ impl ChatStateActor {
              api_duration_ms,
              cost_usd_ticks,
          );
@@ -68,15 +71,18 @@ index 030ede8..fcd2ea4 100644
 +    ///
 +    /// Called **before** response items are pushed, independent of token usage.
 +    /// `model_id` is the resolved response model when present — never filled
-+    /// from current config. API is the actor's live `sampling_config.api_backend`
-+    /// at this response boundary (the backend that produced the response).
++    /// from current config. `attempt_api` is the backend frozen for the sampler
++    /// attempt that produced this response — never read from live
++    /// `sampling_config` (which can change under a concurrent model switch).
 +    /// Stash site pairs with the hook-8 marker on `record_model_call_usage`
 +    /// (same side-channel family).
-+    pub(super) fn record_response_identity(&mut self, model_id: Option<String>) {
++    pub(super) fn record_response_identity(
++        &mut self,
++        model_id: Option<String>,
++        attempt_api: Option<xai_grok_sampling_types::ApiBackend>,
++    ) {
 +        let model = model_id.filter(|m| !m.is_empty());
-+        let api = Some(
-+            crate::api_backend_label(self.state.sampling_config.api_backend.clone()).to_string(),
-+        );
++        let api = attempt_api.map(|b| crate::api_backend_label(b).to_string());
 +        self.state.pending_assistant_identity = Some(crate::HostAssistantIdentity {
 +            provider: crate::HostAssistantIdentity::PROVIDER_XAI.to_string(),
 +            model,
@@ -86,10 +92,10 @@ index 030ede8..fcd2ea4 100644
  
      pub(super) fn record_subagent_usage(
 diff --git a/crates/codegen/xai-chat-state/src/actor/state.rs b/crates/codegen/xai-chat-state/src/actor/state.rs
-index cde5e59..d5cf597 100644
+index cde5e59..dcad6d9 100644
 --- a/crates/codegen/xai-chat-state/src/actor/state.rs
 +++ b/crates/codegen/xai-chat-state/src/actor/state.rs
-@@ -153,6 +153,22 @@ pub(crate) struct ChatState {
+@@ -153,6 +153,24 @@ pub(crate) struct ChatState {
      /// persist last_turn_usage). Always overwritten by the most recent turn —
      /// historical turns are not retained here.
      pub last_turn_usage: Option<TokenUsage>,
@@ -105,14 +111,16 @@ index cde5e59..d5cf597 100644
 +    /// Pending host-observed identity for the current model response.
 +    ///
 +    /// Stamped by `record_response_identity` **before** response items are
-+    /// pushed (usage-independent). Cloned onto each preceding `Reasoning`
-+    /// persist; taken once on the trailing `Assistant` so identity cannot
-+    /// leak to the next response. Bootstrap/replace never invents this.
++    /// pushed (usage-independent). API comes from the frozen sampler-attempt
++    /// backend; model from the resolved response when present. Cloned onto
++    /// each preceding `Reasoning` persist; taken once on the trailing
++    /// `Assistant` so identity cannot leak to the next response.
++    /// Bootstrap/replace never invents this.
 +    pub pending_assistant_identity: Option<crate::HostAssistantIdentity>,
      /// Billing for the open prompt (cleared on next prompt; not persisted).
      pub prompt_usage: Option<UsageLedger>,
      /// Lifetime session billing (not persisted).
-@@ -240,6 +256,8 @@ impl ChatState {
+@@ -240,6 +258,8 @@ impl ChatState {
              estimated_tokens_since_model: 0,
              estimate_at_last_response: initial_tokens,
              last_turn_usage: None,
@@ -122,10 +130,10 @@ index cde5e59..d5cf597 100644
              session_usage: UsageLedger::default(),
              turn_capture: None,
 diff --git a/crates/codegen/xai-chat-state/src/actor/tests.rs b/crates/codegen/xai-chat-state/src/actor/tests.rs
-index c3eada8..44f95e0 100644
+index c3eada8..70709e4 100644
 --- a/crates/codegen/xai-chat-state/src/actor/tests.rs
 +++ b/crates/codegen/xai-chat-state/src/actor/tests.rs
-@@ -453,6 +453,182 @@ async fn record_token_usage_emits_event() {
+@@ -453,6 +453,230 @@ async fn record_token_usage_emits_event() {
      assert_eq!(tokens, 1000);
  }
  
@@ -202,13 +210,9 @@ index c3eada8..44f95e0 100644
 +    use xai_grok_sampling_types::{ApiBackend, ConversationItem, synthesized_reasoning_item};
 +
 +    let mut h = TestHarness::new();
-+    // Stamp a responses backend so identity.api is observable.
-+    let mut cfg = h.handle.get_sampling_config().await.unwrap();
-+    cfg.api_backend = ApiBackend::Responses;
-+    h.handle.update_sampling_config(cfg);
-+    let _ = h.handle.get_conversation().await;
-+
-+    h.handle.record_response_identity(Some("grok-4".into()));
++    // Explicit frozen attempt API (not live config).
++    h.handle
++        .record_response_identity(Some("grok-4".into()), Some(ApiBackend::Responses));
 +    let _ = h.handle.get_conversation().await;
 +
 +    h.handle
@@ -259,21 +263,19 @@ index c3eada8..44f95e0 100644
 +#[tokio::test]
 +async fn identity_does_not_leak_across_model_change() {
 +    use crate::HostAssistantIdentity;
-+    use xai_grok_sampling_types::ApiBackend;
++    use xai_grok_sampling_types::{ApiBackend, ConversationItem};
 +
 +    let mut h = TestHarness::new();
-+    let mut cfg = h.handle.get_sampling_config().await.unwrap();
-+    cfg.api_backend = ApiBackend::Responses;
-+    h.handle.update_sampling_config(cfg);
-+    let _ = h.handle.get_conversation().await;
 +
-+    h.handle.record_response_identity(Some("model-a".into()));
++    h.handle
++        .record_response_identity(Some("model-a".into()), Some(ApiBackend::Responses));
 +    let _ = h.handle.get_conversation().await;
 +    h.handle
 +        .push_assistant_response(ConversationItem::assistant("a"));
 +    let _ = h.handle.get_conversation().await;
 +
-+    h.handle.record_response_identity(Some("model-b".into()));
++    h.handle
++        .record_response_identity(Some("model-b".into()), Some(ApiBackend::ChatCompletions));
 +    let _ = h.handle.get_conversation().await;
 +    h.handle
 +        .push_assistant_response(ConversationItem::assistant("b"));
@@ -303,31 +305,89 @@ index c3eada8..44f95e0 100644
 +    );
 +    assert_eq!(ids[1].0, "b");
 +    assert_eq!(ids[1].1.model.as_deref(), Some("model-b"));
++    assert_eq!(ids[1].1.api.as_deref(), Some("chat_completions"));
++}
++
++/// Wave B race: after attempt API is frozen, a concurrent config switch must
++/// not re-label the response. Production path stamps the frozen attempt API,
++/// never the post-switch live `sampling_config`.
++#[tokio::test]
++async fn response_identity_uses_frozen_attempt_api_despite_config_switch() {
++    use crate::HostAssistantIdentity;
++    use xai_grok_sampling_types::{ApiBackend, ConversationItem};
++
++    let mut h = TestHarness::new();
++
++    // Attempt frozen under Responses / model-a (prepare_sampler_for_turn).
++    let frozen_api = ApiBackend::Responses;
++    let frozen_model = "model-a".to_string();
++
++    // Concurrent SetSessionModel: live config becomes ChatCompletions / model-b
++    // while the sampler attempt is still in flight.
++    let mut cfg = h.handle.get_sampling_config().await.unwrap();
++    cfg.api_backend = ApiBackend::ChatCompletions;
++    cfg.model = "model-b".into();
++    h.handle.update_sampling_config(cfg);
++    let _ = h.handle.get_conversation().await;
++
++    // Response arrives; stamp with frozen attempt facts (not live config).
++    h.handle
++        .record_response_identity(Some(frozen_model.clone()), Some(frozen_api));
++    let _ = h.handle.get_conversation().await;
++    h.handle
++        .push_assistant_response(ConversationItem::assistant_with_model(
++            "answer",
++            &frozen_model,
++        ));
++    let _ = h.handle.get_conversation().await;
++
++    let records = h.persistence_rx.drain();
++    let id = records.into_iter().find_map(|r| match r {
++        PersistenceRecord::MessageWithCaptureFacts {
++            item: ConversationItem::Assistant(_),
++            identity: Some(id),
++            ..
++        } => Some(id),
++        _ => None,
++    });
++    assert_eq!(
++        id,
++        Some(HostAssistantIdentity {
++            provider: "xai".into(),
++            model: Some("model-a".into()),
++            api: Some("responses".into()),
++        }),
++        "must stamp frozen attempt API/model, not post-switch live config"
++    );
 +}
 +
  #[tokio::test]
  async fn record_last_turn_usage_round_trip() {
      use xai_grok_sampling_types::TokenUsage;
 diff --git a/crates/codegen/xai-chat-state/src/commands.rs b/crates/codegen/xai-chat-state/src/commands.rs
-index 625ad90..d32f642 100644
+index 625ad90..767807c 100644
 --- a/crates/codegen/xai-chat-state/src/commands.rs
 +++ b/crates/codegen/xai-chat-state/src/commands.rs
-@@ -99,6 +99,10 @@ pub enum ChatStateCommand {
+@@ -99,6 +99,14 @@ pub enum ChatStateCommand {
          cost_usd_ticks: Option<i64>,
      },
  
 +    /// Stash host-observed assistant identity for the current model response.
 +    /// Usage-independent — fires even when the provider reports no token usage.
-+    RecordResponseIdentity { model_id: Option<String> },
++    /// `attempt_api` is the frozen sampler-attempt backend (not live config).
++    RecordResponseIdentity {
++        model_id: Option<String>,
++        attempt_api: Option<xai_grok_sampling_types::ApiBackend>,
++    },
 +
      /// Subagent usage into session (and prompt when attributable). Replies when applied.
      RecordSubagentUsage {
          by_model: Vec<(String, crate::usage::UsageTotals)>,
 diff --git a/crates/codegen/xai-chat-state/src/handle.rs b/crates/codegen/xai-chat-state/src/handle.rs
-index e58fd57..06dd26c 100644
+index e58fd57..a5a9560 100644
 --- a/crates/codegen/xai-chat-state/src/handle.rs
 +++ b/crates/codegen/xai-chat-state/src/handle.rs
-@@ -126,6 +126,17 @@ impl ChatStateHandle {
+@@ -126,6 +126,24 @@ impl ChatStateHandle {
          });
      }
  
@@ -336,10 +396,17 @@ index e58fd57..06dd26c 100644
 +    /// Call **before** pushing response items. Independent of token usage so a
 +    /// valid response without usage still carries provenance. `model_id` is the
 +    /// resolved response model when present — never invent from current config.
-+    pub fn record_response_identity(&self, model_id: Option<String>) {
-+        let _ = self
-+            .cmd_tx
-+            .send(ChatStateCommand::RecordResponseIdentity { model_id });
++    /// `attempt_api` is the backend frozen for the sampler attempt that produced
++    /// the response — never sampled from live chat-state config after the fact.
++    pub fn record_response_identity(
++        &self,
++        model_id: Option<String>,
++        attempt_api: Option<xai_grok_sampling_types::ApiBackend>,
++    ) {
++        let _ = self.cmd_tx.send(ChatStateCommand::RecordResponseIdentity {
++            model_id,
++            attempt_api,
++        });
 +    }
 +
      /// Apply subagent usage; returns false if the actor did not acknowledge.
@@ -361,10 +428,10 @@ index 3fdd1dd..f43751f 100644
  pub use types::*;
  pub use usage::{UsageLedger, UsageTotals};
 diff --git a/crates/codegen/xai-chat-state/src/persistence.rs b/crates/codegen/xai-chat-state/src/persistence.rs
-index 8c3ea9a..bf7d499 100644
+index 8c3ea9a..e1211f0 100644
 --- a/crates/codegen/xai-chat-state/src/persistence.rs
 +++ b/crates/codegen/xai-chat-state/src/persistence.rs
-@@ -8,10 +8,56 @@
+@@ -8,10 +8,58 @@
  use std::io;
  
  use tokio::sync::{mpsc, oneshot};
@@ -378,14 +445,16 @@ index 8c3ea9a..bf7d499 100644
 +/// Captured at the response boundary and attached to `assistant_thinking` /
 +/// `assistant_text` LHC events. Partial identity is allowed (`model`/`api` may
 +/// be absent); complete identity is required to re-emit opaque reasoning on
-+/// serve. Never invent missing fields from later config.
++/// serve. Never invent missing fields from later config. API must be the
++/// frozen sampler-attempt backend, not a post-response config sample.
 +#[derive(Debug, Clone, PartialEq, Eq)]
 +pub struct HostAssistantIdentity {
 +    /// Wave B provider label (`"xai"` for Grok).
 +    pub provider: String,
 +    /// Resolved response model (`AssistantItem.model_id`) when present.
 +    pub model: Option<String>,
-+    /// Normalized API backend label for the call that produced the response.
++    /// Normalized API backend label for the sampler attempt that produced
++    /// the response (frozen at prepare; not live chat-state config).
 +    pub api: Option<String>,
 +}
 +
@@ -422,7 +491,7 @@ index 8c3ea9a..bf7d499 100644
  /// Abstraction over chat-specific persistence operations.
  ///
  /// The actor owns this exclusively via `Box<dyn ChatPersistence>`, so all
-@@ -24,6 +70,23 @@ pub trait ChatPersistence: Send + 'static {
+@@ -24,6 +72,23 @@ pub trait ChatPersistence: Send + 'static {
      /// Persist a single conversation item (append to chat_history.jsonl).
      fn persist_message(&mut self, item: &ConversationItem);
  
@@ -446,7 +515,7 @@ index 8c3ea9a..bf7d499 100644
      /// Persist one working-directory switch generation and report commit status.
      fn persist_working_directory_switch_and_ack(
          &mut self,
-@@ -44,8 +107,20 @@ pub trait ChatPersistence: Send + 'static {
+@@ -44,8 +109,20 @@ pub trait ChatPersistence: Send + 'static {
  /// A record of a persistence call, sent over a channel to the test.
  #[derive(Debug, Clone)]
  pub enum PersistenceRecord {
@@ -468,7 +537,7 @@ index 8c3ea9a..bf7d499 100644
      /// A persistence-acknowledged switch append was requested.
      AcknowledgedMessage(ConversationItem),
      /// The full history was replaced.
-@@ -128,12 +203,15 @@ impl MockPersistenceReceiver {
+@@ -128,12 +205,15 @@ impl MockPersistenceReceiver {
          }
      }
  
@@ -486,7 +555,7 @@ index 8c3ea9a..bf7d499 100644
                  _ => None,
              })
              .collect()
-@@ -145,6 +223,32 @@ impl ChatPersistence for MockChatPersistence {
+@@ -145,6 +225,32 @@ impl ChatPersistence for MockChatPersistence {
          let _ = self.tx.send(PersistenceRecord::Message(item.clone()));
      }
  
@@ -822,18 +891,96 @@ index 9489c62..a0f8fcc 100644
  mod observability_bridge_mapping_tests;
  #[cfg(test)]
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs
-index 217033f..d2112da 100644
+index 217033f..92b746e 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs
-@@ -1371,6 +1371,11 @@ impl SessionActor {
+@@ -718,17 +718,19 @@ impl SessionActor {
+         Ok(sampling_client)
+     }
+     /// Push a fresh `SamplerConfig` into the per-session sampler actor
+-    /// before each turn. Mirrors `prepare_chat_completion`'s
+-    /// auth-refresh + config rebuild, but routes the result to the
+-    /// `xai-grok-sampler` instead of constructing a new
+-    /// `OaiCompatClient`.
++    /// before each turn and return the frozen attempt identity.
+     ///
+-    /// Behaviour parity: we run the same `refresh_token_if_expired()`
+-    /// and `reconstruct_full_config()` so the sampler picks up any
+-    /// newly issued session token. The previous client cache inside
+-    /// the sampler actor is invalidated automatically by
+-    /// `update_config`.
+-    pub(crate) async fn prepare_sampler_for_turn(&self) {
++    /// Mirrors `prepare_chat_completion`'s auth-refresh + config rebuild,
++    /// but routes the result to the `xai-grok-sampler` instead of
++    /// constructing a new `OaiCompatClient`.
++    ///
++    /// The returned [`SamplerAttemptIdentity`] is taken from the config
++    /// just enqueued via `update_config`. The sampler actor processes
++    /// `UpdateConfig` and the subsequent `Submit` on one FIFO channel, so
++    /// this identity is exactly the actor configuration used for that
++    /// submit — not a later chat-state sample. Auth-retry and
++    /// compact/resubmit each call this again for their own attempt.
++    pub(crate) async fn prepare_sampler_for_turn(&self) -> SamplerAttemptIdentity {
+         self.refresh_token_if_expired().await;
+         let mut sampler_config = self.reconstruct_full_config().await;
+         if self.tool_context.task_output_token_budget.is_some()
+@@ -737,7 +739,12 @@ impl SessionActor {
+             sampler_config.doom_loop_recovery = None;
+         }
+         sampler_config.idle_timeout_secs = Some(self.inference_idle_timeout.as_secs());
++        let attempt = SamplerAttemptIdentity {
++            api_backend: sampler_config.api_backend.clone(),
++            model: sampler_config.model.clone(),
++        };
+         self.sampler_handle.update_config(sampler_config);
++        attempt
+     }
+     /// Fold an auth remedy into a turn failure: its advice becomes the tail of
+     /// the message, and its `turn_error_type` the classification the client
+@@ -1129,9 +1136,10 @@ impl SessionActor {
+     }
+     /// Drive a single turn through the sampler-based path.
+     ///
+-    /// Calls `prepare_sampler_for_turn` first (auth refresh + config
+-    /// push), then submits via `SamplerHandle::submit_and_collect` and
+-    /// returns:
++    /// Caller must have already called [`Self::prepare_sampler_for_turn`]
++    /// for this attempt (so hook-4 signature gating and response identity
++    /// stamping share the same frozen attempt config). This method only
++    /// submits via `SamplerHandle::submit_and_collect` and returns:
+     /// * `Ok(SamplerTurnOutcome::Response(_))` - model responded.
+     /// * `Ok(SamplerTurnOutcome::CompactAndResubmit)` - compaction
+     ///    ran, the outer turn loop should `continue`.
+@@ -1143,7 +1151,6 @@ impl SessionActor {
+         self: &Arc<Self>,
+         request: ConversationRequest,
+     ) -> Result<SamplerTurnOutcome, acp::Error> {
+-        self.prepare_sampler_for_turn().await;
+         let stream_drained_rx = {
+             let (tx, rx) = tokio::sync::oneshot::channel();
+             *self.turn_stream_drained.lock() = Some(tx);
+@@ -1366,11 +1373,24 @@ impl SessionActor {
+     /// Resetting `estimated_tokens_since_model = 0` here also keeps the
+     /// preflight-overflow guard accurate against the next turn's
+     /// tool-result deltas.
++    ///
++    /// `attempt_api` is the frozen backend from
++    /// [`Self::prepare_sampler_for_turn`] for this attempt — never the live
++    /// chat-state config (which can change under a concurrent model switch).
+     pub(crate) fn record_response_token_usage(
+         &self,
          response: &ConversationResponse,
          api_duration_ms: Option<u64>,
++        attempt_api: xai_grok_sampling_types::ApiBackend,
      ) {
 +        // Wave B identity: always stamp before items are pushed, even when the
 +        // provider reports no token usage. Model is the resolved response
-+        // model only — never filled from current config.
-+        self.chat_state_handle
-+            .record_response_identity(response.assistant().and_then(|a| a.model_id.clone()));
++        // model only — never filled from current config. API is the frozen
++        // attempt backend prepared for this submit.
++        self.chat_state_handle.record_response_identity(
++            response.assistant().and_then(|a| a.model_id.clone()),
++            Some(attempt_api),
++        );
          if let Some(ref u) = response.usage {
              self.tool_context
                  .record_task_model_output(u64::from(u.completion_tokens));
@@ -984,7 +1131,7 @@ index d42f1d3..1b2f03b 100644
          tokio_util::sync::CancellationToken::new(),
      );
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
-index 758bb9e..1671dbd 100644
+index 758bb9e..b8839b2 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
 @@ -1143,6 +1143,40 @@ impl SessionActor {
@@ -1028,10 +1175,15 @@ index 758bb9e..1671dbd 100644
          xai_grok_telemetry::session_ctx::log_session_event(
              crate::agent::session_metrics::TurnCompletedLifecycle {
                  session_id: self.session_info.id.0.to_string(),
-@@ -2164,7 +2198,72 @@ impl SessionActor {
+@@ -2164,7 +2198,63 @@ impl SessionActor {
                  })),
              );
              let mut request = request;
++            // Freeze sampler attempt identity before hook-4 and submit so
++            // signature admission and response stamping share the exact
++            // config this attempt will use (FIFO UpdateConfig → Submit).
++            // Auth-retry / compact-resubmit re-enter this loop and freeze again.
++            let attempt_identity = self.prepare_sampler_for_turn().await;
 +            // LHC-HOOK 4/10: substitute LHC request context after build_request
 +            // (+ live identity for signature gate). Cheap atomic first, then
 +            // per-session registry — no mutex when off. Instrumented-redundant
@@ -1041,22 +1193,8 @@ index 758bb9e..1671dbd 100644
 +            {
 +                let native_items = std::mem::take(&mut request.items);
 +                let tools_before = request.tools.len();
-+                let live_identity = {
-+                    let cfg = self.chat_state_handle.get_sampling_config().await;
-+                    let model = request
-+                        .model
-+                        .clone()
-+                        .or_else(|| cfg.as_ref().map(|c| c.model.clone()))
-+                        .filter(|m| !m.is_empty());
-+                    let api = cfg.as_ref().map(|c| {
-+                        grok_lhc_host::api_backend_label(c.api_backend.clone()).to_string()
-+                    });
-+                    Some(grok_lhc_host::LiveRequestIdentity {
-+                        provider: grok_lhc_host::HostAssistantIdentity::PROVIDER_XAI.to_string(),
-+                        model,
-+                        api,
-+                    })
-+                };
++                let live_identity =
++                    Some(attempt_identity.live_request_identity(request.model.clone()));
 +                let decision = grok_lhc_host::serve_request_context(
 +                    self.session_info.id.0.as_ref(),
 +                    &native_items,
@@ -1101,6 +1239,74 @@ index 758bb9e..1671dbd 100644
              request.x_grok_turn_idx =
                  Some(self.chat_state_handle.get_prompt_index().await.to_string());
              request.x_grok_agent_id = Some(xai_grok_telemetry::id::agent_id());
+@@ -2410,7 +2500,11 @@ impl SessionActor {
+                     },
+                 );
+             }
+-            self.record_response_token_usage(&response, Some(model_duration_ms));
++            self.record_response_token_usage(
++                &response,
++                Some(model_duration_ms),
++                attempt_identity.api_backend.clone(),
++            );
+             let response_completed = self.response_completed_update(&response);
+             if let Some(pt) = prompt_timing.take() {
+                 let mcp_count = self.mcp_state.lock().await.configs.len() as u32;
+diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/types.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/types.rs
+index 9679663..ad0965e 100644
+--- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/types.rs
++++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/types.rs
+@@ -44,6 +44,50 @@ pub(crate) enum SamplerFailureRecovery {
+     },
+ }
+ 
++/// Frozen identity for one sampler attempt (Wave B exact-attempt contract).
++///
++/// Captured from the `SamplerConfig` that `prepare_sampler_for_turn` pushes
++/// into the sampler actor. Because that `UpdateConfig` is enqueued on the
++/// same FIFO channel as the subsequent `Submit`, this is the configuration
++/// the actor clones into the request task — not whatever chat-state holds
++/// after a concurrent `SetSessionModel`.
++///
++/// Every actual attempt (initial, auth-retry, compact/resubmit) freezes its
++/// own identity; response stamping and hook-4 signature gating both use it.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub(crate) struct SamplerAttemptIdentity {
++    /// Protocol backend prepared for this submit.
++    pub api_backend: xai_grok_sampling_types::ApiBackend,
++    /// Model string on the prepared sampler config (fallback when the
++    /// outgoing request has no model; never invents missing response model).
++    pub model: String,
++}
++
++impl SamplerAttemptIdentity {
++    /// Live request identity for hook-4 signature admission.
++    ///
++    /// Prefer the model already present on the outgoing request; fall back to
++    /// the prepared config model only when the request has none. API always
++    /// comes from the frozen attempt backend.
++    pub(crate) fn live_request_identity(
++        &self,
++        request_model: Option<String>,
++    ) -> grok_lhc_host::LiveRequestIdentity {
++        let model = request_model.filter(|m| !m.is_empty()).or_else(|| {
++            if self.model.is_empty() {
++                None
++            } else {
++                Some(self.model.clone())
++            }
++        });
++        grok_lhc_host::LiveRequestIdentity {
++            provider: grok_lhc_host::HostAssistantIdentity::PROVIDER_XAI.to_string(),
++            model,
++            api: Some(grok_lhc_host::api_backend_label(self.api_backend.clone()).to_string()),
++        }
++    }
++}
++
+ /// Outcome of a single turn attempt via the sampler-based path.
+ /// `CompactAndResubmit` short-circuits the outer turn loop with
+ /// `continue` (the turn driver re-builds the request from the latest
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/lhc_derivation_quality_timing.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/lhc_derivation_quality_timing.rs
 new file mode 100644
 index 0000000..c614b1b
@@ -2282,6 +2488,146 @@ index 0000000..38451cb
 +        None => unsafe { std::env::remove_var("GROK_LHC_INFERENCE_MODEL") },
 +    }
 +}
+diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/record_response_token_usage_tests.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/record_response_token_usage_tests.rs
+index 037bc05..e658248 100644
+--- a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/record_response_token_usage_tests.rs
++++ b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/record_response_token_usage_tests.rs
+@@ -56,7 +56,11 @@ async fn updates_chat_state_total_tokens_from_response_usage() {
+             let _sync = actor.chat_state_handle.get_total_tokens().await;
+             assert_eq!(actor.chat_state_handle.get_total_tokens().await, 0);
+ 
+-            actor.record_response_token_usage(&response_with_usage(150_000), None);
++            actor.record_response_token_usage(
++                &response_with_usage(150_000),
++                None,
++                xai_grok_sampling_types::ApiBackend::ChatCompletions,
++            );
+ 
+             assert_eq!(actor.chat_state_handle.get_total_tokens().await, 150_000);
+             let prompt = actor
+@@ -93,7 +97,11 @@ async fn preserves_total_tokens_when_response_has_no_usage() {
+             let actor = create_test_actor(99_999, 256_000, 85, gateway_tx, persistence_tx).await;
+             let _sync = actor.chat_state_handle.get_total_tokens().await;
+ 
+-            actor.record_response_token_usage(&response_without_usage(), None);
++            actor.record_response_token_usage(
++                &response_without_usage(),
++                None,
++                xai_grok_sampling_types::ApiBackend::ChatCompletions,
++            );
+ 
+             assert_eq!(actor.chat_state_handle.get_total_tokens().await, 99_999);
+         })
+@@ -135,7 +143,11 @@ async fn build_session_info_used_reflects_recorded_response() {
+                 .push_user_message_and_ack(ConversationItem::user("hello hello hello hello"))
+                 .await;
+ 
+-            actor.record_response_token_usage(&response_with_usage(120_000), None);
++            actor.record_response_token_usage(
++                &response_with_usage(120_000),
++                None,
++                xai_grok_sampling_types::ApiBackend::ChatCompletions,
++            );
+ 
+             let info = actor.build_session_info().await;
+             assert_eq!(info.context.used, 120_000);
+@@ -214,6 +226,83 @@ async fn build_session_info_sources_show_model_fingerprint_from_catalog() {
+         .await;
+ }
+ 
++/// Wave B race (production-shaped shell path): after `prepare_sampler_for_turn`
++/// freezes attempt identity, a concurrent sampling_config switch must not
++/// change hook-4 live identity or the API passed into response stamping.
++#[tokio::test(flavor = "current_thread")]
++async fn frozen_attempt_identity_survives_config_switch_before_stamp() {
++    use xai_grok_sampling_types::{ApiBackend, ConversationItem, ConversationResponse};
++
++    let local = tokio::task::LocalSet::new();
++    local
++        .run_until(async {
++            let (gateway_tx, _) =
++                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
++            let (persistence_tx, _) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
++            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
++
++            let mut cfg = actor
++                .chat_state_handle
++                .get_sampling_config()
++                .await
++                .expect("config");
++            cfg.api_backend = ApiBackend::Responses;
++            cfg.model = "model-a".into();
++            actor.chat_state_handle.update_sampling_config(cfg);
++
++            // Exact prepare point that enqueues UpdateConfig on the sampler FIFO.
++            let attempt = actor.prepare_sampler_for_turn().await;
++            assert_eq!(attempt.api_backend, ApiBackend::Responses);
++            assert_eq!(attempt.model, "model-a");
++
++            // Concurrent SetSessionModel (chat-state only; sampler still holds freeze).
++            let mut switched = actor
++                .chat_state_handle
++                .get_sampling_config()
++                .await
++                .expect("config");
++            switched.api_backend = ApiBackend::ChatCompletions;
++            switched.model = "model-b".into();
++            actor.chat_state_handle.update_sampling_config(switched);
++            let live_now = actor
++                .chat_state_handle
++                .get_sampling_config()
++                .await
++                .expect("config");
++            assert_eq!(live_now.api_backend, ApiBackend::ChatCompletions);
++
++            // Hook-4 path: live_request_identity from frozen attempt.
++            let live = attempt.live_request_identity(Some("model-a".into()));
++            assert_eq!(live.provider, "xai");
++            assert_eq!(live.model.as_deref(), Some("model-a"));
++            assert_eq!(
++                live.api.as_deref(),
++                Some("responses"),
++                "hook-4 must gate on frozen attempt API, not post-switch config"
++            );
++
++            // Response stamp path: pass frozen attempt API (not live config).
++            let response = ConversationResponse {
++                items: vec![ConversationItem::assistant_with_model("ok", "model-a")],
++                stop_reason: None,
++                usage: None,
++                cost_usd_ticks: None,
++                message_chunks_emitted: 1,
++                doom_loop_signals: Vec::new(),
++                stop_message: None,
++                message_id: None,
++                raw_stop_reason: None,
++                stop_sequence: None,
++            };
++            actor.record_response_token_usage(&response, None, attempt.api_backend.clone());
++            let _ = actor.chat_state_handle.get_conversation().await;
++            // Stamped pending identity is proven end-to-end in xai-chat-state
++            // `response_identity_uses_frozen_attempt_api_despite_config_switch`.
++            assert_eq!(attempt.api_backend, ApiBackend::Responses);
++        })
++        .await;
++}
++
+ /// `record_response_token_usage` must also stash the per-turn `TokenUsage`
+ /// in chat state so the next `PromptResponse._meta` can carry input/output
+ /// token counts to the bot's telemetry layer.
+@@ -237,7 +326,11 @@ async fn stashes_per_turn_usage_in_chat_state() {
+             );
+ 
+             // Use existing fixture: total=200_000 → prompt=199_950, completion=50.
+-            actor.record_response_token_usage(&response_with_usage(200_000), None);
++            actor.record_response_token_usage(
++                &response_with_usage(200_000),
++                None,
++                xai_grok_sampling_types::ApiBackend::ChatCompletions,
++            );
+ 
+             let stashed = actor
+                 .chat_state_handle
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/rewind_cross_compaction_tests.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/rewind_cross_compaction_tests.rs
 index c9e2eb7..e2d009e 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/rewind_cross_compaction_tests.rs

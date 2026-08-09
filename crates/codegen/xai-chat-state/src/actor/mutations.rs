@@ -402,15 +402,18 @@ impl ChatStateActor {
     ///
     /// Called **before** response items are pushed, independent of token usage.
     /// `model_id` is the resolved response model when present — never filled
-    /// from current config. API is the actor's live `sampling_config.api_backend`
-    /// at this response boundary (the backend that produced the response).
+    /// from current config. `attempt_api` is the backend frozen for the sampler
+    /// attempt that produced this response — never read from live
+    /// `sampling_config` (which can change under a concurrent model switch).
     /// Stash site pairs with the hook-8 marker on `record_model_call_usage`
     /// (same side-channel family).
-    pub(super) fn record_response_identity(&mut self, model_id: Option<String>) {
+    pub(super) fn record_response_identity(
+        &mut self,
+        model_id: Option<String>,
+        attempt_api: Option<xai_grok_sampling_types::ApiBackend>,
+    ) {
         let model = model_id.filter(|m| !m.is_empty());
-        let api = Some(
-            crate::api_backend_label(self.state.sampling_config.api_backend.clone()).to_string(),
-        );
+        let api = attempt_api.map(|b| crate::api_backend_label(b).to_string());
         self.state.pending_assistant_identity = Some(crate::HostAssistantIdentity {
             provider: crate::HostAssistantIdentity::PROVIDER_XAI.to_string(),
             model,

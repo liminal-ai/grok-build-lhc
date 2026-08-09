@@ -131,10 +131,17 @@ impl ChatStateHandle {
     /// Call **before** pushing response items. Independent of token usage so a
     /// valid response without usage still carries provenance. `model_id` is the
     /// resolved response model when present — never invent from current config.
-    pub fn record_response_identity(&self, model_id: Option<String>) {
-        let _ = self
-            .cmd_tx
-            .send(ChatStateCommand::RecordResponseIdentity { model_id });
+    /// `attempt_api` is the backend frozen for the sampler attempt that produced
+    /// the response — never sampled from live chat-state config after the fact.
+    pub fn record_response_identity(
+        &self,
+        model_id: Option<String>,
+        attempt_api: Option<xai_grok_sampling_types::ApiBackend>,
+    ) {
+        let _ = self.cmd_tx.send(ChatStateCommand::RecordResponseIdentity {
+            model_id,
+            attempt_api,
+        });
     }
 
     /// Apply subagent usage; returns false if the actor did not acknowledge.

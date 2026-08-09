@@ -718,17 +718,19 @@ impl SessionActor {
         Ok(sampling_client)
     }
     /// Push a fresh `SamplerConfig` into the per-session sampler actor
-    /// before each turn. Mirrors `prepare_chat_completion`'s
-    /// auth-refresh + config rebuild, but routes the result to the
-    /// `xai-grok-sampler` instead of constructing a new
-    /// `OaiCompatClient`.
+    /// before each turn and return the frozen attempt identity.
     ///
-    /// Behaviour parity: we run the same `refresh_token_if_expired()`
-    /// and `reconstruct_full_config()` so the sampler picks up any
-    /// newly issued session token. The previous client cache inside
-    /// the sampler actor is invalidated automatically by
-    /// `update_config`.
-    pub(crate) async fn prepare_sampler_for_turn(&self) {
+    /// Mirrors `prepare_chat_completion`'s auth-refresh + config rebuild,
+    /// but routes the result to the `xai-grok-sampler` instead of
+    /// constructing a new `OaiCompatClient`.
+    ///
+    /// The returned [`SamplerAttemptIdentity`] is taken from the config
+    /// just enqueued via `update_config`. The sampler actor processes
+    /// `UpdateConfig` and the subsequent `Submit` on one FIFO channel, so
+    /// this identity is exactly the actor configuration used for that
+    /// submit — not a later chat-state sample. Auth-retry and
+    /// compact/resubmit each call this again for their own attempt.
+    pub(crate) async fn prepare_sampler_for_turn(&self) -> SamplerAttemptIdentity {
         self.refresh_token_if_expired().await;
         let mut sampler_config = self.reconstruct_full_config().await;
         if self.tool_context.task_output_token_budget.is_some()
@@ -737,7 +739,12 @@ impl SessionActor {
             sampler_config.doom_loop_recovery = None;
         }
         sampler_config.idle_timeout_secs = Some(self.inference_idle_timeout.as_secs());
+        let attempt = SamplerAttemptIdentity {
+            api_backend: sampler_config.api_backend.clone(),
+            model: sampler_config.model.clone(),
+        };
         self.sampler_handle.update_config(sampler_config);
+        attempt
     }
     /// Fold an auth remedy into a turn failure: its advice becomes the tail of
     /// the message, and its `turn_error_type` the classification the client
@@ -1129,9 +1136,10 @@ impl SessionActor {
     }
     /// Drive a single turn through the sampler-based path.
     ///
-    /// Calls `prepare_sampler_for_turn` first (auth refresh + config
-    /// push), then submits via `SamplerHandle::submit_and_collect` and
-    /// returns:
+    /// Caller must have already called [`Self::prepare_sampler_for_turn`]
+    /// for this attempt (so hook-4 signature gating and response identity
+    /// stamping share the same frozen attempt config). This method only
+    /// submits via `SamplerHandle::submit_and_collect` and returns:
     /// * `Ok(SamplerTurnOutcome::Response(_))` - model responded.
     /// * `Ok(SamplerTurnOutcome::CompactAndResubmit)` - compaction
     ///    ran, the outer turn loop should `continue`.
@@ -1143,7 +1151,6 @@ impl SessionActor {
         self: &Arc<Self>,
         request: ConversationRequest,
     ) -> Result<SamplerTurnOutcome, acp::Error> {
-        self.prepare_sampler_for_turn().await;
         let stream_drained_rx = {
             let (tx, rx) = tokio::sync::oneshot::channel();
             *self.turn_stream_drained.lock() = Some(tx);
@@ -1366,16 +1373,24 @@ impl SessionActor {
     /// Resetting `estimated_tokens_since_model = 0` here also keeps the
     /// preflight-overflow guard accurate against the next turn's
     /// tool-result deltas.
+    ///
+    /// `attempt_api` is the frozen backend from
+    /// [`Self::prepare_sampler_for_turn`] for this attempt — never the live
+    /// chat-state config (which can change under a concurrent model switch).
     pub(crate) fn record_response_token_usage(
         &self,
         response: &ConversationResponse,
         api_duration_ms: Option<u64>,
+        attempt_api: xai_grok_sampling_types::ApiBackend,
     ) {
         // Wave B identity: always stamp before items are pushed, even when the
         // provider reports no token usage. Model is the resolved response
-        // model only — never filled from current config.
-        self.chat_state_handle
-            .record_response_identity(response.assistant().and_then(|a| a.model_id.clone()));
+        // model only — never filled from current config. API is the frozen
+        // attempt backend prepared for this submit.
+        self.chat_state_handle.record_response_identity(
+            response.assistant().and_then(|a| a.model_id.clone()),
+            Some(attempt_api),
+        );
         if let Some(ref u) = response.usage {
             self.tool_context
                 .record_task_model_output(u64::from(u.completion_tokens));

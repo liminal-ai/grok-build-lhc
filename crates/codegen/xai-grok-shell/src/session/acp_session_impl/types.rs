@@ -44,6 +44,50 @@ pub(crate) enum SamplerFailureRecovery {
     },
 }
 
+/// Frozen identity for one sampler attempt (Wave B exact-attempt contract).
+///
+/// Captured from the `SamplerConfig` that `prepare_sampler_for_turn` pushes
+/// into the sampler actor. Because that `UpdateConfig` is enqueued on the
+/// same FIFO channel as the subsequent `Submit`, this is the configuration
+/// the actor clones into the request task — not whatever chat-state holds
+/// after a concurrent `SetSessionModel`.
+///
+/// Every actual attempt (initial, auth-retry, compact/resubmit) freezes its
+/// own identity; response stamping and hook-4 signature gating both use it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SamplerAttemptIdentity {
+    /// Protocol backend prepared for this submit.
+    pub api_backend: xai_grok_sampling_types::ApiBackend,
+    /// Model string on the prepared sampler config (fallback when the
+    /// outgoing request has no model; never invents missing response model).
+    pub model: String,
+}
+
+impl SamplerAttemptIdentity {
+    /// Live request identity for hook-4 signature admission.
+    ///
+    /// Prefer the model already present on the outgoing request; fall back to
+    /// the prepared config model only when the request has none. API always
+    /// comes from the frozen attempt backend.
+    pub(crate) fn live_request_identity(
+        &self,
+        request_model: Option<String>,
+    ) -> grok_lhc_host::LiveRequestIdentity {
+        let model = request_model.filter(|m| !m.is_empty()).or_else(|| {
+            if self.model.is_empty() {
+                None
+            } else {
+                Some(self.model.clone())
+            }
+        });
+        grok_lhc_host::LiveRequestIdentity {
+            provider: grok_lhc_host::HostAssistantIdentity::PROVIDER_XAI.to_string(),
+            model,
+            api: Some(grok_lhc_host::api_backend_label(self.api_backend.clone()).to_string()),
+        }
+    }
+}
+
 /// Outcome of a single turn attempt via the sampler-based path.
 /// `CompactAndResubmit` short-circuits the outer turn loop with
 /// `continue` (the turn driver re-builds the request from the latest

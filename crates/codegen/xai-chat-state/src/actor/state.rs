@@ -165,9 +165,11 @@ pub(crate) struct ChatState {
     /// Pending host-observed identity for the current model response.
     ///
     /// Stamped by `record_response_identity` **before** response items are
-    /// pushed (usage-independent). Cloned onto each preceding `Reasoning`
-    /// persist; taken once on the trailing `Assistant` so identity cannot
-    /// leak to the next response. Bootstrap/replace never invents this.
+    /// pushed (usage-independent). API comes from the frozen sampler-attempt
+    /// backend; model from the resolved response when present. Cloned onto
+    /// each preceding `Reasoning` persist; taken once on the trailing
+    /// `Assistant` so identity cannot leak to the next response.
+    /// Bootstrap/replace never invents this.
     pub pending_assistant_identity: Option<crate::HostAssistantIdentity>,
     /// Billing for the open prompt (cleared on next prompt; not persisted).
     pub prompt_usage: Option<UsageLedger>,
