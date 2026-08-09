@@ -1,10 +1,11 @@
 # Install & use
 
-Build and run **this fork** from source. Upstream install scripts and
-prebuilt `grok` binaries do **not** include LHC.
+Build and run **this fork** from source: Grok Build with optional
+long-horizon context (LHC). Upstream install scripts and prebuilt `grok`
+binaries do **not** include that path.
 
-For what the fork is, see [`README.md`](README.md). For maintainer drills, see
-[`../FORK.md`](../FORK.md).
+For *why* the fork exists, see [`README.md`](README.md). For maintainer
+drills, see [`../FORK.md`](../FORK.md).
 
 ---
 

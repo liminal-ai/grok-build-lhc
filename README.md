@@ -1,22 +1,25 @@
 > **This is a maintained fork of [`xai-org/grok-build`](https://github.com/xai-org/grok-build).**
 >
-> It adds [**LHC** (Long Horizon Context)](https://github.com/liminal-ai/long-horizon-context):
-> every session is captured into a durable SQLite record, and what the model
-> sees is a *rendering* of that record — recent work at full fidelity, older
-> work progressively compressed — rather than a one-shot summary that throws
-> the originals away. History is kept; any band can be rebuilt. The agent can
-> also pull specific past turns and messages on demand.
+> **Why it exists.** Long agent sessions hit a hard limit: the context window
+> fills, older work is summarized or dropped, and the session loses coherence.
+> That is fine for a short task. It is a poor fit for days of continuous work
+> where decisions, constraints, and “why we did that” still matter.
 >
-> Fork work lives on the default branch **`lhc`**. Branch **`main`** tracks
-> upstream only. LHC is **off by default**; with it disabled this tree behaves
-> like upstream Grok Build.
+> **What this fork does.** It keeps Grok Build as the coding harness and adds
+> [**LHC** (Long Horizon Context)](https://github.com/liminal-ai/long-horizon-context)
+> so memory can age gracefully: recent work stays sharp, older work compresses
+> in stages, nothing important is thrown away as the only copy, and the agent
+> can pull full detail back when a thin summary is not enough.
 >
-> - [**What this fork is**](lhc-docs/README.md) — problem, idea, how it fits Grok
+> LHC is **off by default** (this tree still runs as ordinary Grok Build).
+> Product work is on branch **`lhc`**; **`main`** tracks upstream only.
+>
+> - [**What this fork is**](lhc-docs/README.md) — problem, approach, how it fits Grok
 > - [**Install & use**](lhc-docs/INSTALL.md) — build, enable, verify
-> - [**LHC project**](https://github.com/liminal-ai/long-horizon-context) — the context engine (all hosts)
+> - [**LHC project**](https://github.com/liminal-ai/long-horizon-context) — the shared context engine
 >
-> Prebuilt fork releases are not published yet; run from this source tree.
-> Upstream install scripts and binaries do **not** include LHC.
+> No prebuilt fork releases yet — use this source tree. Official `grok`
+> installers do **not** include LHC.
 >
 > Everything below is upstream's README.
 

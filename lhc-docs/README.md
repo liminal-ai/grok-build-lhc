@@ -1,114 +1,121 @@
 # grok-build-lhc — what this fork is
 
-A maintained public fork of
-[`xai-org/grok-build`](https://github.com/xai-org/grok-build) that adds
-[**LHC** (Long Horizon Context)](https://github.com/liminal-ai/long-horizon-context).
+A maintained fork of Grok Build that aims at **long-horizon work**: sessions
+that stay useful across many hours or days, not just until the first context
+crunch.
 
-This page is the short tour: what problem we care about, what LHC does, and
-how that shows up inside Grok Build. For build and enable steps, see
-[Install & use](INSTALL.md). For hooks, sync drills, and recovery (maintainers),
-see [`FORK.md`](../FORK.md).
+If you only need a short orientation: **this is Grok Build with better memory
+for long projects.** The rest of this page is the why and how, still short.
+Install steps live in [Install & use](INSTALL.md). Maintainer contract:
+[`FORK.md`](../FORK.md).
 
 ---
 
-## The problem in one minute
+## The problem
 
-Coding agents fill a context window. When it gets full, most harnesses
-**summarize the old part and drop the original**. Do that a few times and the
-session develops a cliff: sharp recent work, a mush of summaries further
-back, and no honest way back to what actually happened.
+Coding agents are strong in the moment and weak over time.
 
-That is fine for a short task. It is a bad foundation for days or weeks of
-continuous work.
+As a session grows, the window fills. The usual fix is to **summarize or drop
+older context**. Do that repeatedly and you get a cliff: crisp recent turns,
+a vague mush further back, and no honest way back to the real trail of
+decisions, failures, and constraints.
 
-## What LHC does instead
+That is acceptable for a one-hour task. It is a bad foundation when you are
+steering a real codebase for a week — the agent “forgets” in the worst way:
+not gently, but by destroying the only high-fidelity copy of what happened.
 
-LHC keeps a **full durable record** of the session (typed events in
-per-thread SQLite). What the model *sees* is a **rendering** of that record:
+## The purpose of this fork
 
-| Closer to now | Further back |
+Keep **Grok Build** (SpaceXAI’s coding agent harness) as the thing you drive
+day to day, and give it a **context layer built for long horizons**:
+
+- Stay coherent longer without stuffing the window with every tool dump forever  
+- Prefer a **gentle fade** of older work over a single hard cliff  
+- Keep a path back to detail when the thin view is not enough  
+- Remain **opt-in**, so the fork is still usable as plain Grok Build  
+
+The engine behind that is
+[**LHC** (Long Horizon Context)](https://github.com/liminal-ai/long-horizon-context)
+— the same project used on other hosts (for example
+[codex-lhc](https://github.com/liminal-ai/codex-lhc)). This repository is the
+**Grok Build host**: LHC integrated into this codebase and kept merging with
+upstream.
+
+## How it thinks about memory (high level)
+
+**Two layers, not one:**
+
+1. **What actually happened** — the full session trail is retained so it can
+   be rebuilt and inspected later.  
+2. **What the model sees right now** — a working view sized for the window:
+   recent material sharp, older material more compressed.
+
+Compaction is closer to **re-rendering a long story at a target length** than
+to “replace the past with one irreversible paragraph.” When a compressed
+stretch is not enough, the agent can **ask for specific past turns or
+messages** and refresh that slice — history-native retrieval, not “hope
+search finds it.”
+
+If you want the deep design (bands, derivations, intake, ethics of not
+erasing archives), read the LHC repo’s
+[onboard docs](https://github.com/liminal-ai/long-horizon-context/tree/main/docs/onboard).
+You do not need that to evaluate whether this fork is interesting.
+
+## What you get in Grok, practically
+
+| Capability | In plain terms |
 |---|---|
-| Full fidelity (live tail) | Smoother turn-level texture |
-| | Then fuller summaries |
-| | Then brief outcomes |
+| Capture | Session activity can be recorded into the long-horizon store |
+| Banded context | Model context prefers a ramp of fidelity over a single cliff |
+| Compact | LHC can own compaction instead of only native auto-compact |
+| Pull | Tools to re-open older turns/messages when needed |
+| Operator controls | `/lhc` status, health, on/off, repair |
 
-So memory **ramps down** instead of falling off a cliff. The originals stay
-in the archive. Compaction assembles a new view from material already derived;
-it does not invent a one-time irreversible summary blob as the only truth.
+Default is **off**. Enable when you want the long-horizon path; leave it off
+and you are close to stock Grok Build behavior.
 
-When a thin band is not enough, the agent can **pull** specific past turns or
-messages at higher fidelity (`get_turns` / `get_messages`) instead of hoping a
-keyword search guesses right.
+## What this fork is not
 
-Full concepts and design live in the LHC repo — start at
-[`docs/onboard/`](https://github.com/liminal-ai/long-horizon-context/tree/main/docs/onboard)
-if you want depth.
+- Not an official xAI product line or release channel  
+- Not a ground-up rewrite of Grok Build  
+- Not “always on” memory theater — it is gated and still evolving  
+- Not a substitute for reading upstream Grok docs for the base CLI/TUI  
 
-## What this fork is (and is not)
+## Branches, releases, maintenance
 
-| This fork is | This fork is not |
+| | |
 |---|---|
-| Grok Build **plus** LHC capture, serve, compact, and retrieval | A rebrand of Grok or a replacement for xAI’s product |
-| A **maintained** integration branch (`lhc`) rebased/merged with upstream | A one-off patch dump |
-| **Opt-in** — off by default; flag-off ≈ upstream behavior | Forced on for every user of `grok` |
-| Built from **source** today | An official xAI release channel |
-
-**Branches**
-
-- **`lhc`** (default) — fork product: LHC host + core touchpoints + docs
-- **`main`** — upstream mirror only (no LHC)
-
-**Releases**
-
-There are no prebuilt fork releases yet. Install and run from this tree. We
-expect to publish fork binaries later so day-to-day use does not require a
-local build; until then, [Install & use](INSTALL.md) is the path.
-
-## How it sits in Grok Build
-
-Integration is intentionally thin so upstream can move daily:
-
-```
-crates/lhc/
-  vendor/long-horizon-context/   LHC SDK (git submodule, pinned)
-  grok-lhc-host/                 adapter — mapping, capture, serve, compact
-```
-
-Core Grok files only get small, marked call sites (`LHC-HOOK`); almost all
-logic lives in the adapter. Inventory and laws: [`FORK.md`](../FORK.md).
-
-In practice that means:
-
-1. **Capture** — conversation items are teed into LHC as the session runs  
-2. **Serve** — when capture is active, model requests can use the LHC view  
-3. **Compact** — LHC smart compact can replace native auto-compact (shadow or
-   experimental replace modes)  
-4. **Retrieve** — tools to pull historical turns/messages from the archive  
-5. **Operator surface** — `/lhc` status, health, repair, per-session on/off  
-
-## Related projects
-
-LHC is one engine with several hosts. This repo is the **Grok Build** host.
-
-- [**long-horizon-context**](https://github.com/liminal-ai/long-horizon-context) — SDK, onboard docs, other host packages  
-- [**codex-lhc**](https://github.com/liminal-ai/codex-lhc) — same idea on OpenAI Codex  
-
-## Status (honest, short)
-
-- Capture / serve / banded compact / history pull are integrated and gated.  
-- Default remains **off** until you enable it.  
-- Live certification and some experimental compact paths are still active
-  maintainer work — see `FORK.md` and
-  `crates/lhc/grok-lhc-host/LIVE_RUNBOOK.md` if you are deep in the weeds.  
-- Upstream Grok Build is a monorepo sync; this fork is designed to **merge
-  upstream regularly** and survive history resets via patches + tripwires.
+| **`lhc`** (default) | Product branch: Grok + LHC |
+| **`main`** | Upstream mirror only |
+| **Releases** | No prebuilt fork binaries yet — build from source ([Install](INSTALL.md)). Fork releases may come later. |
+| **Upstream** | Merged regularly; the fork is designed to survive that churn |
 
 ## Where to go next
 
 | You want… | Go to |
 |---|---|
 | Build, enable, verify | [Install & use](INSTALL.md) |
-| Maintainer contract (hooks, sync, recovery) | [`FORK.md`](../FORK.md) |
-| LHC itself (concepts, other hosts) | [liminal-ai/long-horizon-context](https://github.com/liminal-ai/long-horizon-context) |
-| Deeper LHC design reading | [docs/onboard/](https://github.com/liminal-ai/long-horizon-context/tree/main/docs/onboard) |
-| Upstream Grok product docs | Remainder of the root [README](../README.md) and [x.ai/cli](https://x.ai/cli) |
+| How the integration is structured (hooks, layout) | [Technical shape](#technical-shape-optional) below, then [`FORK.md`](../FORK.md) |
+| LHC concepts in depth | [long-horizon-context](https://github.com/liminal-ai/long-horizon-context) · [docs/onboard](https://github.com/liminal-ai/long-horizon-context/tree/main/docs/onboard) |
+| Base Grok product | Root [README](../README.md) below the banner · [x.ai/cli](https://x.ai/cli) |
+
+---
+
+## Technical shape (optional)
+
+Only if you are already sold on the purpose and want the map.
+
+```
+crates/lhc/
+  vendor/long-horizon-context/   LHC SDK (submodule, pinned)
+  grok-lhc-host/                 adapter (capture, serve, compact, tools)
+```
+
+Core Grok touchpoints stay small and marked (`LHC-HOOK`); almost all LHC
+logic lives in the adapter so upstream can move without a rewrite. Details,
+sync drill, and recovery: [`FORK.md`](../FORK.md).
+
+**Status (honest):** capture, serve, banded compact, and history pull are
+integrated and gated. Live certification and some compact modes are still
+active work. Prefer [Install](INSTALL.md) for “can I run it?” and `FORK.md`
+for “can I maintain it?”
