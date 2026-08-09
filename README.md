@@ -1,3 +1,25 @@
+> **This is a maintained fork of [`xai-org/grok-build`](https://github.com/xai-org/grok-build).**
+>
+> It adds [**LHC** (Long Horizon Context)](https://github.com/liminal-ai/long-horizon-context):
+> every session is captured into a durable SQLite record, and what the model
+> sees is a *rendering* of that record — recent work at full fidelity, older
+> work progressively compressed — rather than a one-shot summary that throws
+> the originals away. History is kept; any band can be rebuilt. The agent can
+> also pull specific past turns and messages on demand.
+>
+> Fork work lives on the default branch **`lhc`**. Branch **`main`** tracks
+> upstream only. LHC is **off by default**; with it disabled this tree behaves
+> like upstream Grok Build.
+>
+> - [**What this fork is**](lhc-docs/README.md) — problem, idea, how it fits Grok
+> - [**Install & use**](lhc-docs/INSTALL.md) — build, enable, verify
+> - [**LHC project**](https://github.com/liminal-ai/long-horizon-context) — the context engine (all hosts)
+>
+> Prebuilt fork releases are not published yet; run from this source tree.
+> Upstream install scripts and binaries do **not** include LHC.
+>
+> Everything below is upstream's README.
+
 <div align="center">
 
 <h1>

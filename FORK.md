@@ -1,5 +1,12 @@
 # grok-build-lhc — LHC context management for Grok Build
 
+**Visitors / evaluators:** start at
+[`lhc-docs/README.md`](lhc-docs/README.md) (what this fork is) and
+[`lhc-docs/INSTALL.md`](lhc-docs/INSTALL.md) (build and enable). The root
+[`README.md`](README.md) opens with a short fork banner, then upstream’s
+README. This file is the **maintenance contract** — touchpoints, sync,
+recovery, gating detail.
+
 Fork of [`xai-org/grok-build`](https://github.com/xai-org/grok-build) adding
 [LHC](https://github.com/liminal-ai/long-horizon-context) (Long Horizon
 Context): event-sourced capture of every session into a per-thread SQLite
@@ -10,11 +17,13 @@ branch: `lhc`. `main` tracks upstream, untouched.
 Status: Chunk 3B harness track in progress (3A accepted); product wiring — config, `/lhc` status/repair, rollout
 safety) of the 3-chunk integration
 (`long-horizon-context/docs/lhc-rs-port/phase3-grok-build-integration-brief.md`).
-Capture and serving are gated off by default (`GROK_LHC` / `[lhc]`). A resolving
-capture tee is always installed so mid-session `/lhc on` (A5) can attach. When
-a session has no worker, its persist path takes **no registry mutex** — even if
-other sessions are actively capturing — via a per-session generation-cached
-binding (`aa1_disabled_persist_takes_no_registry_lock_while_other_session_active`).
+Wave B retrieval tools (`get_turns` / `get_messages`) and identity/signature
+work are on `lhc`. Capture and serving are gated off by default (`GROK_LHC` /
+`[lhc]`). A resolving capture tee is always installed so mid-session `/lhc on`
+(A5) can attach. When a session has no worker, its persist path takes **no
+registry mutex** — even if other sessions are actively capturing — via a
+per-session generation-cached binding
+(`aa1_disabled_persist_takes_no_registry_lock_while_other_session_active`).
 Steady state: one generation atomic compare; mutex only when registration
 actually changes. No I/O, no spawn, no SQLite on that path. Chunk 3B (live
 certification) remains.
@@ -334,17 +343,27 @@ durable representation of the fork.
    sorted; our `crates/lhc/grok-lhc-host` members entry will collide.
    Resolution rule: take upstream's list, re-add our single entry in sort
    order. Never hand-resolve anything else in that file.
-3. `scripts/check-lhc-hooks.sh` — all layers green.
-4. Fast-forward `main` to `upstream/main`.
-5. **Advance the patch base.** `patches/BASE` names the upstream commit the
+3. **Re-assert the root `README.md` fork banner.** Upstream rewrites the
+   README often. The blockquote at the top of `README.md` (starts with
+   `This is a maintained fork of`, links `lhc-docs/` and
+   `liminal-ai/long-horizon-context`, ends with `Everything below is
+   upstream's README`) is fork-owned. After a merge, if the banner is
+   missing or mangled, restore it from the previous `lhc` tip or from
+   `lhc-docs/` intent — do not leave default-branch `README.md` as pure
+   upstream. `lhc-docs/**` and `FORK.md` are fork-only; they should not
+   conflict with upstream.
+4. `scripts/check-lhc-hooks.sh` — all layers green.
+5. Fast-forward `main` to `upstream/main`.
+6. **Advance the patch base.** `patches/BASE` names the upstream commit the
    state diff is generated from; a merge moves the tree past it. Rewrite
    `BASE` with the new `main` and regenerate `0001-lhc-touchpoints.patch`
    (`patches/README.md`). This step is **part of the sync**, not cleanup
    after it — the codex-lhc fork learned this the hard way (its `patch-repro`
    gate failed at the first real sync for exactly this omission).
-6. Push both branches.
-7. Sync commit body records: upstream range, tripwire results, smoke verdict.
-   Append an entry to the Sync record section above.
+7. Push both branches.
+8. Sync commit body records: upstream range, tripwire results, smoke verdict,
+   and whether the README banner was re-applied. Append an entry to the Sync
+   record section above.
 
 ## History-reset recovery drill
 
