@@ -349,10 +349,19 @@ fn emit_assistant_conserved(
                 }
             }
             SessionAssistantPartType::Thinking => {
-                if let Some(t) = &p.thinking {
-                    out.push(ConversationItem::Reasoning(synthesized_reasoning_item(
-                        t.clone(),
-                    )));
+                // Preserve opaque thinkingSignature → Reasoning.encrypted_content
+                // (R2 capture/serve parity). Host identity (provider/model/api)
+                // is not wired in this slice.
+                let signature = p.thinking_signature.as_ref().filter(|s| !s.is_empty());
+                if p.thinking.is_none() && signature.is_none() {
+                    // Nothing to conserve.
+                } else {
+                    let text = p.thinking.clone().unwrap_or_default();
+                    let mut item = synthesized_reasoning_item(text);
+                    if let Some(sig) = signature {
+                        item.encrypted_content = Some(sig.clone());
+                    }
+                    out.push(ConversationItem::Reasoning(item));
                 }
             }
             SessionAssistantPartType::ToolCall => {
@@ -520,11 +529,16 @@ mod tests {
                     type_: SessionAssistantPartType::Text,
                     text: Some(text.into()),
                     thinking: None,
+                    thinking_signature: None,
                     tool_call_id: None,
                     tool_name: None,
                     arguments: None,
                 }],
                 source_messages: vec![src(id)],
+
+                provider: None,
+                model: None,
+                api: None,
             },
         ))
     }
@@ -539,11 +553,16 @@ mod tests {
                     type_: SessionAssistantPartType::ToolCall,
                     text: None,
                     thinking: None,
+                    thinking_signature: None,
                     tool_call_id: Some("c1".into()),
                     tool_name: Some(name.into()),
                     arguments: Some(args),
                 }],
                 source_messages: vec![src(id)],
+
+                provider: None,
+                model: None,
+                api: None,
             },
         ))
     }
@@ -973,6 +992,7 @@ mod tests {
                         type_: SessionAssistantPartType::Thinking,
                         text: None,
                         thinking: Some("plan".into()),
+                        thinking_signature: None,
                         tool_call_id: None,
                         tool_name: None,
                         arguments: None,
@@ -981,12 +1001,17 @@ mod tests {
                         type_: SessionAssistantPartType::Text,
                         text: Some("ok".into()),
                         thinking: None,
+                        thinking_signature: None,
                         tool_call_id: None,
                         tool_name: None,
                         arguments: None,
                     },
                 ],
                 source_messages: vec![src("a")],
+
+                provider: None,
+                model: None,
+                api: None,
             }),
         )]);
         let items =
@@ -1000,6 +1025,49 @@ mod tests {
             matches!(&items[1], ConversationItem::Assistant(a) if a.content.as_ref() == "ok"),
             "text part must remain Assistant"
         );
+    }
+
+    /// R2: session-view thinkingSignature → Reasoning.encrypted_content.
+    #[test]
+    fn thinking_signature_is_conserved_as_encrypted_content() {
+        use lhc::shared_tech::view::{SessionAssistantMessage, SessionAssistantPart};
+        let v = view(vec![SessionThreadViewEntry::Message(
+            SessionThreadViewMessage::Assistant(SessionAssistantMessage {
+                content: vec![
+                    SessionAssistantPart {
+                        type_: SessionAssistantPartType::Thinking,
+                        text: None,
+                        thinking: Some("plan".into()),
+                        thinking_signature: Some("enc-sig-abc".into()),
+                        tool_call_id: None,
+                        tool_name: None,
+                        arguments: None,
+                    },
+                    SessionAssistantPart {
+                        type_: SessionAssistantPartType::Text,
+                        text: Some("ok".into()),
+                        thinking: None,
+                        thinking_signature: None,
+                        tool_call_id: None,
+                        tool_name: None,
+                        arguments: None,
+                    },
+                ],
+                source_messages: vec![src("a")],
+                provider: None,
+                model: None,
+                api: None,
+            }),
+        )]);
+        let items =
+            session_view_to_serve_items(&v, &SourceKindIndex::assume_sourced_users_are_prompts(&v))
+                .unwrap();
+        match &items[0] {
+            ConversationItem::Reasoning(r) => {
+                assert_eq!(r.encrypted_content.as_deref(), Some("enc-sig-abc"));
+            }
+            other => panic!("expected Reasoning with signature, got {other:?}"),
+        }
     }
 
     /// N1: classifier must ignore tool-result body truncation at the view

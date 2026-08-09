@@ -9,8 +9,8 @@ use std::path::PathBuf;
 
 use grok_lhc_host::{TurnEndFacts, map_history, map_model_change};
 use lhc::intake_stream::{
-    AssistantTextPayload, ModelChangePayload, TextPayload, ThinkingLevelChangePayload,
-    ToolCallPayload, ToolResultPayload, TurnEndPayload,
+    AssistantTextPayload, AssistantThinkingPayload, ModelChangePayload, TextPayload,
+    ThinkingLevelChangePayload, ToolCallPayload, ToolResultPayload, TurnEndPayload,
 };
 use serde_json::{Map, Value, json};
 use xai_grok_sampling_types::{
@@ -65,13 +65,20 @@ fn assert_lhc_payload_shapes(events: &[grok_lhc_host::MappedEvent]) {
         let v = Value::Object(e.input.payload.clone());
         match e.input.event_kind.as_str() {
             // assistant_text is schema-v5 `AssistantTextPayload` (optional
-            // providerUsage); shared TextPayload is deny_unknown_fields and
-            // panics when usage is present.
+            // providerUsage + optional provenance); shared TextPayload is
+            // deny_unknown_fields and panics when usage is present.
             "assistant_text" => {
                 let _: AssistantTextPayload = serde_json::from_value(v)
                     .unwrap_or_else(|err| panic!("assistant_text payload decode failed: {err}"));
             }
-            "user_prompt" | "assistant_thinking" | "runtime_note" => {
+            // R2: assistant_thinking is AssistantThinkingPayload (optional
+            // signature + provenance), no longer plain TextPayload.
+            "assistant_thinking" => {
+                let _: AssistantThinkingPayload = serde_json::from_value(v).unwrap_or_else(|err| {
+                    panic!("assistant_thinking payload decode failed: {err}")
+                });
+            }
+            "user_prompt" | "runtime_note" => {
                 let _: TextPayload = serde_json::from_value(v).unwrap_or_else(|err| {
                     panic!("{} payload decode failed: {err}", e.input.event_kind)
                 });
@@ -396,11 +403,16 @@ fn golden_serving_substitute_preserves_system_prefix() {
                         type_: SessionAssistantPartType::Text,
                         text: Some("lhc-assistant".into()),
                         thinking: None,
+                        thinking_signature: None,
                         tool_call_id: None,
                         tool_name: None,
                         arguments: None,
                     }],
                     source_messages: vec![src("a")],
+
+                    provider: None,
+                    model: None,
+                    api: None,
                 },
             )),
         ],

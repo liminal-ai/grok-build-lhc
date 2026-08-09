@@ -169,11 +169,16 @@ fn view_assistant_text(text: &str, id: &str) -> SessionThreadViewEntry {
                 type_: SessionAssistantPartType::Text,
                 text: Some(text.into()),
                 thinking: None,
+                thinking_signature: None,
                 tool_call_id: None,
                 tool_name: None,
                 arguments: None,
             }],
             source_messages: vec![view_src(id)],
+
+            provider: None,
+            model: None,
+            api: None,
         },
     ))
 }
@@ -187,11 +192,16 @@ fn view_assistant_tool(name: &str, args: &str, id: &str) -> SessionThreadViewEnt
                 type_: SessionAssistantPartType::ToolCall,
                 text: None,
                 thinking: None,
+                thinking_signature: None,
                 tool_call_id: Some("c1".into()),
                 tool_name: Some(name.into()),
                 arguments: Some(arguments),
             }],
             source_messages: vec![view_src(id)],
+
+            provider: None,
+            model: None,
+            api: None,
         },
     ))
 }

@@ -16,7 +16,7 @@ Actor / harness stamped on every event: `actor = "grok"`, `harness = "grok-build
 | `Assistant` | `assistant_text` (if content non-empty, or no tool calls); one `tool_call` per `ToolCall`; `turn_end` when `tool_calls` is empty | Client-executed tool calls only on this item. |
 | `ToolResult` | `tool_result` | `tool_call_id` + `content` (+ image parts folded into text). `is_error` omitted (`None`) — host `ToolResultItem` does not persist an error flag. |
 | `BackendToolCall` | `tool_call` **and** paired `tool_result` | Server-side tools are recorded as a call plus an immediate result carrying status/outputs (see below). |
-| `Reasoning` | `assistant_thinking` | `text` from `reasoning_item_text` (summary + content parts). |
+| `Reasoning` | `assistant_thinking` | `text` from `reasoning_item_text` (summary + content parts). Optional `signature` = `encrypted_content` when non-empty (SDK R2). Host `provider`/`model`/`api` provenance is **not** attached yet (later identity slice). |
 
 ## `SyntheticReason`
 

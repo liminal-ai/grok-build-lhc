@@ -27,10 +27,11 @@ certification) remains.
   commits of the SDK repo's `main` only (Phase 2 acceptance `358c8d1` or
   later; the historical `lhc-rs-port` working branch was retired into `main`
   2026-08-08). Never copy the port in; bump the pin and record it here.
-  Current pin: `c136899` (tag `vendor-pin/grok-a3deafd-token-hotfix`:
-  `a3deafd` + capture-totality token-counting hotfix, applied live
-  2026-08-08 after a special-token panic; bump to the signed R1–R6 wave tip
-  `65580ea` opens the grok fork wave).
+  Current pin: `dd251ec` (certified Wave B code tip — R1–R6 retrieval +
+  thinking-signature/provenance schema + clean-tail windows; gate 584).
+  Later LHC `main` commit `7493f36` is bookkeeping only and is **not** the
+  pin. Wave B Slice 1 advances the pin and host schema compatibility only;
+  retrieval tools and host identity/provenance wiring are later slices.
 - `patches/` — every core touchpoint as a re-appliable `format-patch` file
   (see `patches/README.md`). The history-reset recovery path.
 - `scripts/check-lhc-hooks.sh` — the three-layer tripwire (sentinel count,
@@ -177,6 +178,23 @@ The production choke still uses `params: None`; live Replace must produce
 bands under real budgets for that kill test to be meaningful.
 
 ## Sync record
+
+### 2026-08-09 — Wave B Slice 1: vendor pin `c136899` → `dd251ec`
+
+Submodule-only certified code tip advance (not a main/upstream merge).
+`main` remains at `8a14c91`. Host compatibility for the new SDK surface:
+
+- `assistant_thinking.signature` ← host `Reasoning.encrypted_content` (R2)
+- session-view `thinkingSignature` → `encrypted_content` on serve
+- struct literals for new optional view fields (`thinking_signature`,
+  assistant `provider`/`model`/`api`) — values left `None` (no host identity
+  design in this slice)
+- golden payload decode: `AssistantThinkingPayload` (no longer plain
+  `TextPayload`)
+
+**Not in this slice:** retrieval tool wiring, host model-identity/provenance
+capture for signature replay, any new LHC-HOOK markers. All 10 existing
+hooks and existing LHC behavior preserved.
 
 ### 2026-08-09 — `a5589e9..8a14c91` (3 squash commits, ~37k insertions)
 

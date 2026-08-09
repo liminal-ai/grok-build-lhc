@@ -269,14 +269,14 @@ pub fn map_item(
             } else {
                 Some(reasoning.id.as_str())
             };
-            vec![text_event(
-                session_id,
-                generation,
-                &digest,
-                occ,
-                "assistant_thinking",
-                &text,
-                part,
+            // Preserve host-owned encrypted reasoning as LHC signature (R2).
+            // provider/model/api identity is a later host-design slice — omit here.
+            let signature = reasoning
+                .encrypted_content
+                .as_deref()
+                .filter(|s| !s.is_empty());
+            vec![thinking_event(
+                session_id, generation, &digest, occ, &text, part, signature,
             )]
         }
     }
@@ -416,6 +416,39 @@ fn text_event(
             actor: ACTOR.to_string(),
             harness: HARNESS.to_string(),
             payload: text_payload(text),
+            extra: Map::new(),
+        },
+    }
+}
+
+/// Map `assistant_thinking` with optional opaque signature (encrypted reasoning).
+///
+/// Schema R2: payload is `AssistantThinkingPayload` (`text` + optional
+/// `signature`). Empty signature is omitted rather than sent as `""`.
+fn thinking_event(
+    session_id: &str,
+    generation: u64,
+    digest: &str,
+    occ: u64,
+    text: &str,
+    part: Option<&str>,
+    signature: Option<&str>,
+) -> MappedEvent {
+    let key = item_event_key(
+        session_id,
+        generation,
+        digest,
+        occ,
+        "assistant_thinking",
+        part,
+    );
+    MappedEvent {
+        input: MessageEventInput {
+            event_kind: "assistant_thinking".to_string(),
+            idempotency_key: Some(key),
+            actor: ACTOR.to_string(),
+            harness: HARNESS.to_string(),
+            payload: assistant_thinking_payload(text, signature),
             extra: Map::new(),
         },
     }
@@ -651,6 +684,14 @@ fn backend_tool_events(
 fn text_payload(text: &str) -> Map<String, Value> {
     let mut map = Map::new();
     map.insert("text".into(), json!(text));
+    map
+}
+
+fn assistant_thinking_payload(text: &str, signature: Option<&str>) -> Map<String, Value> {
+    let mut map = text_payload(text);
+    if let Some(sig) = signature {
+        map.insert("signature".into(), json!(sig));
+    }
     map
 }
 
@@ -1064,6 +1105,32 @@ mod tests {
         let item = ConversationItem::Reasoning(synthesized_reasoning_item("think"));
         let ev = map_item("s", 0, &item, &mut t, &empty_facts());
         assert_eq!(ev[0].input.event_kind, "assistant_thinking");
+        assert_eq!(ev[0].input.payload.get("text"), Some(&json!("think")));
+        assert!(
+            ev[0].input.payload.get("signature").is_none(),
+            "synthesized reasoning has no encrypted_content"
+        );
+    }
+
+    /// R2: host `Reasoning.encrypted_content` maps to LHC `signature`.
+    #[test]
+    fn reasoning_encrypted_content_is_signature() {
+        let mut t = OccurrenceTracker::new();
+        let mut r = synthesized_reasoning_item("think");
+        r.encrypted_content = Some("enc-sig-xyz".into());
+        let item = ConversationItem::Reasoning(r);
+        let ev = map_item("s", 0, &item, &mut t, &empty_facts());
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].input.event_kind, "assistant_thinking");
+        assert_eq!(ev[0].input.payload.get("text"), Some(&json!("think")));
+        assert_eq!(
+            ev[0].input.payload.get("signature"),
+            Some(&json!("enc-sig-xyz"))
+        );
+        // Identity provenance deliberately not invented here.
+        assert!(ev[0].input.payload.get("provider").is_none());
+        assert!(ev[0].input.payload.get("model").is_none());
+        assert!(ev[0].input.payload.get("api").is_none());
     }
 
     #[test]

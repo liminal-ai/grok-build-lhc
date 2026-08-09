@@ -932,6 +932,7 @@ mod tests {
                             type_: SessionAssistantPartType::ToolCall,
                             text: None,
                             thinking: None,
+                            thinking_signature: None,
                             tool_call_id: Some("c1".into()),
                             tool_name: Some(tool_name.into()),
                             arguments: Some(args),
@@ -940,6 +941,10 @@ mod tests {
                             message_id: "a".into(),
                             idempotency_key: Some("a".into()),
                         }],
+
+                        provider: None,
+                        model: None,
+                        api: None,
                     },
                 )),
             ],
