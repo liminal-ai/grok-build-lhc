@@ -20,7 +20,15 @@ use lhc::shared_tech::view::{
     SessionUserMessage,
 };
 use tracing::{debug, warn};
+use xai_chat_state::HostAssistantIdentity;
 use xai_grok_sampling_types::{ConversationItem, ToolCall, synthesized_reasoning_item};
+
+/// Live request identity for safe opaque-reasoning replay (Wave B).
+///
+/// Built from the request about to be sent (provider `xai`, request model,
+/// live API backend). Missing or incomplete identity suppresses
+/// `encrypted_content` re-emission.
+pub type LiveRequestIdentity = HostAssistantIdentity;
 
 /// `message_id` → recorded [`MessageKind`], fetched once per translation.
 ///
@@ -254,10 +262,16 @@ pub fn is_band_user(user: &SessionUserMessage) -> bool {
 /// and the view lacks `previous` — stay `user_meta` (SDK/host boundary).
 ///
 /// Bands stay prose by design (compaction). Live-tail kinds round-trip.
+///
+/// `live_identity` gates re-emission of opaque `encrypted_content`: only when
+/// stored message identity is complete and exactly matches the live request.
+/// Pass `None` when the caller has no live request (e.g. pure view tests /
+/// write-back without a model call) — signatures are then suppressed.
 pub fn session_view_to_items(
     view: &SessionThreadView,
     kinds: &SourceKindIndex,
     mode: ViewTranslateMode,
+    live_identity: Option<&LiveRequestIdentity>,
 ) -> Result<Vec<ConversationItem>, String> {
     let mut out = Vec::with_capacity(view.entries.len());
     let mut band_chunks: Vec<String> = Vec::new();
@@ -297,7 +311,7 @@ pub fn session_view_to_items(
             }
             SessionThreadViewEntry::Message(SessionThreadViewMessage::Assistant(a)) => {
                 flush_bands(&mut out, &mut band_chunks);
-                emit_assistant_conserved(a, &mut out);
+                emit_assistant_conserved(a, &mut out, live_identity);
             }
             SessionThreadViewEntry::Message(SessionThreadViewMessage::ToolResult(tr)) => {
                 flush_bands(&mut out, &mut band_chunks);
@@ -333,10 +347,27 @@ pub fn session_view_to_items(
 
 /// Emit conserved assistant parts: `Reasoning` siblings, then `Assistant`
 /// with text content and real `tool_calls`.
+///
+/// Opaque signature re-emit policy (host-owned, not SDK): only when stored
+/// provider/model/api is complete **and** exactly matches `live_identity`.
+/// Mismatch or missing either side keeps visible reasoning text but drops
+/// `encrypted_content` so Grok never hits a terminal incompatible-history 400.
+/// Stored model is restored onto `AssistantItem.model_id` when present.
 fn emit_assistant_conserved(
     a: &lhc::shared_tech::view::SessionAssistantMessage,
     out: &mut Vec<ConversationItem>,
+    live_identity: Option<&LiveRequestIdentity>,
 ) {
+    let stored = HostAssistantIdentity {
+        provider: a.provider.clone().unwrap_or_default(),
+        model: a.model.clone(),
+        api: a.api.clone(),
+    };
+    let reemit_signature = match live_identity {
+        Some(live) => stored.matches_live(live),
+        None => false,
+    };
+
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     for p in &a.content {
@@ -349,12 +380,18 @@ fn emit_assistant_conserved(
                 }
             }
             SessionAssistantPartType::Thinking => {
-                // Preserve opaque thinkingSignature → Reasoning.encrypted_content
-                // (R2 capture/serve parity). Host identity (provider/model/api)
-                // is not wired in this slice.
-                let signature = p.thinking_signature.as_ref().filter(|s| !s.is_empty());
-                if p.thinking.is_none() && signature.is_none() {
+                let signature = p
+                    .thinking_signature
+                    .as_ref()
+                    .filter(|s| !s.is_empty())
+                    .filter(|_| reemit_signature);
+                if p.thinking.is_none()
+                    && p.thinking_signature.as_ref().is_none_or(|s| s.is_empty())
+                {
                     // Nothing to conserve.
+                } else if p.thinking.is_none() && signature.is_none() {
+                    // Signature-only block suppressed by identity gate — drop
+                    // the empty husk (nothing visible to keep).
                 } else {
                     let text = p.thinking.clone().unwrap_or_default();
                     let mut item = synthesized_reasoning_item(text);
@@ -387,11 +424,13 @@ fn emit_assistant_conserved(
     if content.is_empty() && tool_calls.is_empty() {
         return;
     }
+    // Restore stored model provenance when the native type supports it.
+    let model_id = a.model.as_ref().filter(|m| !m.is_empty()).cloned();
     out.push(ConversationItem::Assistant(
         xai_grok_sampling_types::AssistantItem {
             content: std::sync::Arc::<str>::from(content),
             tool_calls,
-            model_id: None,
+            model_id,
             model_fingerprint: None,
             reasoning_effort: None,
         },
@@ -407,7 +446,10 @@ pub fn build_writeback_conversation(
     view: &SessionThreadView,
     kinds: &SourceKindIndex,
 ) -> Result<Vec<ConversationItem>, String> {
-    let mut body = session_view_to_items(view, kinds, ViewTranslateMode::Writeback)?;
+    // Write-back has no live model request; suppress encrypted_content so a
+    // later native serve path cannot re-emit signatures under wrong identity.
+    // Visible reasoning text is preserved; model_id is restored from stored.
+    let mut body = session_view_to_items(view, kinds, ViewTranslateMode::Writeback, None)?;
     if body.is_empty() {
         return Err("empty_lhc_context".into());
     }
@@ -421,11 +463,15 @@ pub fn build_writeback_conversation(
 }
 
 /// Serve-mode translation (bands kept separate).
+///
+/// When `live_identity` is complete and matches stored provenance, opaque
+/// thinking signatures are re-emitted; otherwise visible reasoning only.
 pub fn session_view_to_serve_items(
     view: &SessionThreadView,
     kinds: &SourceKindIndex,
+    live_identity: Option<&LiveRequestIdentity>,
 ) -> Result<Vec<ConversationItem>, String> {
-    session_view_to_items(view, kinds, ViewTranslateMode::Serve)
+    session_view_to_items(view, kinds, ViewTranslateMode::Serve, live_identity)
 }
 
 /// Write-back-mode translation (leading bands collapsed).
@@ -433,7 +479,7 @@ pub fn session_view_to_writeback_items(
     view: &SessionThreadView,
     kinds: &SourceKindIndex,
 ) -> Result<Vec<ConversationItem>, String> {
-    session_view_to_items(view, kinds, ViewTranslateMode::Writeback)
+    session_view_to_items(view, kinds, ViewTranslateMode::Writeback, None)
 }
 
 /// True when a body contains tool-call or tool-result items.
@@ -456,8 +502,9 @@ pub fn decide_substitution(
     native_items: &[ConversationItem],
     view: &SessionThreadView,
     kinds: &SourceKindIndex,
+    live_identity: Option<&LiveRequestIdentity>,
 ) -> ServeDecision {
-    let mut body = match session_view_to_serve_items(view, kinds) {
+    let mut body = match session_view_to_serve_items(view, kinds, live_identity) {
         Ok(b) => b,
         Err(err) => {
             warn!(%err, "LHC serving: session-view translation failed; native path");
@@ -661,6 +708,7 @@ mod tests {
             &native,
             &v,
             &SourceKindIndex::assume_sourced_users_are_prompts(&v),
+            None,
         ) {
             ServeDecision::Substitute { items } => {
                 assert_eq!(items.len(), 3);
@@ -675,9 +723,12 @@ mod tests {
     #[test]
     fn substituted_body_has_no_tool_cycle() {
         let v = view(vec![user_prompt("hi", "u")]);
-        let body =
-            session_view_to_serve_items(&v, &SourceKindIndex::assume_sourced_users_are_prompts(&v))
-                .unwrap();
+        let body = session_view_to_serve_items(
+            &v,
+            &SourceKindIndex::assume_sourced_users_are_prompts(&v),
+            None,
+        )
+        .unwrap();
         assert!(!body_has_tool_cycle(&body));
     }
 
@@ -690,6 +741,7 @@ mod tests {
                 &native,
                 &v,
                 &SourceKindIndex::assume_sourced_users_are_prompts(&v),
+                None
             ),
             ServeDecision::Native {
                 reason: "empty_lhc_context"
@@ -712,6 +764,7 @@ mod tests {
             &native,
             &v,
             &SourceKindIndex::assume_sourced_users_are_prompts(&v),
+            None,
         ) {
             ServeDecision::Substitute { items } => {
                 assert!(matches!(&items[0], ConversationItem::System(_)));
@@ -741,6 +794,7 @@ mod tests {
             &native,
             &v,
             &SourceKindIndex::assume_sourced_users_are_prompts(&v),
+            None,
         ) {
             ServeDecision::Substitute { items } => match &items[0] {
                 ConversationItem::System(s) => {
@@ -774,6 +828,7 @@ mod tests {
             &native,
             &v,
             &SourceKindIndex::assume_sourced_users_are_prompts(&v),
+            None,
         ) {
             ServeDecision::Substitute { items } => {
                 assert!(!body_has_tool_cycle(&items));
@@ -806,6 +861,7 @@ mod tests {
             &native,
             &v,
             &SourceKindIndex::assume_sourced_users_are_prompts(&v),
+            None,
         ) else {
             panic!("expected substitute");
         };
@@ -851,6 +907,7 @@ mod tests {
             &native,
             &v,
             &SourceKindIndex::assume_sourced_users_are_prompts(&v),
+            None,
         ) else {
             panic!("expected substitute");
         };
@@ -867,7 +924,8 @@ mod tests {
         let native = native_three_turn_tool_session();
         let v = realistic_post_compact_view();
         let kinds = realistic_kinds(&v);
-        let ServeDecision::Substitute { items } = decide_substitution(&native, &v, &kinds) else {
+        let ServeDecision::Substitute { items } = decide_substitution(&native, &v, &kinds, None)
+        else {
             panic!("expected substitute");
         };
         let real: Vec<_> = items
@@ -954,9 +1012,12 @@ mod tests {
     #[test]
     fn tool_result_is_conserved_as_tool_result_item() {
         let v = view(vec![tool_result("bash", "out", "tr")]);
-        let items =
-            session_view_to_serve_items(&v, &SourceKindIndex::assume_sourced_users_are_prompts(&v))
-                .unwrap();
+        let items = session_view_to_serve_items(
+            &v,
+            &SourceKindIndex::assume_sourced_users_are_prompts(&v),
+            None,
+        )
+        .unwrap();
         match &items[0] {
             ConversationItem::ToolResult(tr) => {
                 assert_eq!(tr.tool_call_id, "c1");
@@ -969,9 +1030,12 @@ mod tests {
     #[test]
     fn assistant_tool_call_is_conserved_on_assistant_item() {
         let v = view(vec![assistant_tool_call("bash", r#"{"cmd":"ls"}"#, "a1")]);
-        let items =
-            session_view_to_serve_items(&v, &SourceKindIndex::assume_sourced_users_are_prompts(&v))
-                .unwrap();
+        let items = session_view_to_serve_items(
+            &v,
+            &SourceKindIndex::assume_sourced_users_are_prompts(&v),
+            None,
+        )
+        .unwrap();
         match &items[0] {
             ConversationItem::Assistant(a) => {
                 assert_eq!(a.tool_calls.len(), 1);
@@ -1014,9 +1078,12 @@ mod tests {
                 api: None,
             }),
         )]);
-        let items =
-            session_view_to_serve_items(&v, &SourceKindIndex::assume_sourced_users_are_prompts(&v))
-                .unwrap();
+        let items = session_view_to_serve_items(
+            &v,
+            &SourceKindIndex::assume_sourced_users_are_prompts(&v),
+            None,
+        )
+        .unwrap();
         assert!(
             matches!(&items[0], ConversationItem::Reasoning(_)),
             "thinking part must emit Reasoning sibling"
@@ -1027,10 +1094,16 @@ mod tests {
         );
     }
 
-    /// R2: session-view thinkingSignature → Reasoning.encrypted_content.
+    /// R2 + Wave B: thinkingSignature → encrypted_content only when stored
+    /// identity is complete and matches the live request.
     #[test]
     fn thinking_signature_is_conserved_as_encrypted_content() {
         use lhc::shared_tech::view::{SessionAssistantMessage, SessionAssistantPart};
+        let live = LiveRequestIdentity {
+            provider: "xai".into(),
+            model: Some("grok-4".into()),
+            api: Some("responses".into()),
+        };
         let v = view(vec![SessionThreadViewEntry::Message(
             SessionThreadViewMessage::Assistant(SessionAssistantMessage {
                 content: vec![
@@ -1054,20 +1127,169 @@ mod tests {
                     },
                 ],
                 source_messages: vec![src("a")],
-                provider: None,
-                model: None,
-                api: None,
+                provider: Some("xai".into()),
+                model: Some("grok-4".into()),
+                api: Some("responses".into()),
             }),
         )]);
-        let items =
-            session_view_to_serve_items(&v, &SourceKindIndex::assume_sourced_users_are_prompts(&v))
-                .unwrap();
+        let items = session_view_to_serve_items(
+            &v,
+            &SourceKindIndex::assume_sourced_users_are_prompts(&v),
+            Some(&live),
+        )
+        .unwrap();
         match &items[0] {
             ConversationItem::Reasoning(r) => {
                 assert_eq!(r.encrypted_content.as_deref(), Some("enc-sig-abc"));
             }
             other => panic!("expected Reasoning with signature, got {other:?}"),
         }
+        match &items[1] {
+            ConversationItem::Assistant(a) => {
+                assert_eq!(a.model_id.as_deref(), Some("grok-4"));
+            }
+            other => panic!("expected Assistant with restored model_id, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn thinking_signature_suppressed_on_model_mismatch() {
+        use lhc::shared_tech::view::{SessionAssistantMessage, SessionAssistantPart};
+        let live = LiveRequestIdentity {
+            provider: "xai".into(),
+            model: Some("grok-4".into()),
+            api: Some("responses".into()),
+        };
+        let v = view(vec![SessionThreadViewEntry::Message(
+            SessionThreadViewMessage::Assistant(SessionAssistantMessage {
+                content: vec![
+                    SessionAssistantPart {
+                        type_: SessionAssistantPartType::Thinking,
+                        text: None,
+                        thinking: Some("plan".into()),
+                        thinking_signature: Some("enc-old".into()),
+                        tool_call_id: None,
+                        tool_name: None,
+                        arguments: None,
+                    },
+                    SessionAssistantPart {
+                        type_: SessionAssistantPartType::Text,
+                        text: Some("ok".into()),
+                        thinking: None,
+                        thinking_signature: None,
+                        tool_call_id: None,
+                        tool_name: None,
+                        arguments: None,
+                    },
+                ],
+                source_messages: vec![src("a")],
+                provider: Some("xai".into()),
+                model: Some("grok-3".into()), // stored differs
+                api: Some("responses".into()),
+            }),
+        )]);
+        let items = session_view_to_serve_items(
+            &v,
+            &SourceKindIndex::assume_sourced_users_are_prompts(&v),
+            Some(&live),
+        )
+        .unwrap();
+        match &items[0] {
+            ConversationItem::Reasoning(r) => {
+                assert_eq!(
+                    r.encrypted_content, None,
+                    "mismatch must suppress signature"
+                );
+                assert!(
+                    !reasoning_item_text_empty(r),
+                    "visible reasoning text must remain"
+                );
+            }
+            other => panic!("expected Reasoning without signature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn thinking_signature_suppressed_on_api_mismatch() {
+        use lhc::shared_tech::view::{SessionAssistantMessage, SessionAssistantPart};
+        let live = LiveRequestIdentity {
+            provider: "xai".into(),
+            model: Some("grok-4".into()),
+            api: Some("responses".into()),
+        };
+        let v = view(vec![SessionThreadViewEntry::Message(
+            SessionThreadViewMessage::Assistant(SessionAssistantMessage {
+                content: vec![SessionAssistantPart {
+                    type_: SessionAssistantPartType::Thinking,
+                    text: None,
+                    thinking: Some("plan".into()),
+                    thinking_signature: Some("enc".into()),
+                    tool_call_id: None,
+                    tool_name: None,
+                    arguments: None,
+                }],
+                source_messages: vec![src("a")],
+                provider: Some("xai".into()),
+                model: Some("grok-4".into()),
+                api: Some("chat_completions".into()),
+            }),
+        )]);
+        let items = session_view_to_serve_items(
+            &v,
+            &SourceKindIndex::assume_sourced_users_are_prompts(&v),
+            Some(&live),
+        )
+        .unwrap();
+        match &items[0] {
+            ConversationItem::Reasoning(r) => {
+                assert_eq!(r.encrypted_content, None);
+            }
+            other => panic!("expected Reasoning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn thinking_signature_suppressed_when_stored_identity_incomplete() {
+        use lhc::shared_tech::view::{SessionAssistantMessage, SessionAssistantPart};
+        let live = LiveRequestIdentity {
+            provider: "xai".into(),
+            model: Some("grok-4".into()),
+            api: Some("responses".into()),
+        };
+        let v = view(vec![SessionThreadViewEntry::Message(
+            SessionThreadViewMessage::Assistant(SessionAssistantMessage {
+                content: vec![SessionAssistantPart {
+                    type_: SessionAssistantPartType::Thinking,
+                    text: None,
+                    thinking: Some("plan".into()),
+                    thinking_signature: Some("enc".into()),
+                    tool_call_id: None,
+                    tool_name: None,
+                    arguments: None,
+                }],
+                source_messages: vec![src("a")],
+                provider: Some("xai".into()),
+                model: None, // incomplete
+                api: Some("responses".into()),
+            }),
+        )]);
+        let items = session_view_to_serve_items(
+            &v,
+            &SourceKindIndex::assume_sourced_users_are_prompts(&v),
+            Some(&live),
+        )
+        .unwrap();
+        match &items[0] {
+            ConversationItem::Reasoning(r) => {
+                assert_eq!(r.encrypted_content, None);
+            }
+            other => panic!("expected Reasoning, got {other:?}"),
+        }
+    }
+
+    fn reasoning_item_text_empty(r: &xai_grok_sampling_types::rs::ReasoningItem) -> bool {
+        use xai_grok_sampling_types::reasoning_item_text;
+        reasoning_item_text(r).is_empty()
     }
 
     /// N1: classifier must ignore tool-result body truncation at the view
@@ -1196,7 +1418,7 @@ mod tests {
     fn runtime_note_classifies_synthetic_via_message_id_kind() {
         let v = view(vec![user_prompt("[runtime note] cwd switched", "rn1")]);
         let as_note = SourceKindIndex::new().with("rn1", lhc::messages::MessageKind::RuntimeNote);
-        let items = session_view_to_serve_items(&v, &as_note).unwrap();
+        let items = session_view_to_serve_items(&v, &as_note, None).unwrap();
         match &items[0] {
             ConversationItem::User(u) => {
                 assert!(
@@ -1208,7 +1430,7 @@ mod tests {
         }
         // Fail toward synthetic when the index has no entry.
         let unknown = SourceKindIndex::new();
-        let items = session_view_to_serve_items(&v, &unknown).unwrap();
+        let items = session_view_to_serve_items(&v, &unknown, None).unwrap();
         assert!(
             matches!(&items[0], ConversationItem::User(u) if u.synthetic_reason.is_some()),
             "lookup miss must not promote to real user"

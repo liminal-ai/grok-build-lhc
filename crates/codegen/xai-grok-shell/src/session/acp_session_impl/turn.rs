@@ -2198,18 +2198,35 @@ impl SessionActor {
                 })),
             );
             let mut request = request;
-            // LHC-HOOK 4/10: substitute LHC request context (all-LHC or all-native)
-            // Cheap atomic first, then per-session registry — no mutex when off.
-            // Hook 4 is instrumented-redundant: observe native vs served (G1);
-            // observation never changes the served result.
+            // LHC-HOOK 4/10: substitute LHC request context after build_request
+            // (+ live identity for signature gate). Cheap atomic first, then
+            // per-session registry — no mutex when off. Instrumented-redundant
+            // equivalence observation (G1) never changes the served result.
             if grok_lhc_host::any_capture_active()
                 && grok_lhc_host::capture_active(self.session_info.id.0.as_ref())
             {
                 let native_items = std::mem::take(&mut request.items);
                 let tools_before = request.tools.len();
+                let live_identity = {
+                    let cfg = self.chat_state_handle.get_sampling_config().await;
+                    let model = request
+                        .model
+                        .clone()
+                        .or_else(|| cfg.as_ref().map(|c| c.model.clone()))
+                        .filter(|m| !m.is_empty());
+                    let api = cfg.as_ref().map(|c| {
+                        grok_lhc_host::api_backend_label(c.api_backend.clone()).to_string()
+                    });
+                    Some(grok_lhc_host::LiveRequestIdentity {
+                        provider: grok_lhc_host::HostAssistantIdentity::PROVIDER_XAI.to_string(),
+                        model,
+                        api,
+                    })
+                };
                 let decision = grok_lhc_host::serve_request_context(
                     self.session_info.id.0.as_ref(),
                     &native_items,
+                    live_identity.as_ref(),
                 )
                 .await;
                 let observe = grok_lhc_host::equivalence_armed();

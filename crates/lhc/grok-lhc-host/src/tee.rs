@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use tokio::sync::oneshot;
-use xai_chat_state::{ChatPersistence, StrictAppendAck, StrictAppendError};
+use xai_chat_state::{ChatPersistence, HostAssistantIdentity, StrictAppendAck, StrictAppendError};
 use xai_grok_sampling_types::{ConversationItem, TokenUsage};
 
 use crate::capture::{
@@ -100,17 +100,19 @@ impl LhcTeePersistence {
 
 impl ChatPersistence for LhcTeePersistence {
     fn persist_message(&mut self, item: &ConversationItem) {
-        self.persist_message_with_provider_usage(item, None);
+        self.persist_message_with_provider_usage(item, None, None);
     }
 
     fn persist_message_with_provider_usage(
         &mut self,
         item: &ConversationItem,
         provider_usage: Option<&TokenUsage>,
+        identity: Option<&HostAssistantIdentity>,
     ) {
         let usage_map = provider_usage.and_then(token_usage_to_provider_usage);
-        self.with_handle(|h| h.persist_with_provider_usage(item, usage_map));
-        // Inner (disk) path does not need usage — chat_history.jsonl is native shape.
+        let identity = identity.cloned();
+        self.with_handle(|h| h.persist_with_capture_facts(item, usage_map, identity));
+        // Inner (disk) path does not need LHC facts — chat_history.jsonl is native shape.
         self.inner.persist_message(item);
     }
 

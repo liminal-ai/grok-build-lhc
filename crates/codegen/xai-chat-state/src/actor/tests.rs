@@ -466,6 +466,7 @@ async fn pending_model_call_usage_consumed_once_on_assistant_persist() {
         total_tokens: 120,
         reasoning_tokens: 5,
         cached_prompt_tokens: 40,
+        cache_creation_prompt_tokens: 0,
     };
 
     h.handle
@@ -487,6 +488,10 @@ async fn pending_model_call_usage_consumed_once_on_assistant_persist() {
             r,
             PersistenceRecord::Message(ConversationItem::Assistant(_))
                 | PersistenceRecord::MessageWithProviderUsage(ConversationItem::Assistant(_), _)
+                | PersistenceRecord::MessageWithCaptureFacts {
+                    item: ConversationItem::Assistant(_),
+                    ..
+                }
         )
     });
 
@@ -511,6 +516,117 @@ async fn pending_model_call_usage_consumed_once_on_assistant_persist() {
         other => panic!("expected plain Message for second assistant, got {other:?}"),
     }
     assert!(assistant_records.next().is_none());
+}
+
+/// Wave B: reasoning + trailing Assistant share the same identity even without
+/// provider usage; identity does not leak to the next response.
+#[tokio::test]
+async fn pending_identity_shared_with_reasoning_and_consumed_on_assistant() {
+    use crate::HostAssistantIdentity;
+    use xai_grok_sampling_types::{ApiBackend, ConversationItem, synthesized_reasoning_item};
+
+    let mut h = TestHarness::new();
+    // Stamp a responses backend so identity.api is observable.
+    let mut cfg = h.handle.get_sampling_config().await.unwrap();
+    cfg.api_backend = ApiBackend::Responses;
+    h.handle.update_sampling_config(cfg);
+    let _ = h.handle.get_conversation().await;
+
+    h.handle.record_response_identity(Some("grok-4".into()));
+    let _ = h.handle.get_conversation().await;
+
+    h.handle
+        .push_tool_result(ConversationItem::Reasoning(synthesized_reasoning_item(
+            "plan",
+        )));
+    let _ = h.handle.get_conversation().await;
+    h.handle
+        .push_assistant_response(ConversationItem::assistant("answer"));
+    let _ = h.handle.get_conversation().await;
+
+    // Second response without a new identity stamp must not inherit.
+    h.handle
+        .push_assistant_response(ConversationItem::assistant("next"));
+    let _ = h.handle.get_conversation().await;
+
+    let records = h.persistence_rx.drain();
+    let expected = HostAssistantIdentity {
+        provider: "xai".into(),
+        model: Some("grok-4".into()),
+        api: Some("responses".into()),
+    };
+
+    let mut with_id = records.into_iter().filter_map(|r| match r {
+        PersistenceRecord::MessageWithCaptureFacts {
+            item,
+            identity: Some(id),
+            ..
+        } => Some((item, id)),
+        _ => None,
+    });
+
+    let (r_item, r_id) = with_id.next().expect("reasoning carries identity");
+    assert!(matches!(r_item, ConversationItem::Reasoning(_)));
+    assert_eq!(r_id, expected);
+
+    let (a_item, a_id) = with_id.next().expect("assistant carries same identity");
+    assert_eq!(a_item.text_content(), "answer");
+    assert_eq!(a_id, expected);
+
+    assert!(
+        with_id.next().is_none(),
+        "identity must not leak to the next assistant"
+    );
+}
+
+/// Wave B: consecutive responses with different models do not cross-label.
+#[tokio::test]
+async fn identity_does_not_leak_across_model_change() {
+    use crate::HostAssistantIdentity;
+    use xai_grok_sampling_types::ApiBackend;
+
+    let mut h = TestHarness::new();
+    let mut cfg = h.handle.get_sampling_config().await.unwrap();
+    cfg.api_backend = ApiBackend::Responses;
+    h.handle.update_sampling_config(cfg);
+    let _ = h.handle.get_conversation().await;
+
+    h.handle.record_response_identity(Some("model-a".into()));
+    let _ = h.handle.get_conversation().await;
+    h.handle
+        .push_assistant_response(ConversationItem::assistant("a"));
+    let _ = h.handle.get_conversation().await;
+
+    h.handle.record_response_identity(Some("model-b".into()));
+    let _ = h.handle.get_conversation().await;
+    h.handle
+        .push_assistant_response(ConversationItem::assistant("b"));
+    let _ = h.handle.get_conversation().await;
+
+    let records = h.persistence_rx.drain();
+    let ids: Vec<_> = records
+        .into_iter()
+        .filter_map(|r| match r {
+            PersistenceRecord::MessageWithCaptureFacts {
+                item: ConversationItem::Assistant(a),
+                identity: Some(id),
+                ..
+            } => Some((a.content.to_string(), id)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids[0].0, "a");
+    assert_eq!(
+        ids[0].1,
+        HostAssistantIdentity {
+            provider: "xai".into(),
+            model: Some("model-a".into()),
+            api: Some("responses".into()),
+        }
+    );
+    assert_eq!(ids[1].0, "b");
+    assert_eq!(ids[1].1.model.as_deref(), Some("model-b"));
 }
 
 #[tokio::test]

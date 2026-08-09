@@ -154,15 +154,25 @@ impl ChatStateActor {
                 "ChatState: push_message updated estimated_tokens_since_model"
             );
         }
-        // Consume pending model-call usage once on next Assistant persist
-        // (paired with the hook-8 stash in record_model_call_usage).
+        // Consume pending usage once on Assistant; share identity with
+        // preceding Reasoning siblings (clone), take on trailing Assistant
+        // (paired with the hook-8 stash in record_model_call_usage /
+        // record_response_identity).
         let provider_usage = if matches!(item, ConversationItem::Assistant(_)) {
             self.state.pending_model_call_usage.take()
         } else {
             None
         };
-        self.persistence
-            .persist_message_with_provider_usage(&item, provider_usage.as_ref());
+        let identity = match &item {
+            ConversationItem::Assistant(_) => self.state.pending_assistant_identity.take(),
+            ConversationItem::Reasoning(_) => self.state.pending_assistant_identity.clone(),
+            _ => None,
+        };
+        self.persistence.persist_message_with_provider_usage(
+            &item,
+            provider_usage.as_ref(),
+            identity.as_ref(),
+        );
         self.state.conversation.push(item);
     }
 
@@ -383,8 +393,29 @@ impl ChatStateActor {
             api_duration_ms,
             cost_usd_ticks,
         );
-        // LHC-HOOK 8/10: stash for the next Assistant → LHC assistant_text.providerUsage
+        // LHC-HOOK 8/10: stash usage + identity; share identity with Reasoning;
+        // consume both on Assistant (schema v5 / D3 + Wave B)
         self.state.pending_model_call_usage = Some(usage.clone());
+    }
+
+    /// Stash host-observed identity for the current model response (Wave B).
+    ///
+    /// Called **before** response items are pushed, independent of token usage.
+    /// `model_id` is the resolved response model when present — never filled
+    /// from current config. API is the actor's live `sampling_config.api_backend`
+    /// at this response boundary (the backend that produced the response).
+    /// Stash site pairs with the hook-8 marker on `record_model_call_usage`
+    /// (same side-channel family).
+    pub(super) fn record_response_identity(&mut self, model_id: Option<String>) {
+        let model = model_id.filter(|m| !m.is_empty());
+        let api = Some(
+            crate::api_backend_label(self.state.sampling_config.api_backend.clone()).to_string(),
+        );
+        self.state.pending_assistant_identity = Some(crate::HostAssistantIdentity {
+            provider: crate::HostAssistantIdentity::PROVIDER_XAI.to_string(),
+            model,
+            api,
+        });
     }
 
     pub(super) fn record_subagent_usage(

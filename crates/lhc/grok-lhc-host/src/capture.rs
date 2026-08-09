@@ -19,8 +19,8 @@ use crate::inference::{
     LhcInferenceSampler, register_inference_sampler, unregister_inference_sampler,
 };
 use crate::mapping::{
-    MappedEvent, TurnEndFacts, apply_turn_end_facts, attach_provider_usage, map_history, map_item,
-    map_model_change, shell_turn_end_event,
+    MappedEvent, TurnEndFacts, apply_turn_end_facts, attach_assistant_identity,
+    attach_provider_usage, map_history, map_item, map_model_change, shell_turn_end_event,
 };
 use crate::session::LhcSession;
 
@@ -42,10 +42,11 @@ static REGISTRY_GENERATION: AtomicU64 = AtomicU64::new(0);
 static REGISTRY_LOOKUPS: AtomicU64 = AtomicU64::new(0);
 
 enum CaptureCmd {
-    /// Live item persist; optional verbatim provider usage for `assistant_text`.
+    /// Live item persist; optional usage + identity for assistant_text/thinking.
     Persist {
         item: ConversationItem,
         provider_usage: Option<serde_json::Map<String, serde_json::Value>>,
+        identity: Option<xai_chat_state::HostAssistantIdentity>,
     },
     /// Shell turn-end facts (schema v5 / G2). Attaches to a deferred item-mapped
     /// `turn_end`, or emits a shell-authored close when none is deferred.
@@ -143,19 +144,20 @@ pub struct CaptureHandle {
 
 impl CaptureHandle {
     pub fn persist(&self, item: &ConversationItem) {
-        self.persist_with_provider_usage(item, None);
+        self.persist_with_capture_facts(item, None, None);
     }
 
-    /// Persist an item, optionally attaching verbatim provider usage on the
-    /// mapped `assistant_text` event (schema v5 / D3).
-    pub fn persist_with_provider_usage(
+    /// Persist an item with optional LHC capture facts (usage + identity).
+    pub fn persist_with_capture_facts(
         &self,
         item: &ConversationItem,
         provider_usage: Option<serde_json::Map<String, serde_json::Value>>,
+        identity: Option<xai_chat_state::HostAssistantIdentity>,
     ) {
         match self.inner.tx.try_send(CaptureCmd::Persist {
             item: item.clone(),
             provider_usage,
+            identity,
         }) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -165,6 +167,15 @@ impl CaptureHandle {
                 self.note_drop("persist_closed");
             }
         }
+    }
+
+    /// Persist with provider usage only (no identity).
+    pub fn persist_with_provider_usage(
+        &self,
+        item: &ConversationItem,
+        provider_usage: Option<serde_json::Map<String, serde_json::Value>>,
+    ) {
+        self.persist_with_capture_facts(item, provider_usage, None);
     }
 
     /// Deliver shell turn-outcome facts (schema v5 / G2).
@@ -1034,6 +1045,7 @@ async fn process_cmd(
         CaptureCmd::Persist {
             item,
             provider_usage,
+            identity,
         } => {
             if baseline_poisoned.load(Ordering::SeqCst) {
                 let n = dropped.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1062,6 +1074,13 @@ async fn process_cmd(
                     .find(|e| e.input.event_kind == "assistant_text")
             {
                 attach_provider_usage(ev, usage);
+            }
+            // Identity attaches to assistant_text and assistant_thinking only
+            // (host-observed side channel; bootstrap/replace never supplies it).
+            if let Some(id) = identity.as_ref() {
+                for ev in mapped.iter_mut() {
+                    attach_assistant_identity(ev, id);
+                }
             }
             let mut turn_ends = Vec::new();
             mapped.retain(|e| {

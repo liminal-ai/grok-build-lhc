@@ -824,7 +824,7 @@ fn b6_equivalence_and_b8_encoding_and_tool_args() {
         ],
     };
     let kinds = SourceKindIndex::assume_sourced_users_are_prompts(&view);
-    let decision = decide_substitution(&native_tools, &view, &kinds);
+    let decision = decide_substitution(&native_tools, &view, &kinds, None);
     let (served, substituted) = apply_serve_decision(native_tools.clone(), decision);
     let obs = observe_serve_equivalence(sid, Some(0), true, substituted, &native_tools, &served);
     let snap = equivalence_snapshot();

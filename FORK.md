@@ -44,13 +44,13 @@ certification) remains.
 | 1 | `crates/codegen/xai-grok-shell/Cargo.toml` | `LHC-HOOK 1/10` | dependency on `grok-lhc-host` | _(regen after commit)_ |
 | 2 | `crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs` | `LHC-HOOK 2/10` | wrap persistence in the LHC capture tee (+ inference sampler) | _(regen)_ |
 | 3 | `crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs` | `LHC-HOOK 3/10` | model / thinking-level change tee | _(regen)_ |
-| 4 | `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs` | `LHC-HOOK 4/10` | substitute LHC request context after `build_request` | _(regen)_ |
+| 4 | `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs` | `LHC-HOOK 4/10` | substitute LHC request context after `build_request` (+ live identity for signature gate) | _(regen)_ |
 | 5 | `crates/codegen/xai-grok-shell/src/session/compaction.rs` | `LHC-HOOK 5/10` | compact bridge decision (LHC I/O at writer choke) | _(regen)_ |
 | 6 | `crates/codegen/xai-grok-shell/src/session/mod.rs` | `LHC-HOOK 6/10` | `mod lhc_inference` declaration | _(regen)_ |
 | 6b | `crates/codegen/xai-grok-shell/src/session/lhc_inference.rs` | new file (shell-local LHC inference transport) | _(regen)_ |
-| 7 | `crates/codegen/xai-chat-state/src/actor/state.rs` | `LHC-HOOK 7/10` | pending model-call `TokenUsage` for `assistant_text.providerUsage` (schema v5 / D3) | _(regen)_ |
-| 8 | `crates/codegen/xai-chat-state/src/actor/mutations.rs` | `LHC-HOOK 8/10` | stash on `RecordModelCallUsage`; consume once on next Assistant persist | _(regen)_ |
-| 9 | `crates/codegen/xai-chat-state/src/persistence.rs` | `LHC-HOOK 9/10` | `ChatPersistence::persist_message_with_provider_usage` side-channel | _(regen)_ |
+| 7 | `crates/codegen/xai-chat-state/src/actor/state.rs` | `LHC-HOOK 7/10` | pending model-call `TokenUsage` + assistant identity for LHC capture (schema v5 / D3 + Wave B) | _(regen)_ |
+| 8 | `crates/codegen/xai-chat-state/src/actor/mutations.rs` | `LHC-HOOK 8/10` | stash usage + identity; share identity with Reasoning; consume both on Assistant | _(regen)_ |
+| 9 | `crates/codegen/xai-chat-state/src/persistence.rs` | `LHC-HOOK 9/10` | `persist_message_with_provider_usage` side-channel (usage + identity) | _(regen)_ |
 | 10 | `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs` | `LHC-HOOK 10/10` | shell turn-outcome → LHC `turn_end` facts (schema v5 / G2) | _(regen)_ |
 | — | root `Cargo.toml` | workspace-members entry `crates/lhc/grok-lhc-host` (no marker — auto-generated/sorted; asserted in `scripts/check-lhc-hooks.sh`) | adapter workspace membership | _(regen)_ |
 
@@ -76,6 +76,17 @@ hook; each hook is regenerated into `patches/` after commit (Lee). Patch
 Schema v5 G1 carve-out (hooks 7–9): `xai-chat-state` stashes the last model
 call's `TokenUsage` and passes it through a defaulted trait method so the LHC
 tee can attach `providerUsage` on the next `assistant_text`.
+
+Wave B identity (hooks 7–9 + hook 4, same markers): host-observed
+`provider`/`model`/`api` for one model response. Stamped
+**usage-independently** before response items are pushed (`record_response_identity`);
+cloned onto preceding `Reasoning` persists; taken once on trailing `Assistant`.
+Provider is `xai`; model is resolved `AssistantItem.model_id` when present
+(never invented); API is the actor's live `sampling_config.api_backend` at the
+response boundary, normalized to `chat_completions` / `responses` / `messages`.
+Bootstrap/replace re-map never invents identity. Hook 4 passes live request
+identity into serve so opaque `encrypted_content` is re-emitted only when
+stored identity is complete and exactly matches the live request.
 
 Schema v5 G2 (hook 10): shell `turn.rs` after-turn fan-out delivers
 `TurnEndFacts` (outcome fold, `outcomeReason`, ISO `startedAt`/`endedAt`) to
@@ -179,6 +190,22 @@ bands under real budgets for that kill test to be meaningful.
 
 ## Sync record
 
+### 2026-08-09 — Wave B Slice 2: host-observed identity + safe signature replay
+
+Identity/signature slice only (still pin `dd251ec`; `main` stays `8a14c91`).
+No retrieval tools; no SDK/vendor source changes. No new LHC-HOOK markers —
+extends hooks 7–9 (side channel) and hook 4 (live identity on serve).
+
+- Live capture: provider `xai`, resolved `AssistantItem.model_id`, live
+  `ApiBackend` label → same identity on `assistant_thinking` + `assistant_text`
+  for one response (usage-independent; no cross-response leak).
+- Serve/write-back: re-emit `encrypted_content` only when stored identity is
+  complete and matches live request identity; otherwise visible reasoning
+  without ciphertext. Restore stored model onto `AssistantItem.model_id`.
+- Bootstrap/replace: never invent identity from current config.
+- Maintenance: pin-drift check in `scripts/check-lhc-hooks.sh` tracks
+  `origin/main` (not retired `origin/lhc-rs-port`) so `dd251ec` is clean.
+
 ### 2026-08-09 — Wave B Slice 1: vendor pin `c136899` → `dd251ec`
 
 Submodule-only certified code tip advance (not a main/upstream merge).
@@ -187,14 +214,12 @@ Submodule-only certified code tip advance (not a main/upstream merge).
 - `assistant_thinking.signature` ← host `Reasoning.encrypted_content` (R2)
 - session-view `thinkingSignature` → `encrypted_content` on serve
 - struct literals for new optional view fields (`thinking_signature`,
-  assistant `provider`/`model`/`api`) — values left `None` (no host identity
-  design in this slice)
+  assistant `provider`/`model`/`api`) — values left `None` until Slice 2
 - golden payload decode: `AssistantThinkingPayload` (no longer plain
   `TextPayload`)
 
-**Not in this slice:** retrieval tool wiring, host model-identity/provenance
-capture for signature replay, any new LHC-HOOK markers. All 10 existing
-hooks and existing LHC behavior preserved.
+**Not in Slice 1:** retrieval tool wiring, host model-identity/provenance
+capture for signature replay, any new LHC-HOOK markers.
 
 ### 2026-08-09 — `a5589e9..8a14c91` (3 squash commits, ~37k insertions)
 

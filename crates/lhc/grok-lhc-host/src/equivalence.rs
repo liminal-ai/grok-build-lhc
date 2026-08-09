@@ -951,7 +951,7 @@ mod tests {
         };
         let kinds = SourceKindIndex::assume_sourced_users_are_prompts(&view);
         let mut items = vec![ConversationItem::system("sys")];
-        items.extend(session_view_to_serve_items(&view, &kinds).expect("translate"));
+        items.extend(session_view_to_serve_items(&view, &kinds, None).expect("translate"));
         items
     }
 

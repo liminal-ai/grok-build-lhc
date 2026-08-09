@@ -183,6 +183,9 @@ impl ChatStateActor {
             } => {
                 self.record_model_call_usage(model_id, &usage, api_duration_ms, cost_usd_ticks);
             }
+            ChatStateCommand::RecordResponseIdentity { model_id } => {
+                self.record_response_identity(model_id);
+            }
             ChatStateCommand::RecordSubagentUsage {
                 by_model,
                 attribute_to_prompt,

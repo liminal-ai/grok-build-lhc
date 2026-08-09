@@ -126,6 +126,17 @@ impl ChatStateHandle {
         });
     }
 
+    /// Stash host-observed assistant identity for the current model response.
+    ///
+    /// Call **before** pushing response items. Independent of token usage so a
+    /// valid response without usage still carries provenance. `model_id` is the
+    /// resolved response model when present — never invent from current config.
+    pub fn record_response_identity(&self, model_id: Option<String>) {
+        let _ = self
+            .cmd_tx
+            .send(ChatStateCommand::RecordResponseIdentity { model_id });
+    }
+
     /// Apply subagent usage; returns false if the actor did not acknowledge.
     pub async fn record_subagent_usage(
         &self,

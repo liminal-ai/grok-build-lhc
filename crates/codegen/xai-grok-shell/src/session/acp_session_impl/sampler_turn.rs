@@ -1371,6 +1371,11 @@ impl SessionActor {
         response: &ConversationResponse,
         api_duration_ms: Option<u64>,
     ) {
+        // Wave B identity: always stamp before items are pushed, even when the
+        // provider reports no token usage. Model is the resolved response
+        // model only — never filled from current config.
+        self.chat_state_handle
+            .record_response_identity(response.assistant().and_then(|a| a.model_id.clone()));
         if let Some(ref u) = response.usage {
             self.tool_context
                 .record_task_model_output(u64::from(u.completion_tokens));

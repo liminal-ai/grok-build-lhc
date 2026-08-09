@@ -99,6 +99,10 @@ pub enum ChatStateCommand {
         cost_usd_ticks: Option<i64>,
     },
 
+    /// Stash host-observed assistant identity for the current model response.
+    /// Usage-independent — fires even when the provider reports no token usage.
+    RecordResponseIdentity { model_id: Option<String> },
+
     /// Subagent usage into session (and prompt when attributable). Replies when applied.
     RecordSubagentUsage {
         by_model: Vec<(String, crate::usage::UsageTotals)>,

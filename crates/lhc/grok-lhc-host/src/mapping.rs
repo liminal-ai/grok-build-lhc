@@ -270,7 +270,8 @@ pub fn map_item(
                 Some(reasoning.id.as_str())
             };
             // Preserve host-owned encrypted reasoning as LHC signature (R2).
-            // provider/model/api identity is a later host-design slice — omit here.
+            // provider/model/api identity is attached on the live capture path
+            // via the side channel (never invented on bootstrap/replace re-map).
             let signature = reasoning
                 .encrypted_content
                 .as_deref()
@@ -508,6 +509,34 @@ pub fn attach_provider_usage(event: &mut MappedEvent, usage: &Map<String, Value>
         .input
         .payload
         .insert("providerUsage".into(), Value::Object(usage.clone()));
+}
+
+/// Attach host-observed provider/model/api to `assistant_text` or
+/// `assistant_thinking`. Partial fields are allowed (omit empty). Does not
+/// invent missing identity — caller supplies only observed facts.
+pub fn attach_assistant_identity(
+    event: &mut MappedEvent,
+    identity: &xai_chat_state::HostAssistantIdentity,
+) {
+    if event.input.event_kind != "assistant_text" && event.input.event_kind != "assistant_thinking"
+    {
+        return;
+    }
+    if !identity.provider.is_empty() {
+        event
+            .input
+            .payload
+            .insert("provider".into(), json!(identity.provider.clone()));
+    }
+    if let Some(model) = identity.model.as_ref().filter(|m| !m.is_empty()) {
+        event
+            .input
+            .payload
+            .insert("model".into(), json!(model.clone()));
+    }
+    if let Some(api) = identity.api.as_ref().filter(|a| !a.is_empty()) {
+        event.input.payload.insert("api".into(), json!(api.clone()));
+    }
 }
 
 fn tool_call_event(
@@ -955,6 +984,68 @@ mod tests {
             attach_provider_usage(te, &usage);
             assert!(te.input.payload.get("providerUsage").is_none());
         }
+    }
+
+    #[test]
+    fn assistant_identity_attaches_to_text_and_thinking_only() {
+        use xai_chat_state::HostAssistantIdentity;
+        let id = HostAssistantIdentity {
+            provider: "xai".into(),
+            model: Some("grok-4".into()),
+            api: Some("responses".into()),
+        };
+        let mut t = OccurrenceTracker::new();
+        let mut text = map_item(
+            "s",
+            0,
+            &ConversationItem::assistant("hi"),
+            &mut t,
+            &empty_facts(),
+        );
+        attach_assistant_identity(&mut text[0], &id);
+        assert_eq!(text[0].input.payload.get("provider"), Some(&json!("xai")));
+        assert_eq!(text[0].input.payload.get("model"), Some(&json!("grok-4")));
+        assert_eq!(text[0].input.payload.get("api"), Some(&json!("responses")));
+        if let Some(te) = text.iter_mut().find(|e| e.input.event_kind == "turn_end") {
+            attach_assistant_identity(te, &id);
+            assert!(te.input.payload.get("provider").is_none());
+        }
+
+        let mut r = synthesized_reasoning_item("think");
+        r.encrypted_content = Some("sig".into());
+        let mut think = map_item(
+            "s",
+            0,
+            &ConversationItem::Reasoning(r),
+            &mut t,
+            &empty_facts(),
+        );
+        attach_assistant_identity(&mut think[0], &id);
+        assert_eq!(think[0].input.payload.get("signature"), Some(&json!("sig")));
+        assert_eq!(think[0].input.payload.get("provider"), Some(&json!("xai")));
+        assert_eq!(think[0].input.payload.get("model"), Some(&json!("grok-4")));
+    }
+
+    #[test]
+    fn partial_identity_omits_missing_fields() {
+        use xai_chat_state::HostAssistantIdentity;
+        let id = HostAssistantIdentity {
+            provider: "xai".into(),
+            model: None,
+            api: Some("responses".into()),
+        };
+        let mut t = OccurrenceTracker::new();
+        let mut text = map_item(
+            "s",
+            0,
+            &ConversationItem::assistant("hi"),
+            &mut t,
+            &empty_facts(),
+        );
+        attach_assistant_identity(&mut text[0], &id);
+        assert_eq!(text[0].input.payload.get("provider"), Some(&json!("xai")));
+        assert!(text[0].input.payload.get("model").is_none());
+        assert_eq!(text[0].input.payload.get("api"), Some(&json!("responses")));
     }
 
     #[test]

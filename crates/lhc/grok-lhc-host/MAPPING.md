@@ -16,7 +16,7 @@ Actor / harness stamped on every event: `actor = "grok"`, `harness = "grok-build
 | `Assistant` | `assistant_text` (if content non-empty, or no tool calls); one `tool_call` per `ToolCall`; `turn_end` when `tool_calls` is empty | Client-executed tool calls only on this item. |
 | `ToolResult` | `tool_result` | `tool_call_id` + `content` (+ image parts folded into text). `is_error` omitted (`None`) — host `ToolResultItem` does not persist an error flag. |
 | `BackendToolCall` | `tool_call` **and** paired `tool_result` | Server-side tools are recorded as a call plus an immediate result carrying status/outputs (see below). |
-| `Reasoning` | `assistant_thinking` | `text` from `reasoning_item_text` (summary + content parts). Optional `signature` = `encrypted_content` when non-empty (SDK R2). Host `provider`/`model`/`api` provenance is **not** attached yet (later identity slice). |
+| `Reasoning` | `assistant_thinking` | `text` from `reasoning_item_text` (summary + content parts). Optional `signature` = `encrypted_content` when non-empty (SDK R2). Live path attaches host-observed `provider`/`model`/`api` via the side channel (Wave B); bootstrap/replace re-map leaves them absent. |
 
 ## `SyntheticReason`
 
@@ -138,6 +138,49 @@ Per model call, the host's verbatim `TokenUsage` JSON object rides the
 A second `Assistant` without an intervening `RecordModelCallUsage` gets no
 usage. Bootstrap / `replace_history` re-maps never carry live usage (side
 channel is not part of history).
+
+## Wave B assistant identity (`provider` / `model` / `api`)
+
+Host-observed provenance for one model response, attached to both
+`assistant_thinking` and `assistant_text` so the SDK groups them under one
+`SessionAssistantMessage` and can split at identity boundaries.
+
+| Field | Source (live only) | Notes |
+|---|---|---|
+| `provider` | constant `"xai"` | Wave B provider label |
+| `model` | `AssistantItem.model_id` when present | Resolved response model; **never** filled from current config |
+| `api` | `sampling_config.api_backend` at response boundary | Normalized: `chat_completions` / `responses` / `messages` |
+
+### Capture lifecycle (Grok — no Codex capture-slot queue)
+
+Grok already has an installed tee and chat-state actor before response
+persistence:
+
+1. After a model response arrives, `record_response_token_usage` **always**
+   calls `record_response_identity(model_id)` (usage-independent), then
+   optionally stashes usage when present.
+2. Response items are pushed in order (reasoning / backend / trailing
+   Assistant). On each `Reasoning` persist the pending identity is
+   **cloned**; on the trailing `Assistant` it is **taken** (consume-once).
+3. The LHC tee attaches identity onto mapped `assistant_thinking` and
+   `assistant_text` events only. Partial identity is allowed (omit empty
+   fields). A second response without a new stamp gets no identity.
+4. Bootstrap / `replace_history` re-maps never invent identity from current
+   config (side channel is not part of history).
+
+### Serve / write-back (opaque signature gate)
+
+SDK exports stored provenance and signatures verbatim; **host** owns replay
+policy:
+
+- Re-emit `Reasoning.encrypted_content` from `thinkingSignature` only when
+  stored identity is complete **and** exactly matches the live request
+  identity (hook 4: provider `xai`, request model, live API).
+- Mismatch or missing either side: keep visible reasoning text/shape,
+  drop `encrypted_content` (avoids Grok's terminal wrong-model 400).
+- Restore stored `model` onto reconstructed `AssistantItem.model_id`.
+- Write-back has no live request → signatures suppressed; model_id still
+  restored.
 
 ## `replace_history` (Chunk 1 decision — B1)
 

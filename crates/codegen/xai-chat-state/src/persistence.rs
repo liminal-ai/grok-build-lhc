@@ -8,9 +8,55 @@
 use std::io;
 
 use tokio::sync::{mpsc, oneshot};
-use xai_grok_sampling_types::{ConversationItem, TokenUsage};
+use xai_grok_sampling_types::{ApiBackend, ConversationItem, TokenUsage};
 
 use crate::commands::{StrictAppendAck, StrictAppendError};
+
+/// Host-observed assistant provenance for one model response (Wave B identity).
+///
+/// Captured at the response boundary and attached to `assistant_thinking` /
+/// `assistant_text` LHC events. Partial identity is allowed (`model`/`api` may
+/// be absent); complete identity is required to re-emit opaque reasoning on
+/// serve. Never invent missing fields from later config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostAssistantIdentity {
+    /// Wave B provider label (`"xai"` for Grok).
+    pub provider: String,
+    /// Resolved response model (`AssistantItem.model_id`) when present.
+    pub model: Option<String>,
+    /// Normalized API backend label for the call that produced the response.
+    pub api: Option<String>,
+}
+
+impl HostAssistantIdentity {
+    /// Wave B Grok provider stamp.
+    pub const PROVIDER_XAI: &'static str = "xai";
+
+    /// True when provider, model, and api are all non-empty.
+    pub fn is_complete(&self) -> bool {
+        !self.provider.is_empty()
+            && self.model.as_ref().is_some_and(|m| !m.is_empty())
+            && self.api.as_ref().is_some_and(|a| !a.is_empty())
+    }
+
+    /// Exact complete-identity match (both sides must be complete).
+    pub fn matches_live(&self, live: &Self) -> bool {
+        self.is_complete()
+            && live.is_complete()
+            && self.provider == live.provider
+            && self.model == live.model
+            && self.api == live.api
+    }
+}
+
+/// Stable wire labels for [`ApiBackend`] (snake_case; LHC free-string identity).
+pub fn api_backend_label(backend: ApiBackend) -> &'static str {
+    match backend {
+        ApiBackend::ChatCompletions => "chat_completions",
+        ApiBackend::Responses => "responses",
+        ApiBackend::Messages => "messages",
+    }
+}
 
 /// Abstraction over chat-specific persistence operations.
 ///
@@ -24,18 +70,20 @@ pub trait ChatPersistence: Send + 'static {
     /// Persist a single conversation item (append to chat_history.jsonl).
     fn persist_message(&mut self, item: &ConversationItem);
 
-    // LHC-HOOK 9/10: optional provider usage side-channel for LHC assistant_text (schema v5 / D3)
-    /// Persist a message, optionally carrying the last model call's provider usage.
+    // LHC-HOOK 9/10: persist_message_with_provider_usage side-channel (usage + identity)
+    /// Persist a message with optional LHC capture facts (usage + identity).
     ///
-    /// Default ignores usage and calls [`Self::persist_message`]. The LHC capture
-    /// tee overrides this to attach `providerUsage` on `assistant_text` events.
-    /// Usage is host fact — never interpreted by chat-state itself.
+    /// Default ignores facts and calls [`Self::persist_message`]. The LHC
+    /// capture tee overrides this to attach `providerUsage` and
+    /// provider/model/api provenance. Facts are host-observed — never
+    /// interpreted by chat-state itself. Identity is independent of usage.
     fn persist_message_with_provider_usage(
         &mut self,
         item: &ConversationItem,
         provider_usage: Option<&TokenUsage>,
+        identity: Option<&HostAssistantIdentity>,
     ) {
-        let _ = provider_usage;
+        let _ = (provider_usage, identity);
         self.persist_message(item);
     }
 
@@ -59,13 +107,20 @@ pub trait ChatPersistence: Send + 'static {
 /// A record of a persistence call, sent over a channel to the test.
 #[derive(Debug, Clone)]
 pub enum PersistenceRecord {
-    /// A single message was persisted (no provider usage attached).
+    /// A single message was persisted (no LHC side-channel facts).
     Message(ConversationItem),
     /// A message persisted with the actor's pending model-call usage (schema v5).
     ///
-    /// Emitted only when the actor calls
-    /// [`ChatPersistence::persist_message_with_provider_usage`] with `Some`.
+    /// Emitted when the actor calls
+    /// [`ChatPersistence::persist_message_with_provider_usage`] with usage and
+    /// no identity.
     MessageWithProviderUsage(ConversationItem, TokenUsage),
+    /// A message persisted with LHC capture facts (usage and/or identity).
+    MessageWithCaptureFacts {
+        item: ConversationItem,
+        provider_usage: Option<TokenUsage>,
+        identity: Option<HostAssistantIdentity>,
+    },
     /// A persistence-acknowledged switch append was requested.
     AcknowledgedMessage(ConversationItem),
     /// The full history was replaced.
@@ -148,7 +203,7 @@ impl MockPersistenceReceiver {
         }
     }
 
-    /// Collect all `Message` / `MessageWithProviderUsage` items received so far
+    /// Collect all `Message` / side-channel message items received so far
     /// (drains the channel).
     pub fn messages(&mut self) -> Vec<ConversationItem> {
         self.drain()
@@ -156,6 +211,7 @@ impl MockPersistenceReceiver {
             .filter_map(|r| match r {
                 PersistenceRecord::Message(item)
                 | PersistenceRecord::MessageWithProviderUsage(item, _) => Some(item),
+                PersistenceRecord::MessageWithCaptureFacts { item, .. } => Some(item),
                 _ => None,
             })
             .collect()
@@ -171,16 +227,24 @@ impl ChatPersistence for MockChatPersistence {
         &mut self,
         item: &ConversationItem,
         provider_usage: Option<&TokenUsage>,
+        identity: Option<&HostAssistantIdentity>,
     ) {
-        match provider_usage {
-            Some(usage) => {
+        match (provider_usage, identity) {
+            (None, None) => {
+                let _ = self.tx.send(PersistenceRecord::Message(item.clone()));
+            }
+            (Some(usage), None) => {
                 let _ = self.tx.send(PersistenceRecord::MessageWithProviderUsage(
                     item.clone(),
                     usage.clone(),
                 ));
             }
-            None => {
-                let _ = self.tx.send(PersistenceRecord::Message(item.clone()));
+            (usage, ident) => {
+                let _ = self.tx.send(PersistenceRecord::MessageWithCaptureFacts {
+                    item: item.clone(),
+                    provider_usage: usage.cloned(),
+                    identity: ident.cloned(),
+                });
             }
         }
     }

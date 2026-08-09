@@ -153,7 +153,8 @@ pub(crate) struct ChatState {
     /// persist last_turn_usage). Always overwritten by the most recent turn —
     /// historical turns are not retained here.
     pub last_turn_usage: Option<TokenUsage>,
-    // LHC-HOOK 7/10: last model-call TokenUsage for assistant_text.providerUsage (schema v5 / D3)
+    // LHC-HOOK 7/10: pending model-call TokenUsage + assistant identity for LHC
+    // assistant_text / assistant_thinking (schema v5 / D3 + Wave B identity)
     /// Pending per-model-call usage for the next `Assistant` persist.
     ///
     /// Set by `record_model_call_usage` (FIFO before `PushAssistantResponse` on
@@ -161,6 +162,13 @@ pub(crate) struct ChatState {
     /// persisted — a second `Assistant` without an intervening record gets
     /// `None`. Not persisted across restore/snapshot; LHC-only side channel.
     pub pending_model_call_usage: Option<TokenUsage>,
+    /// Pending host-observed identity for the current model response.
+    ///
+    /// Stamped by `record_response_identity` **before** response items are
+    /// pushed (usage-independent). Cloned onto each preceding `Reasoning`
+    /// persist; taken once on the trailing `Assistant` so identity cannot
+    /// leak to the next response. Bootstrap/replace never invents this.
+    pub pending_assistant_identity: Option<crate::HostAssistantIdentity>,
     /// Billing for the open prompt (cleared on next prompt; not persisted).
     pub prompt_usage: Option<UsageLedger>,
     /// Lifetime session billing (not persisted).
@@ -249,6 +257,7 @@ impl ChatState {
             estimate_at_last_response: initial_tokens,
             last_turn_usage: None,
             pending_model_call_usage: None,
+            pending_assistant_identity: None,
             prompt_usage: None,
             session_usage: UsageLedger::default(),
             turn_capture: None,

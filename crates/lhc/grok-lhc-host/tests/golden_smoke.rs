@@ -418,7 +418,8 @@ fn golden_serving_substitute_preserves_system_prefix() {
         ],
     };
     let kinds = grok_lhc_host::SourceKindIndex::assume_sourced_users_are_prompts(&view);
-    let ServeDecision::Substitute { items } = decide_substitution(&native, &view, &kinds) else {
+    let ServeDecision::Substitute { items } = decide_substitution(&native, &view, &kinds, None)
+    else {
         panic!("expected substitute");
     };
     let projected: Value = json!(

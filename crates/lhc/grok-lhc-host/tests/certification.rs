@@ -1818,7 +1818,7 @@ fn classify_whole_index_failure_fails_open_no_substitution_no_writeback() {
         .enable_all()
         .build()
         .unwrap();
-    let decision = rt.block_on(serve_request_context(sid, &native));
+    let decision = rt.block_on(serve_request_context(sid, &native, None));
     set_compact_mode_for_test(Some(CompactMode::Replace));
     let wb = rt.block_on(grok_lhc_host::replace_compact_for_writeback(sid));
     set_compact_mode_for_test(None);
@@ -3341,7 +3341,7 @@ async fn chunk2_inference_all_ops_via_counting_double() {
 #[tokio::test(flavor = "current_thread")]
 async fn chunk2_serve_fail_open_when_inactive() {
     let native = vec![ConversationItem::user("keep-me")];
-    let decision = serve_request_context("no-such-session", &native).await;
+    let decision = serve_request_context("no-such-session", &native, None).await;
     let (items, substituted) = apply_serve_decision(native, decision);
     assert!(!substituted);
     assert_eq!(items.len(), 1);
@@ -3375,7 +3375,7 @@ async fn chunk2_serve_substitutes_from_live_context() {
         ConversationItem::system("host-system"),
         ConversationItem::user("stale-native"),
     ];
-    let decision = serve_request_context(sid, &native).await;
+    let decision = serve_request_context(sid, &native, None).await;
     let (items, substituted) = apply_serve_decision(native, decision);
     assert!(
         substituted,
@@ -3422,7 +3422,7 @@ async fn chunk2_serve_timeout_falls_open_on_blocked_worker() {
     .unwrap();
     let native = vec![ConversationItem::user("blocked")];
     let started = std::time::Instant::now();
-    let decision = serve_request_context(sid, &native).await;
+    let decision = serve_request_context(sid, &native, None).await;
     assert!(
         started.elapsed() < Duration::from_secs(10),
         "serve must not hang indefinitely"
@@ -3553,6 +3553,7 @@ fn chunk2_mid_tool_cycle_all_lhc_or_native() {
         &native,
         &view,
         &SourceKindIndex::assume_sourced_users_are_prompts(&view),
+        None,
     ) {
         ServeDecision::Substitute { items } => {
             assert!(!body_has_tool_cycle(&items));
@@ -3702,7 +3703,7 @@ fn equiv_tool_arg_cosmetic_formatting_silent_different_paths() {
         ],
     };
     let kinds = SourceKindIndex::assume_sourced_users_are_prompts(&view);
-    let served = match decide_substitution(&native, &view, &kinds) {
+    let served = match decide_substitution(&native, &view, &kinds, None) {
         ServeDecision::Substitute { items } => items,
         ServeDecision::Native { reason } => panic!("expected substitute, got {reason}"),
     };
@@ -3759,7 +3760,7 @@ fn equiv_tool_arg_real_change_informational_different_paths() {
         ],
     };
     let kinds = SourceKindIndex::assume_sourced_users_are_prompts(&view);
-    let served = match decide_substitution(&native, &view, &kinds) {
+    let served = match decide_substitution(&native, &view, &kinds, None) {
         ServeDecision::Substitute { items } => items,
         ServeDecision::Native { reason } => panic!("expected substitute, got {reason}"),
     };
@@ -3799,7 +3800,7 @@ fn equiv_swapped_tool_call_registers_structurally() {
         ],
     };
     let kinds = SourceKindIndex::assume_sourced_users_are_prompts(&view);
-    let served = match decide_substitution(&native, &view, &kinds) {
+    let served = match decide_substitution(&native, &view, &kinds, None) {
         ServeDecision::Substitute { items } => items,
         ServeDecision::Native { reason } => panic!("expected substitute, got {reason}"),
     };
@@ -3841,7 +3842,7 @@ fn equiv_tool_arg_object_key_reorder_silent() {
         ],
     };
     let kinds = SourceKindIndex::assume_sourced_users_are_prompts(&view);
-    let served = match decide_substitution(&native, &view, &kinds) {
+    let served = match decide_substitution(&native, &view, &kinds, None) {
         ServeDecision::Substitute { items } => items,
         ServeDecision::Native { reason } => panic!("expected substitute, got {reason}"),
     };
@@ -3878,7 +3879,7 @@ fn equiv_tool_arg_array_reorder_divergent() {
         ],
     };
     let kinds = SourceKindIndex::assume_sourced_users_are_prompts(&view);
-    let served = match decide_substitution(&native, &view, &kinds) {
+    let served = match decide_substitution(&native, &view, &kinds, None) {
         ServeDecision::Substitute { items } => items,
         ServeDecision::Native { reason } => panic!("expected substitute, got {reason}"),
     };
@@ -3918,7 +3919,7 @@ fn equiv_post_writeback_band_collapse_informational_silent() {
     let (native_pre, writeback) = writeback_fixture();
     let view = realistic_post_compact_view();
     let kinds = realistic_kinds(&view);
-    let served = match decide_substitution(&native_pre, &view, &kinds) {
+    let served = match decide_substitution(&native_pre, &view, &kinds, None) {
         ServeDecision::Substitute { items } => items,
         ServeDecision::Native { reason } => panic!("expected substitute, got {reason}"),
     };
@@ -4118,7 +4119,7 @@ fn chunk3a_status_on_healthy_store() {
     assert!(h.worker_alive);
     assert!(h.storage_reachable);
     // After a real serve consult, engine follows the decision.
-    let decision = rt.block_on(serve_request_context(sid, &native));
+    let decision = rt.block_on(serve_request_context(sid, &native, None));
     let r2 = rt.block_on(status_report(sid));
     match decision {
         ServeDecision::Substitute { .. } => {
@@ -4383,7 +4384,7 @@ async fn chunk3a_status_reports_fail_open_reason_after_timeout() {
     .await
     .unwrap();
     let native = vec![ConversationItem::user("blocked")];
-    let decision = serve_request_context(sid, &native).await;
+    let decision = serve_request_context(sid, &native, None).await;
     assert!(matches!(
         decision,
         ServeDecision::Native {
@@ -4468,7 +4469,7 @@ fn chunk3a_off_clears_last_serve_engine_label() {
         .enable_all()
         .build()
         .unwrap();
-    let decision = rt.block_on(serve_request_context(sid, &native));
+    let decision = rt.block_on(serve_request_context(sid, &native, None));
     if matches!(decision, ServeDecision::Substitute { .. }) {
         let r = rt.block_on(status_report(sid));
         assert_eq!(r.context_engine, ContextEngine::Lhc);
@@ -4882,6 +4883,229 @@ fn g2_aborted_without_terminal_assistant_emits_shell_turn_end() {
     assert!(
         te_key.contains("shell_turn_end"),
         "expected shell-authored key, got {te_key}"
+    );
+    handle.shutdown_blocking();
+}
+
+/// Wave B Slice 2 — live capture attaches the same complete identity to
+/// reasoning + trailing assistant of one response (usage-independent).
+#[test]
+fn wave_b_reasoning_and_assistant_share_identity_without_usage() {
+    use xai_chat_state::HostAssistantIdentity;
+    use xai_grok_sampling_types::synthesized_reasoning_item;
+
+    let root = TempDir::new().unwrap();
+    let sid = "cert-wave-b-identity-share";
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+
+    let identity = HostAssistantIdentity {
+        provider: "xai".into(),
+        model: Some("grok-4".into()),
+        api: Some("responses".into()),
+    };
+    let mut reasoning = synthesized_reasoning_item("plan");
+    reasoning.encrypted_content = Some("enc-shared".into());
+    handle.persist_with_capture_facts(
+        &ConversationItem::Reasoning(reasoning),
+        None,
+        Some(identity.clone()),
+    );
+    handle.persist_with_capture_facts(
+        &ConversationItem::assistant("answer"),
+        None, // no usage — identity must still land
+        Some(identity.clone()),
+    );
+    handle.flush_blocking();
+    // thinking + assistant_text + turn_end
+    let ev = wait_events(&handle, 3);
+
+    let thinking = ev
+        .iter()
+        .find_map(|e| e.assistant_thinking_payload())
+        .expect("assistant_thinking");
+    assert_eq!(thinking.signature.as_deref(), Some("enc-shared"));
+    assert_eq!(thinking.provider.as_deref(), Some("xai"));
+    assert_eq!(thinking.model.as_deref(), Some("grok-4"));
+    assert_eq!(thinking.api.as_deref(), Some("responses"));
+
+    let text = ev
+        .iter()
+        .find_map(|e| e.assistant_text_payload())
+        .expect("assistant_text");
+    assert_eq!(text.provider.as_deref(), Some("xai"));
+    assert_eq!(text.model.as_deref(), Some("grok-4"));
+    assert_eq!(text.api.as_deref(), Some("responses"));
+    assert!(
+        text.provider_usage.is_none(),
+        "usage must remain independent of identity"
+    );
+
+    handle.shutdown_blocking();
+}
+
+/// Wave B Slice 2 — consecutive responses with different models keep distinct
+/// identity; no cross-response leak of model/api facts.
+#[test]
+fn wave_b_identity_does_not_leak_across_responses() {
+    use xai_chat_state::HostAssistantIdentity;
+
+    let root = TempDir::new().unwrap();
+    let sid = "cert-wave-b-identity-no-leak";
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+
+    let id_a = HostAssistantIdentity {
+        provider: "xai".into(),
+        model: Some("model-a".into()),
+        api: Some("responses".into()),
+    };
+    let id_b = HostAssistantIdentity {
+        provider: "xai".into(),
+        model: Some("model-b".into()),
+        api: Some("chat_completions".into()),
+    };
+    handle.persist_with_capture_facts(&ConversationItem::assistant("first"), None, Some(id_a));
+    handle.persist_with_capture_facts(&ConversationItem::assistant("second"), None, Some(id_b));
+    handle.flush_blocking();
+    // 2 * (assistant_text + turn_end) = 4
+    let ev = wait_events(&handle, 4);
+    let texts: Vec<_> = ev
+        .iter()
+        .filter_map(|e| e.assistant_text_payload())
+        .collect();
+    assert_eq!(texts.len(), 2);
+    assert_eq!(texts[0].model.as_deref(), Some("model-a"));
+    assert_eq!(texts[0].api.as_deref(), Some("responses"));
+    assert_eq!(texts[1].model.as_deref(), Some("model-b"));
+    assert_eq!(texts[1].api.as_deref(), Some("chat_completions"));
+    handle.shutdown_blocking();
+}
+
+/// Wave B Slice 2 — same complete identity re-emits encrypted_content on serve;
+/// model mismatch suppresses it while preserving visible reasoning + model_id.
+#[test]
+fn wave_b_serve_signature_gate_and_model_restore() {
+    use lhc::shared_tech::view::{SessionAssistantMessage, SessionAssistantPart};
+    use xai_grok_sampling_types::reasoning_item_text;
+
+    let live = grok_lhc_host::LiveRequestIdentity {
+        provider: "xai".into(),
+        model: Some("grok-4".into()),
+        api: Some("responses".into()),
+    };
+    let matching = SessionThreadView {
+        thread_id: "t".into(),
+        entries: vec![SessionThreadViewEntry::Message(
+            SessionThreadViewMessage::Assistant(SessionAssistantMessage {
+                content: vec![
+                    SessionAssistantPart {
+                        type_: SessionAssistantPartType::Thinking,
+                        text: None,
+                        thinking: Some("visible plan".into()),
+                        thinking_signature: Some("enc-keep".into()),
+                        tool_call_id: None,
+                        tool_name: None,
+                        arguments: None,
+                    },
+                    SessionAssistantPart {
+                        type_: SessionAssistantPartType::Text,
+                        text: Some("done".into()),
+                        thinking: None,
+                        thinking_signature: None,
+                        tool_call_id: None,
+                        tool_name: None,
+                        arguments: None,
+                    },
+                ],
+                source_messages: vec![SessionThreadViewEntrySource {
+                    message_id: "a1".into(),
+                    idempotency_key: None,
+                }],
+                provider: Some("xai".into()),
+                model: Some("grok-4".into()),
+                api: Some("responses".into()),
+            }),
+        )],
+    };
+    let kinds = SourceKindIndex::assume_sourced_users_are_prompts(&matching);
+    let items =
+        grok_lhc_host::session_view_to_serve_items(&matching, &kinds, Some(&live)).expect("serve");
+    match &items[0] {
+        ConversationItem::Reasoning(r) => {
+            assert_eq!(r.encrypted_content.as_deref(), Some("enc-keep"));
+            assert!(reasoning_item_text(r).contains("visible plan"));
+        }
+        other => panic!("expected Reasoning, got {other:?}"),
+    }
+    match &items[1] {
+        ConversationItem::Assistant(a) => {
+            assert_eq!(a.model_id.as_deref(), Some("grok-4"));
+            assert_eq!(a.content.as_ref(), "done");
+        }
+        other => panic!("expected Assistant, got {other:?}"),
+    }
+
+    // Model mismatch → suppress signature, keep text + restored stored model.
+    let mismatch_live = grok_lhc_host::LiveRequestIdentity {
+        provider: "xai".into(),
+        model: Some("grok-5".into()),
+        api: Some("responses".into()),
+    };
+    let items2 =
+        grok_lhc_host::session_view_to_serve_items(&matching, &kinds, Some(&mismatch_live))
+            .expect("serve");
+    match &items2[0] {
+        ConversationItem::Reasoning(r) => {
+            assert_eq!(r.encrypted_content, None);
+            assert!(reasoning_item_text(r).contains("visible plan"));
+        }
+        other => panic!("expected Reasoning without signature, got {other:?}"),
+    }
+    match &items2[1] {
+        ConversationItem::Assistant(a) => {
+            assert_eq!(
+                a.model_id.as_deref(),
+                Some("grok-4"),
+                "stored model restored even when signature suppressed"
+            );
+        }
+        other => panic!("expected Assistant, got {other:?}"),
+    }
+}
+
+/// Wave B Slice 2 — bootstrap/replace re-map does not invent identity.
+#[test]
+fn wave_b_replace_history_does_not_invent_identity() {
+    use xai_grok_sampling_types::synthesized_reasoning_item;
+
+    let root = TempDir::new().unwrap();
+    let sid = "cert-wave-b-replace-no-identity";
+    let mut reasoning = synthesized_reasoning_item("old plan");
+    reasoning.encrypted_content = Some("enc-hist".into());
+    let items = vec![
+        ConversationItem::user("q"),
+        ConversationItem::Reasoning(reasoning),
+        ConversationItem::assistant_with_model("a", "grok-4"),
+    ];
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+    handle.replace_history(&items);
+    handle.flush_blocking();
+    let ev = wait_events(&handle, 3);
+    let thinking = ev
+        .iter()
+        .find_map(|e| e.assistant_thinking_payload())
+        .expect("thinking");
+    assert_eq!(thinking.signature.as_deref(), Some("enc-hist"));
+    assert!(
+        thinking.provider.is_none() && thinking.model.is_none() && thinking.api.is_none(),
+        "replace must not invent provider/model/api"
+    );
+    let text = ev
+        .iter()
+        .find_map(|e| e.assistant_text_payload())
+        .expect("text");
+    assert!(
+        text.provider.is_none() && text.model.is_none() && text.api.is_none(),
+        "replace must not invent identity on assistant_text"
     );
     handle.shutdown_blocking();
 }

@@ -53,21 +53,22 @@ pub use inference::{
 /// Re-exported so the shell sampler can stamp provenance without depending on `lhc` directly.
 pub use lhc::shared_tech::{InferenceRequestMessage, InferenceRequestRole};
 pub use mapping::{
-    MappedEvent, TurnEndFacts, apply_turn_end_facts, attach_provider_usage,
-    format_system_time_iso8601_millis, level_label, map_history, map_item, map_model_change,
-    shell_turn_end_event, token_usage_to_provider_usage,
+    MappedEvent, TurnEndFacts, apply_turn_end_facts, attach_assistant_identity,
+    attach_provider_usage, format_system_time_iso8601_millis, level_label, map_history, map_item,
+    map_model_change, shell_turn_end_event, token_usage_to_provider_usage,
 };
 pub use runtime_config::{
     ConfigSource, LhcFileConfig, ResolvedLhcConfig, Sourced, applied_config, apply_resolved_config,
     clear_config_parse_error, config_parse_error, note_config_parse_error, resolve_lhc_config,
 };
 pub use serving::{
-    LastServeOutcome, ServeDecision, SourceKindIndex, ViewTranslateMode, apply_serve_decision,
-    assign_prompt_indices_from_tail, body_has_tool_cycle, build_writeback_conversation,
-    clear_last_serve_outcome, decide_substitution, is_band_user, last_serve_outcome,
-    native_prompt_indices, note_last_serve, session_view_to_items, session_view_to_serve_items,
-    session_view_to_writeback_items, split_system_prefix,
+    LastServeOutcome, LiveRequestIdentity, ServeDecision, SourceKindIndex, ViewTranslateMode,
+    apply_serve_decision, assign_prompt_indices_from_tail, body_has_tool_cycle,
+    build_writeback_conversation, clear_last_serve_outcome, decide_substitution, is_band_user,
+    last_serve_outcome, native_prompt_indices, note_last_serve, session_view_to_items,
+    session_view_to_serve_items, session_view_to_writeback_items, split_system_prefix,
 };
+// Re-export identity type so shell can stamp without depending on chat-state layout.
 #[cfg(any(test, feature = "test-util"))]
 pub use session::set_force_classify_list_failure;
 pub use session::{
@@ -80,6 +81,7 @@ pub use status::{
     plan_repair, status_report,
 };
 pub use tee::{capture_active, tee_chat_persistence};
+pub use xai_chat_state::{HostAssistantIdentity, api_backend_label};
 
 /// Test-only: open an LHC session without spawning the capture worker.
 #[cfg(feature = "test-util")]
@@ -189,9 +191,14 @@ pub const DRAIN_SETTLED_AT_CLOSE: std::time::Duration = std::time::Duration::fro
 /// Fail-open: any error / timeout yields [`ServeDecision::Native`]. Never hybrid.
 /// Cheap gate: registry presence only (no env re-read, no clone of items here).
 /// Callers must skip this entirely when [`capture_active`] is false.
+///
+/// `live_identity` is the host-observed identity of the request about to be
+/// sent (provider/model/api). It gates opaque reasoning re-emit; pass `None`
+/// only when identity cannot be observed (then signatures are suppressed).
 pub async fn serve_request_context(
     session_id: &str,
     native_items: &[xai_grok_sampling_types::ConversationItem],
+    live_identity: Option<&LiveRequestIdentity>,
 ) -> ServeDecision {
     // Cheap process-wide gate before any allocation / mutex — same principle
     // as hook 3 (`capture_model_or_thinking_change`). Do not re-read GROK_LHC.
@@ -202,7 +209,7 @@ pub async fn serve_request_context(
             reason: "lhc_inactive",
         };
     }
-    let decision = serve_request_context_inner(session_id, native_items).await;
+    let decision = serve_request_context_inner(session_id, native_items, live_identity).await;
     serving::note_last_serve(session_id, &decision);
     decision
 }
@@ -210,6 +217,7 @@ pub async fn serve_request_context(
 async fn serve_request_context_inner(
     session_id: &str,
     native_items: &[xai_grok_sampling_types::ConversationItem],
+    live_identity: Option<&LiveRequestIdentity>,
 ) -> ServeDecision {
     let Some(handle) = lookup_session(session_id) else {
         return ServeDecision::Native {
@@ -242,7 +250,7 @@ async fn serve_request_context_inner(
                 };
             }
         };
-    decide_substitution(native_items, &view, &kinds)
+    decide_substitution(native_items, &view, &kinds, live_identity)
 }
 
 /// Shadow-mode: preview LHC compaction without writing. Logs and returns.
