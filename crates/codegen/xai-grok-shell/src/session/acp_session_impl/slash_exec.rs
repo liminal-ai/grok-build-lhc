@@ -197,8 +197,9 @@ impl SessionActor {
                             }
                         } else if !grok_lhc_host::is_enabled() {
                             "**LHC:** process gate is off.\n\n\
-                             Set `GROK_LHC=1` or `[lhc] enabled = true` (then restart / \
-                             reload config) before `/lhc on`."
+                             Unset `GROK_LHC=0` / `false` / `off`, or set \
+                             `[lhc] enabled = true` (then restart / reload config) \
+                             before `/lhc on`. This fork defaults to on."
                                 .to_owned()
                         } else {
                             // Mid-session attach: bootstrap from live native history.

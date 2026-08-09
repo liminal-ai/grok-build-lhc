@@ -3,7 +3,7 @@
 //! **Precedence (highest wins per key):**
 //! 1. Environment variable, if set (including explicit `0` / `false` / `off`)
 //! 2. Config-file / host-supplied [`LhcFileConfig`] values
-//! 3. Built-in defaults (`enabled = false`, root `~/.lhc`, compact `shadow`,
+//! 3. Built-in defaults (`enabled = true`, root `~/.lhc`, compact `shadow`,
 //!    equivalence armed, no inference-model override)
 //!
 //! Applying a resolved config only **fills unset** env vars so existing tests
@@ -100,7 +100,7 @@ pub fn resolve_lhc_config(file: &LhcFileConfig) -> ResolvedLhcConfig {
                 source: ConfigSource::ConfigFile,
             },
             None => Sourced {
-                value: false,
+                value: true,
                 source: ConfigSource::Default,
             },
         },
@@ -226,11 +226,17 @@ pub fn apply_resolved_config(resolved: &ResolvedLhcConfig) {
     // SAFETY: process-level config apply at host startup / re-resolve; tests
     // that mutate GROK_LHC* must hold `env_lock`.
     unsafe {
+        // Fill GROK_LHC only for non-default sources so default-on does not
+        // leak into child env, while config-file disable still reaches
+        // `is_enabled()` (which treats unset as on).
         if std::env::var_os("GROK_LHC").is_none()
-            && resolved.enabled.value
             && resolved.enabled.source != ConfigSource::Default
         {
-            std::env::set_var("GROK_LHC", "1");
+            if resolved.enabled.value {
+                std::env::set_var("GROK_LHC", "1");
+            } else {
+                std::env::set_var("GROK_LHC", "0");
+            }
         }
         if std::env::var_os("GROK_LHC_ROOT").is_none()
             && resolved.root.source != ConfigSource::Default
@@ -341,12 +347,12 @@ mod tests {
     }
 
     #[test]
-    fn default_is_off() {
+    fn default_is_on() {
         let _g = env_lock();
         let prev = std::env::var_os("GROK_LHC");
         unsafe { std::env::remove_var("GROK_LHC") };
         let r = resolve_lhc_config(&LhcFileConfig::default());
-        assert!(!r.enabled.value);
+        assert!(r.enabled.value);
         assert_eq!(r.enabled.source, ConfigSource::Default);
         match prev {
             Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
@@ -366,8 +372,12 @@ mod tests {
             std::env::remove_var("GROK_LHC_COMPACT");
         }
         let r = resolve_lhc_config(&LhcFileConfig::default());
+        assert!(r.enabled.value, "default-on");
         apply_resolved_config(&r);
-        assert!(std::env::var_os("GROK_LHC").is_none());
+        assert!(
+            std::env::var_os("GROK_LHC").is_none(),
+            "default-on must not leak GROK_LHC into process env"
+        );
         assert!(
             std::env::var_os("GROK_LHC_ROOT").is_none(),
             "default root must not leak into process env"
@@ -387,6 +397,27 @@ mod tests {
         match prev_compact {
             Some(v) => unsafe { std::env::set_var("GROK_LHC_COMPACT", v) },
             None => unsafe { std::env::remove_var("GROK_LHC_COMPACT") },
+        }
+    }
+
+    #[test]
+    fn apply_config_disable_sets_env_zero() {
+        let _g = env_lock();
+        let prev = std::env::var_os("GROK_LHC");
+        unsafe { std::env::remove_var("GROK_LHC") };
+        let file = LhcFileConfig {
+            enabled: Some(false),
+            ..Default::default()
+        };
+        let r = resolve_lhc_config(&file);
+        assert!(!r.enabled.value);
+        assert_eq!(r.enabled.source, ConfigSource::ConfigFile);
+        apply_resolved_config(&r);
+        assert_eq!(std::env::var("GROK_LHC").ok().as_deref(), Some("0"));
+        assert!(!crate::gating::is_enabled());
+        match prev {
+            Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+            None => unsafe { std::env::remove_var("GROK_LHC") },
         }
     }
 }

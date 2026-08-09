@@ -10,11 +10,10 @@
 > something the thin view only sketches.
 >
 > Built on [**LHC** (Long Horizon Context)](https://github.com/liminal-ai/long-horizon-context).
-> **Off by default** (plain Grok Build when disabled). Product branch **`lhc`**;
-> **`main`** tracks upstream only.
+> Product branch **`lhc`**; **`main`** tracks upstream only.
 >
 > - [**What this fork is**](lhc-docs/README.md) — more on the approach and fit
-> - [**Install & use**](lhc-docs/INSTALL.md) — build, enable, verify
+> - [**Install & use**](lhc-docs/INSTALL.md) — build and run
 > - [**LHC project**](https://github.com/liminal-ai/long-horizon-context) — the shared engine
 >
 > No prebuilt fork releases yet — use this source tree. Official `grok`

@@ -2033,26 +2033,31 @@ pub(crate) fn remove_hooks_path_from_file(
 }
 /// LHC (Long Horizon Context) configuration (`[lhc]` in config.toml).
 ///
-/// Off by default. Precedence for each field (documented in
+/// **On by default** in this fork. Precedence for each field (documented in
 /// `crates/lhc/grok-lhc-host/MAPPING.md`):
 /// 1. Environment variable if set (`GROK_LHC`, `GROK_LHC_ROOT`, …)
-/// 2. This config section
-/// 3. Built-in default (enabled = false)
+/// 2. This config section (when the key is present)
+/// 3. Built-in default (`enabled = true`, …)
+///
+/// Disable for troubleshooting: `GROK_LHC=0` or `[lhc] enabled = false`.
+/// Side-by-side vs stock Grok: use upstream binaries, not this fork with
+/// the gate flipped.
 ///
 /// ```toml
 /// [lhc]
-/// enabled = true
+/// # enabled = false                 # only if you need to disable
 /// root = "/var/lib/lhc"
-/// compact = "shadow"          # or "replace" (needs compact_experimental)
+/// compact = "shadow"                # or "replace" (needs compact_experimental)
 /// compact_experimental = false
 /// equivalence = true
-/// inference_model = "grok-4"
+/// inference_model = "grok-4.5"
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct LhcConfig {
-    /// Whether LHC capture/serving should be enabled when env does not say.
-    pub enabled: bool,
+    /// When set, whether LHC capture/serving is enabled (env still wins).
+    /// Omitted → fork default **on**.
+    pub enabled: Option<bool>,
     /// Storage root override (maps to `GROK_LHC_ROOT`).
     pub root: Option<std::path::PathBuf>,
     /// Compaction mode: `"shadow"` (default) or `"replace"`.
@@ -2094,8 +2099,9 @@ impl LhcConfig {
             },
         };
         let resolved = grok_lhc_host::resolve_lhc_config(&grok_lhc_host::LhcFileConfig {
-            // Only attribute provenance to the file when `[lhc]` parsed cleanly.
-            enabled: if section_ok { Some(file.enabled) } else { None },
+            // Only attribute provenance to the file when `[lhc]` parsed cleanly
+            // and the key was present (`Option` — omit means default-on).
+            enabled: if section_ok { file.enabled } else { None },
             root: if section_ok { file.root.clone() } else { None },
             compact: if section_ok {
                 file.compact.clone()

@@ -88,11 +88,11 @@ fn wait_exact(handle: &CaptureHandle, n: usize) -> Vec<EventRecord> {
 }
 
 #[test]
-fn gate_off_by_default() {
+fn gate_on_by_default() {
     let _g = env_lock();
     let prev = std::env::var_os("GROK_LHC");
     unsafe { std::env::remove_var("GROK_LHC") };
-    assert!(!is_enabled());
+    assert!(is_enabled(), "fork default is on when GROK_LHC is unset");
     match prev {
         Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
         None => unsafe { std::env::remove_var("GROK_LHC") },
@@ -106,7 +106,7 @@ fn disabled_tee_is_passthrough_no_registry() {
     let prev = std::env::var_os("GROK_LHC");
     let prev_root = std::env::var_os("GROK_LHC_ROOT");
     unsafe {
-        std::env::remove_var("GROK_LHC");
+        std::env::set_var("GROK_LHC", "0");
         std::env::set_var("GROK_LHC_ROOT", root.path());
     }
     let sid = "cert-disabled";
@@ -4070,7 +4070,7 @@ fn chunk3a_config_file_enables_when_env_unset() {
 fn chunk3a_status_off_reports_native_engine() {
     let _g = env_lock();
     let prev = std::env::var_os("GROK_LHC");
-    unsafe { std::env::remove_var("GROK_LHC") };
+    unsafe { std::env::set_var("GROK_LHC", "0") };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -4245,7 +4245,7 @@ fn chunk3a_tee_mid_session_on_from_spawned_off() {
     let prev = std::env::var_os("GROK_LHC");
     let prev_root = std::env::var_os("GROK_LHC_ROOT");
     unsafe {
-        std::env::remove_var("GROK_LHC");
+        std::env::set_var("GROK_LHC", "0");
         std::env::set_var("GROK_LHC_ROOT", root.path());
     }
     let sid = "chunk3a-probe-a";
@@ -4421,10 +4421,10 @@ async fn chunk3a_status_reports_fail_open_reason_after_timeout() {
 }
 
 #[test]
-fn chunk3a_off_by_default_noop() {
+fn chunk3a_explicit_off_is_noop() {
     let _g = env_lock();
     let prev = std::env::var_os("GROK_LHC");
-    unsafe { std::env::remove_var("GROK_LHC") };
+    unsafe { std::env::set_var("GROK_LHC", "0") };
     assert!(!is_enabled());
     assert!(!capture_active("chunk3a-never"));
     match prev {

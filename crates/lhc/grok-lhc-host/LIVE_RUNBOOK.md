@@ -28,7 +28,7 @@ FORK/MAPPING prose. Each item is runnable end-to-end.
 **How Replace is armed (needed by L1–L5)**
 
 ```bash
-export GROK_LHC=1
+# LHC is on by default in this fork — no GROK_LHC=1 required
 export GROK_LHC_COMPACT=replace
 export GROK_LHC_COMPACT_EXPERIMENTAL=1   # required; replace alone stays Shadow
 # optional: export GROK_LHC_ROOT=/tmp/lhc-live-$USER
@@ -44,9 +44,10 @@ Then start the shell the way you normally do for this fork. Confirm with
    settles in-flight background work under a short `drainSettled` cap —
    not a multi-minute catch-up bill; status becomes capture stopped /
    engine native).
-2. Process-wide: unset `GROK_LHC` (and `[lhc] enabled` in config); restart.
-3. Flag-off is the rollback at every point — do not leave Replace armed after a
-   failed live item unless the failure criteria say to keep evidence.
+2. Process-wide: `export GROK_LHC=0` (or `[lhc] enabled = false`); restart.
+   Unset alone leaves default-on.
+3. Explicit off is the rollback at every point — do not leave Replace armed
+   after a failed live item unless the failure criteria say to keep evidence.
 
 ---
 

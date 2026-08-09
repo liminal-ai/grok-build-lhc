@@ -747,7 +747,7 @@ fn b5_rollback_disable_after_writeback_continues_native() {
     let body = h.run_replace_writeback();
     assert!(matches!(body.first(), Some(ConversationItem::System(_))));
 
-    unsafe { std::env::remove_var("GROK_LHC") };
+    unsafe { std::env::set_var("GROK_LHC", "0") };
     assert!(!is_enabled());
     h.capture.shutdown_blocking();
     wait_registry_gone(sid);
@@ -892,7 +892,7 @@ fn b7_perf_on_vs_off_and_compaction_wall() {
     let root = TempDir::new().unwrap();
 
     unsafe {
-        std::env::remove_var("GROK_LHC");
+        std::env::set_var("GROK_LHC", "0");
         std::env::set_var("GROK_LHC_ROOT", root.path());
     }
     let sid_off = "harness-b7-off";

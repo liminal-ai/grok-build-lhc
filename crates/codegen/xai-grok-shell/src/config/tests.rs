@@ -3761,7 +3761,7 @@ fn from_remote_gated_requires_xai_auth_for_writeback() {
 }
 
 #[test]
-fn lhc_config_default_section_absent_stays_off() {
+fn lhc_config_default_section_absent_stays_on() {
     let _guard = MEMORY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let prev = std::env::var_os("GROK_LHC");
     let prev_root = std::env::var_os("GROK_LHC_ROOT");
@@ -3773,15 +3773,22 @@ fn lhc_config_default_section_absent_stays_off() {
     }
     let config = toml::Value::Table(toml::map::Map::new());
     let file = crate::config::LhcConfig::resolve_and_apply(&config);
-    assert!(!file.enabled);
-    assert!(!grok_lhc_host::is_enabled());
+    assert!(file.enabled.is_none(), "absent [lhc] leaves enabled unset");
+    assert!(
+        grok_lhc_host::is_enabled(),
+        "fork default is on when env and [lhc] omit enable"
+    );
+    assert!(
+        std::env::var_os("GROK_LHC").is_none(),
+        "default-on must not leak GROK_LHC into env"
+    );
     assert!(
         std::env::var_os("GROK_LHC_ROOT").is_none(),
-        "default-off must not set GROK_LHC_ROOT"
+        "default-on must not set GROK_LHC_ROOT"
     );
     assert!(
         std::env::var_os("GROK_LHC_COMPACT").is_none(),
-        "default-off must not set GROK_LHC_COMPACT"
+        "default-on must not set GROK_LHC_COMPACT"
     );
     match prev {
         Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
@@ -3823,8 +3830,8 @@ fn lhc_config_malformed_section_surfaces_parse_error() {
     let _guard = MEMORY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let prev = std::env::var_os("GROK_LHC");
     unsafe { std::env::remove_var("GROK_LHC") };
-    // `enabled` must be bool — string typo must not silently become default-off
-    // while still attributing provenance to config.
+    // `enabled` must be bool — string typo must not silently become a fake
+    // config provenance while still applying a half-read section.
     let config: toml::Value = toml::from_str(
         r#"
         [lhc]
@@ -3833,14 +3840,40 @@ fn lhc_config_malformed_section_surfaces_parse_error() {
     )
     .unwrap();
     let file = crate::config::LhcConfig::resolve_and_apply(&config);
-    assert!(!file.enabled);
-    assert!(!grok_lhc_host::is_enabled());
+    assert!(file.enabled.is_none());
+    // Malformed section is ignored → fork default-on still applies.
+    assert!(
+        grok_lhc_host::is_enabled(),
+        "malformed [lhc] is ignored; default remains on"
+    );
     let err = grok_lhc_host::config_parse_error();
     assert!(
         err.as_ref().is_some_and(|e| e.contains("invalid [lhc]")),
         "malformed [lhc] must surface a parse error, got {err:?}"
     );
     grok_lhc_host::clear_config_parse_error();
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC") },
+    }
+}
+
+#[test]
+fn lhc_config_toml_disables_when_env_unset() {
+    let _guard = MEMORY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var_os("GROK_LHC");
+    unsafe { std::env::remove_var("GROK_LHC") };
+    let config: toml::Value = toml::from_str(
+        r#"
+        [lhc]
+        enabled = false
+        "#,
+    )
+    .unwrap();
+    let _ = crate::config::LhcConfig::resolve_and_apply(&config);
+    assert!(!grok_lhc_host::is_enabled());
+    assert_eq!(std::env::var("GROK_LHC").ok().as_deref(), Some("0"));
+    unsafe { std::env::remove_var("GROK_LHC") };
     match prev {
         Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
         None => unsafe { std::env::remove_var("GROK_LHC") },

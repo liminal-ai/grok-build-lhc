@@ -1,11 +1,10 @@
 # Install & use
 
-Build and run **this fork** from source: Grok Build with optional
-long-horizon context (LHC). Upstream install scripts and prebuilt `grok`
-binaries do **not** include that path.
+Build and run **this fork** from source: Grok Build with long-horizon context
+(LHC). Official `grok` installers and prebuilt binaries do **not** include it.
 
-For *why* the fork exists, see [`README.md`](README.md). For maintainer
-drills, see [`../FORK.md`](../FORK.md).
+For *what* the fork is, see [`README.md`](README.md). For maintainer drills,
+see [`../FORK.md`](../FORK.md).
 
 ---
 
@@ -55,58 +54,20 @@ cargo check -p grok-lhc-host
 ```
 
 There is no separate cargo feature flag for LHC — the adapter is a normal
-workspace member. **Runtime** gating controls whether capture runs.
+workspace member.
 
-## 4. Enable LHC
+## 4. Run
 
-**Off by default.** With LHC disabled, behavior matches upstream for practical
-purposes (a resolving tee may still be present; it no-ops when capture is off).
-
-### Environment (common)
-
-```bash
-export GROK_LHC=1
-# optional storage root (default ~/.lhc):
-# export GROK_LHC_ROOT="$HOME/.lhc-dev"
-```
-
-### Config file
-
-In Grok config (`config.toml` — same locations as upstream), you can also set:
-
-```toml
-[lhc]
-enabled = true
-# root = "/path/to/lhc-storage"
-# inference_model = "grok-4.5"   # derivation model; default grok-4.5
-```
-
-When both are set, **env wins** for enablement.
-
-### Compact modes (optional, advanced)
-
-- Default compact path is conservative (**shadow** / non-replace unless you
-  deliberately arm experimental replace).
-- **Replace** write-back into native conversation is double-gated and
-  experimental:
-
-```bash
-export GROK_LHC=1
-export GROK_LHC_COMPACT=replace
-export GROK_LHC_COMPACT_EXPERIMENTAL=1
-```
-
-Do not arm replace casually on a session you cannot afford to rewrite. See
-`FORK.md` (Gating) and `crates/lhc/grok-lhc-host/MAPPING.md`.
-
-## 5. Run
-
-Launch the TUI the same way you would from a source build of Grok Build, e.g.:
+Launch the TUI the same way you would from a source build of Grok Build:
 
 ```bash
 cargo run -p xai-grok-pager-bin
 # or run the release binary you built
 ```
+
+**LHC is on by default** in this fork. You do not need `GROK_LHC=1` for
+normal use. Storage defaults to `~/.lhc` (override with `GROK_LHC_ROOT` or
+`[lhc].root`).
 
 In a session:
 
@@ -117,15 +78,45 @@ In a session:
 | `/lhc on` / `/lhc off` | Per-session attach / detach |
 | `/lhc repair` | Repair paths (see status text; destructive steps need confirm) |
 
-When capture is active and open, history retrieval tools
-(`get_turns` / `get_messages`) are available so the agent can refresh
-low-fidelity spans from the archive.
+History retrieval tools (`get_turns` / `get_messages`) are available while
+capture is active so the agent can refresh low-fidelity spans from the archive.
 
-## 6. Where data lives
+## 5. Disable (troubleshooting only)
 
-Default LHC storage root: **`~/.lhc`** (override with `GROK_LHC_ROOT` /
-`[lhc].root`). Per-thread SQLite plus a registry — full event history lives
-here even when the model only sees a compressed view.
+If you need to rule LHC out of a bug:
+
+```bash
+export GROK_LHC=0
+# or in config.toml:
+# [lhc]
+# enabled = false
+```
+
+Then restart the process. For a clean side-by-side against stock Grok, use
+**upstream** binaries/builds—not this fork with the gate flipped.
+
+## 6. Optional config
+
+```toml
+[lhc]
+# enabled = false              # only to disable
+# root = "/path/to/lhc-storage"
+# inference_model = "grok-4.5" # derivation model; default grok-4.5
+# compact = "shadow"           # default; "replace" needs experimental gate
+# compact_experimental = false
+```
+
+Env wins when set (`GROK_LHC`, `GROK_LHC_ROOT`, `GROK_LHC_COMPACT`, …).
+
+### Compact replace (advanced / experimental)
+
+```bash
+export GROK_LHC_COMPACT=replace
+export GROK_LHC_COMPACT_EXPERIMENTAL=1
+```
+
+Do not arm replace casually on a session you cannot afford to rewrite. See
+`FORK.md` (Gating) and `crates/lhc/grok-lhc-host/MAPPING.md`.
 
 ## 7. Verify the fork is intact
 

@@ -458,7 +458,7 @@ mod tests {
         let prev = std::env::var_os("GROK_LHC");
         let prev_root = std::env::var_os("GROK_LHC_ROOT");
         unsafe {
-            std::env::remove_var("GROK_LHC");
+            std::env::set_var("GROK_LHC", "0");
             std::env::remove_var("GROK_LHC_ROOT");
         }
         let session_id = "disabled-path-test-session";
@@ -493,7 +493,7 @@ mod tests {
         let _g = env_lock();
         let prev = std::env::var_os("GROK_LHC");
         unsafe {
-            std::env::remove_var("GROK_LHC");
+            std::env::set_var("GROK_LHC", "0");
         }
         assert!(
             !any_capture_active(),
@@ -546,7 +546,7 @@ mod tests {
 
         // Session B: install tee with process gate off so no worker is spawned,
         // while A remains registered.
-        unsafe { std::env::remove_var("GROK_LHC") };
+        unsafe { std::env::set_var("GROK_LHC", "0") };
         let mut tee_b = tee_chat_persistence(
             "aa1-disabled-b",
             "/tmp",
@@ -664,7 +664,7 @@ mod tests {
         )
         .expect("A");
 
-        unsafe { std::env::remove_var("GROK_LHC") };
+        unsafe { std::env::set_var("GROK_LHC", "0") };
         let mut tee_b = tee_chat_persistence(
             "ab1-disabled-b",
             "/tmp",

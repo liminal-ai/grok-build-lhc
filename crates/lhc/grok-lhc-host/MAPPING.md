@@ -826,16 +826,17 @@ For each `GROK_LHC*` key independently:
 
 1. **Environment variable** if set (including explicit `0` / `false` / `off`)
 2. **`[lhc]` config.toml** (applied only when the section is present)
-3. **Default** — `enabled = false`, root `~/.lhc`, compact `shadow`,
+3. **Default** — `enabled = true`, root `~/.lhc`, compact `shadow`,
    equivalence armed, no inference-model override
 
 `LhcConfig::resolve_and_apply` (shell) calls `resolve_lhc_config` +
-`apply_resolved_config`, which **fills unset env vars only** — existing tests
-that set `GROK_LHC*` are unchanged. Default remains **off**.
+`apply_resolved_config`, which **fills unset env vars only for non-default
+sources** — default-on does not leak `GROK_LHC=1` into child env; config
+`enabled = false` does set `GROK_LHC=0` so the process gate matches.
 
 | TOML field | Env | Notes |
 |---|---|---|
-| `enabled` | `GROK_LHC` | `1`/`true` on; `0`/`false`/`off` force off |
+| `enabled` | `GROK_LHC` | unset → **on**; `0`/`false`/`off` force off; `1`/`true`/`on` force on |
 | `root` | `GROK_LHC_ROOT` | storage root |
 | `compact` | `GROK_LHC_COMPACT` | `shadow` / `replace` |
 | `compact_experimental` | `GROK_LHC_COMPACT_EXPERIMENTAL` | required for Replace |

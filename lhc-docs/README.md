@@ -44,14 +44,15 @@ Deeper design (bands, archive vs view, ethics of not erasing history): LHC
 | Long-horizon views | Older → more compressed; recent → full fidelity; smooth ramp |
 | Scale ambition | Coherence aimed at very large histories (tens of millions of tokens of record), with a target-sized working context |
 | Tagged retrieval | Re-open specific past turns/messages when the thin view is not enough |
-| Opt-in | **Off by default** — leave it off for stock Grok-like behavior |
+| Default | **On** when you run this fork; disable only to troubleshoot |
 | Controls | `/lhc` status, health, on/off, repair |
 
 ## What this fork is not
 
 - Not an official xAI release channel  
 - Not a rewrite of Grok Build—thin integration, regular upstream merges  
-- Not always-on memory theater; gated and still evolving  
+- Not a substitute for stock Grok when comparing behavior—use upstream builds for that  
+
 
 ## Branches and releases
 

@@ -1423,7 +1423,7 @@ pub struct Config {
     pub subagents: crate::config::SubagentsConfig,
     #[serde(default, skip_serializing)]
     pub memory: crate::config::MemoryConfig,
-    /// `[lhc]` — Long Horizon Context (off by default; env wins over file).
+    /// `[lhc]` — Long Horizon Context (on by default in this fork; env wins).
     #[serde(default, skip_serializing)]
     pub lhc: crate::config::LhcConfig,
     #[serde(default, skip_serializing)]
@@ -2292,7 +2292,7 @@ impl Config {
             ctx.remote_settings,
         );
         self.memory_config = if mem.enabled { Some(mem) } else { None };
-        // LHC: env > [lhc] config > default off. Fills unset GROK_LHC* env
+        // LHC: env > [lhc] config > default on. Fills unset GROK_LHC* env
         // vars only for non-default sources (defaults must not leak into env).
         self.lhc = crate::config::LhcConfig::resolve_and_apply(ctx.raw_config);
         self.disable_web_search = self.disable_web_search || ctx.disable_web_search;

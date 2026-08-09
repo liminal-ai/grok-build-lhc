@@ -1,19 +1,22 @@
-//! Feature gate: LHC capture is off unless `GROK_LHC` is truthy.
+//! Feature gate: LHC capture is **on by default** in this fork.
 //!
-//! Truthy set matches [`crate::runtime_config`] (`1` / `true` / `on`,
-//! case-insensitive) so resolve and gate cannot disagree.
+//! Set `GROK_LHC=0` / `false` / `off` (or `[lhc] enabled = false` via config
+//! apply) to disable for troubleshooting. Explicit `1` / `true` / `on` forces
+//! on. Truthy/falsey sets match [`crate::runtime_config`] so resolve and gate
+//! cannot disagree.
 
 /// Return whether LHC capture should be installed for a new session.
 ///
 /// Reads `GROK_LHC` once per call; the host calls this at session spawn and
-/// caches the decision by whether a capture handle is registered.
+/// caches the decision by whether a capture handle is registered. When the
+/// env var is unset, the fork default is **enabled**.
 pub fn is_enabled() -> bool {
     match std::env::var("GROK_LHC") {
         Ok(v) => {
             let v = v.trim();
             v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
         }
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
@@ -49,11 +52,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn disabled_when_unset() {
+    fn enabled_when_unset() {
         let _g = env_lock();
         // SAFETY: test process; GROK_LHC restored below.
         let prev = std::env::var_os("GROK_LHC");
         unsafe { std::env::remove_var("GROK_LHC") };
+        assert!(is_enabled(), "fork default is on when GROK_LHC is unset");
+        match prev {
+            Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+            None => unsafe { std::env::remove_var("GROK_LHC") },
+        }
+    }
+
+    #[test]
+    fn disabled_when_explicitly_off() {
+        let _g = env_lock();
+        let prev = std::env::var_os("GROK_LHC");
+        unsafe { std::env::set_var("GROK_LHC", "0") };
         assert!(!is_enabled());
         match prev {
             Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },

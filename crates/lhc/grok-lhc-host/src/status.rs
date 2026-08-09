@@ -708,7 +708,7 @@ mod tests {
     fn status_when_off_is_cheap_and_native() {
         let _g = env_lock();
         let prev = std::env::var_os("GROK_LHC");
-        unsafe { std::env::remove_var("GROK_LHC") };
+        unsafe { std::env::set_var("GROK_LHC", "0") };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
