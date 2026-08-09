@@ -6,6 +6,36 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::{fs, iter};
 
+/// Rest of a make-style dep line after the target (`target: deps...`).
+/// Handles Windows drive letters (`C:\foo: D:\bar`).
+fn split_make_dep_rest(line: &str) -> Option<&str> {
+    // Prefer ": " (colon-space) — never a drive letter form.
+    if let Some(i) = line.find(": ") {
+        return Some(line[i + 2..].trim_start());
+    }
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b':' {
+            // Skip `X:` drive-letter prefix.
+            if i == 1 && bytes[0].is_ascii_alphabetic() {
+                i += 1;
+                continue;
+            }
+            return Some(line[i + 1..].trim_start());
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Split a make-deps path list on spaces, keeping `C:\Program Files\...` as one
+/// path when possible by only splitting on spaces not inside... (protoc uses
+/// unquoted space-separated paths; spaces in paths are rare for our tree).
+fn split_make_dep_paths(line: &str) -> impl Iterator<Item = &str> {
+    line.split_whitespace().filter(|p| !p.is_empty() && *p != "\\")
+}
+
 /// Find the protoc well-known types include directory.
 ///
 /// When PROTOC is set (e.g., in Bazel), the include directory is typically
@@ -183,34 +213,34 @@ impl XaiProtoBuilder {
 
             let mut lines = dep_text.lines();
             let first_line = lines.next().context("protoc dependency output is empty")?;
-            // Unix descriptor_set_out=/dev/null → line starts with `/dev/null:`.
-            // Windows uses a temp path → `out.pbbin:` or similar.
-            let rem = first_line
-                .split_once(':')
-                .map(|(_, rest)| rest)
-                .with_context(|| {
-                    format!("protoc dependency line missing ':': {dep_text:?}")
-                })?;
+            // Make-style: `target: dep1 dep2` — on Windows targets are
+            // `C:\path\out.pbbin`, so a naive split on `:` breaks on the drive letter.
+            let rem = split_make_dep_rest(first_line).with_context(|| {
+                format!("protoc dependency line missing target separator: {dep_text:?}")
+            })?;
             for line in iter::once(rem).chain(lines) {
                 let line = line.trim();
                 let line = line.strip_suffix('\\').unwrap_or(line).trim();
                 if line.is_empty() {
                     continue;
                 }
-                // Depending on absolute paths like
-                // /Users/user/homebrew/Cellar/protobuf/29.1/include/google/protobuf/timestamp.proto
-                // is valid, but we want to have output more deterministic.
-                if line.contains("/include/google/protobuf/")
-                    || line.contains("\\include\\google\\protobuf\\")
-                {
-                    continue;
-                }
+                // One line may list several space-separated paths.
+                for path in split_make_dep_paths(line) {
+                    // Depending on absolute paths like
+                    // /Users/user/homebrew/Cellar/protobuf/29.1/include/google/protobuf/timestamp.proto
+                    // is valid, but we want to have output more deterministic.
+                    if path.contains("/include/google/protobuf/")
+                        || path.contains("\\include\\google\\protobuf\\")
+                    {
+                        continue;
+                    }
 
-                if !fs::exists(line)? {
-                    return Err(anyhow::anyhow!("dependency file not found: {line}"));
-                }
+                    if !fs::exists(path)? {
+                        return Err(anyhow::anyhow!("dependency file not found: {path}"));
+                    }
 
-                println!("cargo:rerun-if-changed={line}");
+                    println!("cargo:rerun-if-changed={path}");
+                }
             }
         }
 
