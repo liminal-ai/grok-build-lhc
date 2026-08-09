@@ -1,0 +1,86 @@
+# Optional: smoke release artifacts on Daytona (Linux; Windows if org allows).
+#
+# Trigger manually after a dry-run build, or after a real release.
+# Needs secret DAYTONA_API_KEY.
+
+name: Smoke Daytona
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Actions run id that has grok-* artifacts (e.g. dry-run Release)"
+        required: true
+        type: string
+      platforms:
+        description: "Comma list: linux,windows"
+        required: false
+        default: "linux"
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  smoke-linux:
+    if: contains(inputs.platforms, 'linux')
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: pip install -r scripts/daytona-smoke/requirements.txt
+      - name: Download linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: grok-linux-x86_64
+          path: artifacts
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.run_id }}
+      - name: Run Linux smoke
+        env:
+          DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
+        run: |
+          set -euo pipefail
+          ART=$(ls artifacts/grok-*-linux-x86_64 | head -1)
+          export GROK_ARTIFACT_PATH="$ART"
+          python scripts/daytona-smoke/smoke_linux.py
+
+  smoke-windows:
+    if: contains(inputs.platforms, 'windows')
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: pip install -r scripts/daytona-smoke/requirements.txt
+      - name: Download windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: grok-windows-x86_64
+          path: artifacts
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.run_id }}
+      - name: Run Windows smoke
+        env:
+          DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
+        run: |
+          set -euo pipefail
+          ART=$(ls artifacts/grok-*-windows-x86_64.exe | head -1)
+          export GROK_ARTIFACT_PATH="$ART"
+          set +e
+          python scripts/daytona-smoke/smoke_windows.py
+          code=$?
+          if [ "$code" = "2" ]; then
+            echo "Windows sandboxes not available for this Daytona org — skipped"
+            exit 0
+          fi
+          exit $code
