@@ -110,6 +110,14 @@ impl SessionActor {
                     }
                     LhcSlashOp::Off => {
                         if grok_lhc_host::capture_active(sid) {
+                            // Drop model-visible tools before capture teardown so
+                            // a concurrent tool list cannot advertise a dead session.
+                            {
+                                let bridge = self.agent.borrow().tool_bridge().clone();
+                                crate::session::lhc_retrieval_tools::unregister_lhc_retrieval_tools(
+                                    &bridge,
+                                );
+                            }
                             grok_lhc_host::shutdown_session(sid);
                             // Unregisters immediately; worker settles in-flight
                             // background work under a short drainSettled cap.
@@ -155,6 +163,19 @@ impl SessionActor {
                                 Some(sampler),
                             ) {
                                 Some(_) => {
+                                    let bridge = self.agent.borrow().tool_bridge().clone();
+                                    if let Err(e) = crate::session::lhc_retrieval_tools::register_lhc_retrieval_tools(
+                                        &bridge,
+                                        sid,
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(
+                                            session_id = %sid,
+                                            error = %e,
+                                            "LHC retrieval tools: registration failed on /lhc on"
+                                        );
+                                    }
                                     let compact_line =
                                         if grok_lhc_host::inference_sampler_registered(sid) {
                                             "**ModelCall compact:** available (sampler registered)."

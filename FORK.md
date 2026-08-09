@@ -194,6 +194,25 @@ bands under real budgets for that kill test to be meaningful.
 
 ## Sync record
 
+### 2026-08-09 — Wave B Slice 3: retrieval tools (`get_turns` / `get_messages`)
+
+Smallest native Grok integration for history pull (still pin `dd251ec`;
+`main` stays `8a14c91`). No new LHC-HOOK markers (still 10). No SDK/vendor
+edits.
+
+- Host (`grok-lhc-host`): strict arg validation, order-preserving dedupe before
+  32-id cap, SDK `format::*` assembly, capture-worker commands
+  (`GetTurns` / `GetMessages` / `ListImpressions`) so retrieval shares the
+  per-session SDK owner with capture/compaction (no independent thread-DB open).
+- Shell: direct `xai_tool_runtime::Tool` tools registered on ToolBridge only
+  while capture is active (spawn if tee opened, `/lhc on`, agent rebuild);
+  unregistered on `/lhc off`. Session id bound at registration; inactive /
+  cross-session resolve fails explicitly with zero cross-access.
+- **Output-cap audit:** tool result → `finalize_output` → `prompt_text` →
+  `ConversationItem::tool_result` has **no** universal host truncation for
+  plain Text tools. `byte_budget` is **not** passed (token budget 8000 only).
+  MCP/`use_tool`/bash caps do not apply to this path.
+
 ### 2026-08-09 — Wave B Slice 2: host-observed identity + safe signature replay
 
 Identity/signature slice only (still pin `dd251ec`; `main` stays `8a14c91`).

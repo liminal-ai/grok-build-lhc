@@ -330,6 +330,8 @@ pub(crate) mod image_normalize;
 pub(crate) mod inference_metrics;
 // LHC-HOOK 6/10: shell-local LHC inference transport (dedicated non-main path)
 pub(crate) mod lhc_inference;
+/// Wave B retrieval tools (`get_turns` / `get_messages`) — dynamic ToolBridge registration.
+pub(crate) mod lhc_retrieval_tools;
 pub use xai_grok_shared::session::info;
 pub mod managed_mcp;
 pub(crate) mod mcp_descriptors;

@@ -259,6 +259,24 @@ impl SessionActor {
             }
         }
         self.re_register_mcp_tools_on_rebuilt_bridge().await;
+        // Wave B: rebuilt ToolBridge drops dynamic tools — re-attach retrieval
+        // tools only when this session still has an active LHC capture worker.
+        {
+            let sid = self.session_info.id.0.as_ref();
+            if grok_lhc_host::capture_active(sid) {
+                let bridge = self.agent.borrow().tool_bridge().clone();
+                if let Err(e) =
+                    crate::session::lhc_retrieval_tools::register_lhc_retrieval_tools(&bridge, sid)
+                        .await
+                {
+                    tracing::warn!(
+                        session_id = %sid,
+                        error = %e,
+                        "LHC retrieval tools: re-registration failed after agent rebuild"
+                    );
+                }
+            }
+        }
         if let Some(old_handle) = self.deferred_prefix.take() {
             old_handle.abort();
         }

@@ -93,6 +93,18 @@ enum CaptureCmd {
     DrainSettled(oneshot::Sender<()>),
     GetViewStatus(oneshot::Sender<Result<lhc::shared_tech::view::ViewStatus, String>>),
     InspectHealth(oneshot::Sender<Result<lhc::shared_tech::inspect::HealthReport, String>>),
+    /// History retrieval — serialized with capture/compaction on this worker.
+    GetTurns {
+        ids: Vec<String>,
+        options: Option<lhc::RetrievalOptions>,
+        ack: oneshot::Sender<Result<lhc::RetrievalReceipt<lhc::RetrievedTurn>, String>>,
+    },
+    GetMessages {
+        ids: Vec<String>,
+        options: Option<lhc::RetrievalOptions>,
+        ack: oneshot::Sender<Result<lhc::RetrievalReceipt<lhc::RetrievedMessage>, String>>,
+    },
+    ListImpressions(oneshot::Sender<Result<Vec<lhc::ImpressionRecord>, String>>),
     #[cfg(any(test, feature = "test-util"))]
     Poison(oneshot::Sender<()>),
     #[cfg(any(test, feature = "test-util"))]
@@ -425,6 +437,56 @@ impl CaptureHandle {
         self.inner
             .tx
             .send(CaptureCmd::GetViewStatus(tx))
+            .await
+            .map_err(|_| "capture worker gone".to_string())?;
+        rx.await.map_err(|_| "capture worker dropped".to_string())?
+    }
+
+    /// Retrieve turns by id through this session's capture worker (ordered with
+    /// persist/compact; no independent thread-DB open).
+    pub async fn get_turns(
+        &self,
+        ids: Vec<String>,
+        options: Option<lhc::RetrievalOptions>,
+    ) -> Result<lhc::RetrievalReceipt<lhc::RetrievedTurn>, String> {
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .tx
+            .send(CaptureCmd::GetTurns {
+                ids,
+                options,
+                ack: tx,
+            })
+            .await
+            .map_err(|_| "capture worker gone".to_string())?;
+        rx.await.map_err(|_| "capture worker dropped".to_string())?
+    }
+
+    /// Retrieve messages by id through this session's capture worker.
+    pub async fn get_messages(
+        &self,
+        ids: Vec<String>,
+        options: Option<lhc::RetrievalOptions>,
+    ) -> Result<lhc::RetrievalReceipt<lhc::RetrievedMessage>, String> {
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .tx
+            .send(CaptureCmd::GetMessages {
+                ids,
+                options,
+                ack: tx,
+            })
+            .await
+            .map_err(|_| "capture worker gone".to_string())?;
+        rx.await.map_err(|_| "capture worker dropped".to_string())?
+    }
+
+    /// List retrieval impressions (test/diagnostics) via the capture worker.
+    pub async fn list_impressions(&self) -> Result<Vec<lhc::ImpressionRecord>, String> {
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .tx
+            .send(CaptureCmd::ListImpressions(tx))
             .await
             .map_err(|_| "capture worker gone".to_string())?;
         rx.await.map_err(|_| "capture worker dropped".to_string())?
@@ -1272,6 +1334,18 @@ async fn process_cmd(
         }
         CaptureCmd::InspectHealth(ack) => {
             let _ = ack.send(sess.inspect_health().await);
+            false
+        }
+        CaptureCmd::GetTurns { ids, options, ack } => {
+            let _ = ack.send(sess.get_turns(&ids, options).await);
+            false
+        }
+        CaptureCmd::GetMessages { ids, options, ack } => {
+            let _ = ack.send(sess.get_messages(&ids, options).await);
+            false
+        }
+        CaptureCmd::ListImpressions(ack) => {
+            let _ = ack.send(sess.list_impressions().await);
             false
         }
         #[cfg(any(test, feature = "test-util"))]

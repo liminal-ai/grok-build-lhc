@@ -21,6 +21,7 @@ mod serving;
 mod session;
 mod status;
 mod tee;
+mod tools;
 #[cfg(any(test, feature = "test-util"))]
 mod writeback_gates;
 
@@ -81,6 +82,13 @@ pub use status::{
     plan_repair, status_report,
 };
 pub use tee::{capture_active, tee_chat_persistence};
+pub use tools::{
+    GET_MESSAGES_DESCRIPTION, GET_MESSAGES_TOOL_NAME, GET_TURNS_DESCRIPTION, GET_TURNS_TOOL_NAME,
+    HISTORY_LABEL_GUIDANCE, IdKind, ParsedRetrievalArgs, RetrievalLifecycleError, dedupe_ids,
+    format_messages_result, format_turns_result, get_messages_description, get_turns_description,
+    parse_retrieval_args, resolve_capture_for_retrieval, retrieval_args_schema, retrieval_options,
+    run_get_messages, run_get_turns,
+};
 pub use xai_chat_state::{HostAssistantIdentity, api_backend_label};
 
 /// Test-only: open an LHC session without spawning the capture worker.

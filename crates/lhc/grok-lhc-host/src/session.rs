@@ -274,6 +274,53 @@ impl LhcSession {
         }
     }
 
+    /// SDK `get_turns` via this session's instance (serialized with capture).
+    pub async fn get_turns(
+        &self,
+        turn_ids: &[String],
+        options: Option<lhc::RetrievalOptions>,
+    ) -> Result<lhc::RetrievalReceipt<lhc::RetrievedTurn>, String> {
+        match self
+            .lhc
+            .retrieval
+            .get_turns(self.thread_ref.clone(), turn_ids, options)
+            .await
+        {
+            OpResult::Ok { value } => Ok(value),
+            OpResult::Err { error } => Err(error.reason),
+        }
+    }
+
+    /// SDK `get_messages` via this session's instance (serialized with capture).
+    pub async fn get_messages(
+        &self,
+        message_ids: &[String],
+        options: Option<lhc::RetrievalOptions>,
+    ) -> Result<lhc::RetrievalReceipt<lhc::RetrievedMessage>, String> {
+        match self
+            .lhc
+            .retrieval
+            .get_messages(self.thread_ref.clone(), message_ids, options)
+            .await
+        {
+            OpResult::Ok { value } => Ok(value),
+            OpResult::Err { error } => Err(error.reason),
+        }
+    }
+
+    /// Impression read-back for tests / diagnostics (same SDK owner).
+    pub async fn list_impressions(&self) -> Result<Vec<lhc::ImpressionRecord>, String> {
+        match self
+            .lhc
+            .retrieval
+            .list_impressions(self.thread_ref.clone())
+            .await
+        {
+            OpResult::Ok { value } => Ok(value),
+            OpResult::Err { error } => Err(error.reason),
+        }
+    }
+
     /// LHC assembled request context (model wire shape; not used for classification).
     pub async fn get_llm_request_context(
         &self,

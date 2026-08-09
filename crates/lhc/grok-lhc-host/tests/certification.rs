@@ -5199,3 +5199,394 @@ fn wave_b_replace_history_does_not_invent_identity() {
     );
     handle.shutdown_blocking();
 }
+
+// ── Wave B retrieval tools (host half) ───────────────────────────────────
+
+fn rt_block_on<F: std::future::Future>(f: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(f)
+}
+
+fn seed_two_closed_turns(handle: &CaptureHandle) {
+    handle.persist(&ConversationItem::user("what does the config do?"));
+    handle.persist(&ConversationItem::assistant("it configures the server"));
+    // Terminal assistant without tools closes the turn (item-mapped turn_end).
+    handle.persist(&ConversationItem::user("read the file please"));
+    handle.persist(&ConversationItem::assistant("here is the file contents"));
+    handle.flush_blocking();
+    // Wait for at least two turn_end events.
+    for _ in 0..200 {
+        if let Ok(ev) = handle.list_events_blocking() {
+            let turns = ev
+                .iter()
+                .filter(|e| e.event_kind().as_str() == "turn_end")
+                .count();
+            if turns >= 2 {
+                return;
+            }
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Happy path: exact SDK envelope + impression rows via capture worker.
+#[test]
+fn wave_b_get_turns_and_messages_happy_path() {
+    let _g = env_lock();
+    let root = TempDir::new().unwrap();
+    let prev = std::env::var_os("GROK_LHC");
+    let prev_root = std::env::var_os("GROK_LHC_ROOT");
+    unsafe {
+        std::env::set_var("GROK_LHC", "1");
+        std::env::set_var("GROK_LHC_ROOT", root.path());
+    }
+    let sid = "wave-b-happy-pull";
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+    seed_two_closed_turns(&handle);
+
+    let text = rt_block_on(async {
+        grok_lhc_host::run_get_turns(sid, &serde_json::json!({ "ids": ["t1"] }))
+            .await
+            .expect("get_turns")
+    });
+    assert!(
+        text.starts_with(&lhc::retrieval::format::recall_open("get_turns")),
+        "missing envelope open: {text}"
+    );
+    assert!(
+        text.contains(&lhc::retrieval::format::recall_close("get_turns")),
+        "missing envelope close"
+    );
+    assert!(text.contains("<t1>"), "missing turn label: {text}");
+    assert!(
+        text.contains("what does the config do?"),
+        "missing prompt text: {text}"
+    );
+
+    // Message ids appear as <mN> tags inside the turn rendering.
+    let msg_id = {
+        let start = text.find("<m").expect("message tag in turn");
+        let rest = &text[start + 1..];
+        let end = rest.find('>').expect("close tag");
+        rest[..end].to_string()
+    };
+    assert!(msg_id.starts_with('m'), "expected message id, got {msg_id}");
+
+    let msgs = rt_block_on(async {
+        grok_lhc_host::run_get_messages(sid, &serde_json::json!({ "ids": [msg_id] }))
+            .await
+            .expect("get_messages")
+    });
+    assert!(msgs.starts_with(&lhc::retrieval::format::recall_open("get_messages")));
+    assert!(msgs.contains("what does the config do?"));
+
+    let imps = rt_block_on(async { handle.list_impressions().await.expect("imps") });
+    assert!(
+        imps.len() >= 2,
+        "happy-path pulls must write impression rows; got {}",
+        imps.len()
+    );
+
+    handle.shutdown_blocking();
+    wait_registry_gone(sid);
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC") },
+    }
+    match prev_root {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC_ROOT", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC_ROOT") },
+    }
+}
+
+/// Invalid args must not call the SDK (zero impressions).
+#[test]
+fn wave_b_invalid_args_zero_impressions() {
+    let _g = env_lock();
+    let root = TempDir::new().unwrap();
+    let prev = std::env::var_os("GROK_LHC");
+    let prev_root = std::env::var_os("GROK_LHC_ROOT");
+    unsafe {
+        std::env::set_var("GROK_LHC", "1");
+        std::env::set_var("GROK_LHC_ROOT", root.path());
+    }
+    let sid = "wave-b-val-zero-imp";
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+    seed_two_closed_turns(&handle);
+    let before = rt_block_on(async { handle.list_impressions().await.unwrap().len() });
+    assert_eq!(before, 0);
+
+    let cases = [
+        serde_json::json!({ "ids": ["m1"] }),
+        serde_json::json!({ "ids": [] }),
+        serde_json::json!({ "ids": ["t1"], "from": -1 }),
+        serde_json::json!({ "ids": ["t1"], "from": null }),
+        serde_json::json!({ "ids": ["t1"], "budget": 4000 }),
+    ];
+    for args in cases {
+        let err = rt_block_on(async { grok_lhc_host::run_get_turns(sid, &args).await });
+        assert!(err.is_err(), "expected refuse for {args}");
+    }
+
+    let after = rt_block_on(async { handle.list_impressions().await.unwrap().len() });
+    assert_eq!(after, 0, "validation failures must create zero impressions");
+
+    handle.shutdown_blocking();
+    wait_registry_gone(sid);
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC") },
+    }
+    match prev_root {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC_ROOT", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC_ROOT") },
+    }
+}
+
+/// Inactive session fails explicitly; never opens another session's DB.
+#[test]
+fn wave_b_inactive_and_cross_session_isolation() {
+    let _g = env_lock();
+    let root = TempDir::new().unwrap();
+    let prev = std::env::var_os("GROK_LHC");
+    let prev_root = std::env::var_os("GROK_LHC_ROOT");
+    unsafe {
+        std::env::set_var("GROK_LHC", "1");
+        std::env::set_var("GROK_LHC_ROOT", root.path());
+    }
+    let sid_a = "wave-b-iso-a";
+    let sid_b = "wave-b-iso-b";
+    let ha = spawn_capture(sid_a, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+    seed_two_closed_turns(&ha);
+    let hb = spawn_capture(sid_b, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+    hb.persist(&ConversationItem::user("only in b"));
+    hb.persist(&ConversationItem::assistant("b answer"));
+    hb.flush_blocking();
+
+    // A cannot see B's turns by using B's session id with A's handle — tools
+    // resolve by the bound session_id only.
+    let a_text = rt_block_on(async {
+        grok_lhc_host::run_get_turns(sid_a, &serde_json::json!({ "ids": ["t1"] }))
+            .await
+            .unwrap()
+    });
+    assert!(a_text.contains("what does the config do?"));
+    assert!(!a_text.contains("only in b"));
+
+    // Inactive id refuses without touching A or B.
+    let err = rt_block_on(async {
+        grok_lhc_host::run_get_turns("wave-b-never-opened", &serde_json::json!({ "ids": ["t1"] }))
+            .await
+    });
+    assert!(
+        err.unwrap_err().contains("not active"),
+        "expected inactive error"
+    );
+
+    // After A shuts down, A's tools must fail even though B is live.
+    ha.shutdown_blocking();
+    wait_registry_gone(sid_a);
+    let err = rt_block_on(async {
+        grok_lhc_host::run_get_turns(sid_a, &serde_json::json!({ "ids": ["t1"] })).await
+    });
+    assert!(err.unwrap_err().contains("not active"));
+
+    // B still works.
+    let b_text = rt_block_on(async {
+        grok_lhc_host::run_get_turns(sid_b, &serde_json::json!({ "ids": ["t1"] }))
+            .await
+            .unwrap()
+    });
+    assert!(b_text.contains("only in b") || b_text.contains("b answer") || b_text.contains("<t1>"));
+
+    hb.shutdown_blocking();
+    wait_registry_gone(sid_b);
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC") },
+    }
+    match prev_root {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC_ROOT", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC_ROOT") },
+    }
+}
+
+/// Continuation from `from` > 0 on an oversized turn.
+#[test]
+fn wave_b_continuation_from_nonzero() {
+    let _g = env_lock();
+    let root = TempDir::new().unwrap();
+    let prev = std::env::var_os("GROK_LHC");
+    let prev_root = std::env::var_os("GROK_LHC_ROOT");
+    unsafe {
+        std::env::set_var("GROK_LHC", "1");
+        std::env::set_var("GROK_LHC_ROOT", root.path());
+    }
+    let sid = "wave-b-slice-from";
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+    let big_body: String = (0..2000)
+        .map(|i| {
+            format!(
+                "line {i} of the very long log with filler words for token weight \
+                 and more padding text so the budget walk must slice"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    handle.persist(&ConversationItem::user("dump the log please"));
+    handle.persist(&ConversationItem::assistant(format!(
+        "full log follows\n{big_body}"
+    )));
+    handle.flush_blocking();
+    // Wait for turn close.
+    wait_events(&handle, 3);
+
+    let first = rt_block_on(async {
+        grok_lhc_host::run_get_turns(sid, &serde_json::json!({ "ids": ["t1"] }))
+            .await
+            .expect("first slice")
+    });
+    assert!(
+        first.contains("served tok 0–") || first.contains("served tok 0-"),
+        "expected head slice receipt: {first}"
+    );
+    assert!(
+        first.contains("Next slice: get_turns({\"ids\":[\"t1\"],\"from\":"),
+        "expected continuation instruction: {first}"
+    );
+
+    let second = rt_block_on(async {
+        grok_lhc_host::run_get_turns(sid, &serde_json::json!({ "ids": ["t1"], "from": 8000 }))
+            .await
+            .expect("continuation")
+    });
+    assert!(
+        second.contains("served tok 8000–")
+            || second.contains("served tok 8000-")
+            || second.contains("nothing at token offset 8000"),
+        "expected continuation window: {second}"
+    );
+
+    handle.shutdown_blocking();
+    wait_registry_gone(sid);
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC") },
+    }
+    match prev_root {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC_ROOT", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC_ROOT") },
+    }
+}
+
+/// Dedupe before 32-id cap: 38 copies of one id is one unique (serves), not refuse.
+#[test]
+fn wave_b_dedupe_before_32_cap() {
+    let _g = env_lock();
+    let root = TempDir::new().unwrap();
+    let prev = std::env::var_os("GROK_LHC");
+    let prev_root = std::env::var_os("GROK_LHC_ROOT");
+    unsafe {
+        std::env::set_var("GROK_LHC", "1");
+        std::env::set_var("GROK_LHC_ROOT", root.path());
+    }
+    let sid = "wave-b-dedupe-cap";
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+    seed_two_closed_turns(&handle);
+
+    let ids: Vec<String> = std::iter::repeat_n("t1".to_string(), 38).collect();
+    let text = rt_block_on(async {
+        grok_lhc_host::run_get_turns(sid, &serde_json::json!({ "ids": ids }))
+            .await
+            .expect("38 copies of t1 must budget as one id")
+    });
+    assert!(text.contains("<t1>") || text.contains("what does the config"));
+
+    // 33 unique → host refuse, zero impressions.
+    let before = rt_block_on(async { handle.list_impressions().await.unwrap().len() });
+    let ids33: Vec<String> = (1..=33).map(|i| format!("t{i}")).collect();
+    let err = rt_block_on(async {
+        grok_lhc_host::run_get_turns(sid, &serde_json::json!({ "ids": ids33 })).await
+    });
+    assert!(err.unwrap_err().contains("too many ids"));
+    let after = rt_block_on(async { handle.list_impressions().await.unwrap().len() });
+    assert_eq!(after, before, "over-cap refuse must not add impressions");
+
+    handle.shutdown_blocking();
+    wait_registry_gone(sid);
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC") },
+    }
+    match prev_root {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC_ROOT", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC_ROOT") },
+    }
+}
+
+/// Retrieval is serialized on the capture worker with persist (no independent DB).
+#[test]
+fn wave_b_retrieval_serialized_with_capture() {
+    let _g = env_lock();
+    let root = TempDir::new().unwrap();
+    let prev = std::env::var_os("GROK_LHC");
+    let prev_root = std::env::var_os("GROK_LHC_ROOT");
+    unsafe {
+        std::env::set_var("GROK_LHC", "1");
+        std::env::set_var("GROK_LHC_ROOT", root.path());
+    }
+    let sid = "wave-b-serial-worker";
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+    seed_two_closed_turns(&handle);
+
+    // Block the worker, then queue a persist and a get_turns — both complete
+    // after release, proving they share the same queue owner.
+    let (release_tx, release_rx) = oneshot::channel();
+    let entered_rx = handle.block_worker(release_rx);
+    // Wait until worker is blocked.
+    let _ = entered_rx.blocking_recv();
+
+    handle.persist(&ConversationItem::user("while-blocked"));
+    let handle2 = handle.clone();
+    let pull = thread::spawn(move || {
+        rt_block_on(async {
+            grok_lhc_host::run_get_turns(
+                handle2.session_id(),
+                &serde_json::json!({ "ids": ["t1"] }),
+            )
+            .await
+        })
+    });
+
+    // Give the pull a moment to queue behind the block.
+    thread::sleep(Duration::from_millis(50));
+    let _ = release_tx.send(());
+    let text = pull.join().unwrap().expect("get_turns after unblock");
+    assert!(text.contains("<t1>") || text.contains("what does the config"));
+
+    handle.flush_blocking();
+    let ev = wait_events(&handle, 1);
+    let has_blocked_user = ev.iter().any(|e| {
+        e.event_kind().as_str() == "user_prompt"
+            && e.text_payload()
+                .is_some_and(|p| p.text.contains("while-blocked"))
+    });
+    assert!(
+        has_blocked_user,
+        "persist while blocked must still land after release"
+    );
+
+    handle.shutdown_blocking();
+    wait_registry_gone(sid);
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC") },
+    }
+    match prev_root {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC_ROOT", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC_ROOT") },
+    }
+}
