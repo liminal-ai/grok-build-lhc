@@ -97,6 +97,59 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
+      - name: Install C toolchain (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config cmake protobuf-compiler
+
+      - name: Install C toolchain (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Blacksmith mac images may lack a working `cc`; ensure CLT/Xcode path.
+          if ! command -v cc >/dev/null 2>&1; then
+            echo "cc missing; checking xcode-select"
+            xcode-select -p || sudo xcode-select --install || true
+          fi
+          # Homebrew fallback for cmake/protoc if needed
+          if ! command -v cmake >/dev/null 2>&1; then
+            brew install cmake || true
+          fi
+          if ! command -v protoc >/dev/null 2>&1; then
+            brew install protobuf || true
+          fi
+          command -v cc
+          cc --version | head -1
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # bin/protoc is a Unix dotslash wrapper — unusable on Windows.
+          # Install a real protoc and set PROTOC for the build.
+          choco install protoc -y --no-progress || true
+          if command -v protoc >/dev/null 2>&1; then
+            PROTOC_PATH="$(command -v protoc)"
+          else
+            VER=29.3
+            curl -fsSL -o /tmp/protoc.zip \
+              "https://github.com/protocolbuffers/protobuf/releases/download/v${VER}/protoc-${VER}-win64.zip"
+            mkdir -p "$HOME/protoc"
+            python - <<'PY'
+          import zipfile, os, pathlib
+          zipfile.ZipFile(r"/tmp/protoc.zip").extractall(os.path.expanduser("~/protoc"))
+          PY
+            PROTOC_PATH="$HOME/protoc/bin/protoc.exe"
+          fi
+          echo "PROTOC=$PROTOC_PATH" >> "$GITHUB_ENV"
+          echo "$(dirname "$PROTOC_PATH")" >> "$GITHUB_PATH"
+          "$PROTOC_PATH" --version
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -110,21 +163,25 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.cargo/bin:$PATH"
           command -v dotslash
+          # Warm protoc via repo wrapper on Unix (after build-essential so cc exists).
+          if [ "${{ runner.os }}" != "Windows" ] && [ -x bin/protoc ]; then
+            bin/protoc --version || true
+          fi
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-${{ matrix.label }}
+          shared-key: release-${{ matrix.label }}-v2
           workspaces: "."
 
       - name: Build release binary
         shell: bash
         env:
           GROK_VERSION: ${{ needs.prep.outputs.version }}
-          PATH: ${{ env.PATH }}
         run: |
           set -euo pipefail
           export PATH="$HOME/.cargo/bin:$PATH"
+          command -v cc || command -v cl || true
           cargo build -p xai-grok-pager-bin --release
           BIN="target/release/xai-grok-pager${{ matrix.ext }}"
           test -f "$BIN"
