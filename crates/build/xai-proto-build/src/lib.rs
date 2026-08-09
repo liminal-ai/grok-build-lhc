@@ -126,11 +126,28 @@ impl XaiProtoBuilder {
         }
 
         // Can only process one input file when using --dependency_out=FILE.
+        // Unix: stream deps via /dev/stdout (and discard descriptors to /dev/null).
+        // Windows: those device paths don't exist — use temp files instead.
         for proto in protos {
             let mut command = Command::new(protoc.unwrap_or(Path::new("protoc")));
-            command
-                .arg("--dependency_out=/dev/stdout")
-                .arg("--descriptor_set_out=/dev/null");
+
+            #[cfg(unix)]
+            {
+                command
+                    .arg("--dependency_out=/dev/stdout")
+                    .arg("--descriptor_set_out=/dev/null");
+            }
+
+            #[cfg(windows)]
+            let _dep_tmp = {
+                let tmp = tempfile::TempDir::new().context("windows protoc temp dir")?;
+                let dep_path = tmp.path().join("deps.d");
+                let desc_path = tmp.path().join("out.pbbin");
+                command
+                    .arg(format!("--dependency_out={}", dep_path.display()))
+                    .arg(format!("--descriptor_set_out={}", desc_path.display()));
+                (tmp, dep_path)
+            };
 
             // Add protoc's well-known types include directory first (if found).
             // This is needed for Bazel sandboxed builds where protoc and its
@@ -156,22 +173,36 @@ impl XaiProtoBuilder {
                 return Err(anyhow::anyhow!("protoc command failed"));
             }
 
-            let output =
+            #[cfg(unix)]
+            let dep_text =
                 String::from_utf8(output.stdout).context("protoc command output not UTF-8")?;
 
-            let mut lines = output.lines();
-            let first_line = lines.next().context("protoc command output is empty")?;
-            let prefix = "/dev/null:";
-            let rem = first_line.strip_prefix(prefix).with_context(|| {
-                format!("protoc command output must start with /dev/null: {output:?}")
-            })?;
+            #[cfg(windows)]
+            let dep_text = fs::read_to_string(&_dep_tmp.1)
+                .with_context(|| format!("read protoc deps {}", _dep_tmp.1.display()))?;
+
+            let mut lines = dep_text.lines();
+            let first_line = lines.next().context("protoc dependency output is empty")?;
+            // Unix descriptor_set_out=/dev/null → line starts with `/dev/null:`.
+            // Windows uses a temp path → `out.pbbin:` or similar.
+            let rem = first_line
+                .split_once(':')
+                .map(|(_, rest)| rest)
+                .with_context(|| {
+                    format!("protoc dependency line missing ':': {dep_text:?}")
+                })?;
             for line in iter::once(rem).chain(lines) {
                 let line = line.trim();
-                let line = line.strip_suffix("\\").unwrap_or(line);
+                let line = line.strip_suffix('\\').unwrap_or(line).trim();
+                if line.is_empty() {
+                    continue;
+                }
                 // Depending on absolute paths like
                 // /Users/user/homebrew/Cellar/protobuf/29.1/include/google/protobuf/timestamp.proto
                 // is valid, but we want to have output more deterministic.
-                if line.contains("/include/google/protobuf/") {
+                if line.contains("/include/google/protobuf/")
+                    || line.contains("\\include\\google\\protobuf\\")
+                {
                     continue;
                 }
 
