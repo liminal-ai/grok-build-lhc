@@ -345,14 +345,14 @@ durable representation of the fork.
    order. Never hand-resolve anything else in that file.
 3. **Re-assert the root `README.md` fork banner.** Upstream rewrites the
    README often. The blockquote at the top of `README.md` is fork-owned:
-   it must lead with **why the fork exists** (long-horizon memory problem)
-   and **what it does** (Grok + LHC graceful memory), then links to
-   `lhc-docs/` and `liminal-ai/long-horizon-context`, and end with
-   `Everything below is upstream's README`. After a merge, if the banner is
-   missing, mangled, or has collapsed into storage/API jargon first, restore
-   the purpose-first block from the previous `lhc` tip — do not leave
-   default-branch `README.md` as pure upstream. `lhc-docs/**` and `FORK.md`
-   are fork-only; they should not conflict with upstream.
+   lead with the **product teaser** (full transcript + long-horizon views +
+   ramp of fidelity + scale of history + tagged retrieval)—problem and
+   approach in one breath—not storage jargon or a slow “why it exists”
+   preamble. Then links to `lhc-docs/` and
+   `liminal-ai/long-horizon-context`, ending with `Everything below is
+   upstream's README`. After a merge, if the banner is missing or mangled,
+   restore it from the previous `lhc` tip. `lhc-docs/**` and `FORK.md` are
+   fork-only; they should not conflict with upstream.
 4. `scripts/check-lhc-hooks.sh` — all layers green.
 5. Fast-forward `main` to `upstream/main`.
 6. **Advance the patch base.** `patches/BASE` names the upstream commit the

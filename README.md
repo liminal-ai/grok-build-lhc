@@ -1,22 +1,21 @@
 > **This is a maintained fork of [`xai-org/grok-build`](https://github.com/xai-org/grok-build).**
 >
-> **Why it exists.** Long agent sessions hit a hard limit: the context window
-> fills, older work is summarized or dropped, and the session loses coherence.
-> That is fine for a short task. It is a poor fit for days of continuous work
-> where decisions, constraints, and “why we did that” still matter.
+> **Grok Build + LHC** improves long-session context management: it keeps a
+> full transcript of the work, and serves **long-horizon views** that compress
+> older history (lower fidelity further back) while keeping the latest work at
+> full fidelity, with a smooth ramp between them. The aim is agents that stay
+> coherent and crisp across the scale of **tens of millions of tokens** of
+> history—not only until the first context cliff. Compressed spans stay
+> **tagged for high-fidelity retrieval** when Grok needs a deeper dive into
+> something the thin view only sketches.
 >
-> **What this fork does.** It keeps Grok Build as the coding harness and adds
-> [**LHC** (Long Horizon Context)](https://github.com/liminal-ai/long-horizon-context)
-> so memory can age gracefully: recent work stays sharp, older work compresses
-> in stages, nothing important is thrown away as the only copy, and the agent
-> can pull full detail back when a thin summary is not enough.
+> Built on [**LHC** (Long Horizon Context)](https://github.com/liminal-ai/long-horizon-context).
+> **Off by default** (plain Grok Build when disabled). Product branch **`lhc`**;
+> **`main`** tracks upstream only.
 >
-> LHC is **off by default** (this tree still runs as ordinary Grok Build).
-> Product work is on branch **`lhc`**; **`main`** tracks upstream only.
->
-> - [**What this fork is**](lhc-docs/README.md) — problem, approach, how it fits Grok
+> - [**What this fork is**](lhc-docs/README.md) — more on the approach and fit
 > - [**Install & use**](lhc-docs/INSTALL.md) — build, enable, verify
-> - [**LHC project**](https://github.com/liminal-ai/long-horizon-context) — the shared context engine
+> - [**LHC project**](https://github.com/liminal-ai/long-horizon-context) — the shared engine
 >
 > No prebuilt fork releases yet — use this source tree. Official `grok`
 > installers do **not** include LHC.
