@@ -231,7 +231,7 @@ index 8c3ea9a..b6707fe 100644
          &mut self,
          item: &ConversationItem,
 diff --git a/crates/codegen/xai-grok-shell/Cargo.toml b/crates/codegen/xai-grok-shell/Cargo.toml
-index cf37a46..cdb1328 100644
+index 932ea0b..8390d0e 100644
 --- a/crates/codegen/xai-grok-shell/Cargo.toml
 +++ b/crates/codegen/xai-grok-shell/Cargo.toml
 @@ -138,6 +138,8 @@ xai-agent-lifecycle = { workspace = true }
@@ -256,7 +256,7 @@ index cf37a46..cdb1328 100644
  xai-grok-workspace = { workspace = true, features = ["test-support"] }
  xai-grok-config = { workspace = true, features = [] }
 diff --git a/crates/codegen/xai-grok-shell/src/agent/config.rs b/crates/codegen/xai-grok-shell/src/agent/config.rs
-index dad990b..3ce5a6e 100644
+index efa8a8e..5a6915f 100644
 --- a/crates/codegen/xai-grok-shell/src/agent/config.rs
 +++ b/crates/codegen/xai-grok-shell/src/agent/config.rs
 @@ -1423,6 +1423,9 @@ pub struct Config {
@@ -269,7 +269,7 @@ index dad990b..3ce5a6e 100644
      #[serde(default, skip_serializing)]
      pub compaction: CompactionConfig,
      #[serde(default, skip_serializing)]
-@@ -1818,6 +1821,7 @@ impl Default for Config {
+@@ -1825,6 +1828,7 @@ impl Default for Config {
              disabled_mcp_tools: std::collections::HashMap::new(),
              subagents: crate::config::SubagentsConfig::default(),
              memory: crate::config::MemoryConfig::default(),
@@ -277,7 +277,7 @@ index dad990b..3ce5a6e 100644
              compaction: CompactionConfig::default(),
              managed_mcps: crate::config::ManagedMcpsConfig::default(),
              auth: None,
-@@ -2231,6 +2235,9 @@ impl Config {
+@@ -2288,6 +2292,9 @@ impl Config {
              ctx.remote_settings,
          );
          self.memory_config = if mem.enabled { Some(mem) } else { None };
@@ -315,10 +315,10 @@ index 900cf59..e7ac3ea 100644
          session_id: session_id.0.to_string(),
          previous_model_id: previous_model_id.to_string(),
 diff --git a/crates/codegen/xai-grok-shell/src/config/mod.rs b/crates/codegen/xai-grok-shell/src/config/mod.rs
-index 6ecdf16..ef286e7 100644
+index 94b838d..c75d0c1 100644
 --- a/crates/codegen/xai-grok-shell/src/config/mod.rs
 +++ b/crates/codegen/xai-grok-shell/src/config/mod.rs
-@@ -1936,5 +1936,93 @@ pub(crate) fn remove_hooks_path_from_file(
+@@ -2031,5 +2031,93 @@ pub(crate) fn remove_hooks_path_from_file(
      )?;
      Ok(())
  }
@@ -413,10 +413,10 @@ index 6ecdf16..ef286e7 100644
  #[cfg(test)]
  mod tests;
 diff --git a/crates/codegen/xai-grok-shell/src/config/tests.rs b/crates/codegen/xai-grok-shell/src/config/tests.rs
-index a9a13af..7e013ff 100644
+index 310709b..4f2bdb4 100644
 --- a/crates/codegen/xai-grok-shell/src/config/tests.rs
 +++ b/crates/codegen/xai-grok-shell/src/config/tests.rs
-@@ -3690,6 +3690,7 @@ fn kill_switched_cold_cwd_stays_allowed_through_plugins_config_read() {
+@@ -3735,6 +3735,7 @@ fn kill_switched_cold_cwd_stays_allowed_through_plugins_config_read() {
              "gate must still allow the kill-switched folder after the config read"
          );
  }
@@ -424,7 +424,7 @@ index a9a13af..7e013ff 100644
  /// Writeback requires grok.com auth: remote may advertise it, but a non-xai
  /// credential is downgraded to `Local`.
  #[test]
-@@ -3713,3 +3714,90 @@ fn from_remote_gated_requires_xai_auth_for_writeback() {
+@@ -3758,3 +3759,90 @@ fn from_remote_gated_requires_xai_auth_for_writeback() {
          StorageMode::Local
      );
  }
@@ -516,10 +516,10 @@ index a9a13af..7e013ff 100644
 +    }
 +}
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session.rs b/crates/codegen/xai-grok-shell/src/session/acp_session.rs
-index b8ebbcc..c081af3 100644
+index 9489c62..a0f8fcc 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session.rs
-@@ -1614,6 +1614,12 @@ mod fs_injection_regression_tests;
+@@ -1632,6 +1632,12 @@ mod fs_injection_regression_tests;
  #[path = "acp_session_tests/interjection_actor_tests.rs"]
  mod interjection_actor_tests;
  #[cfg(test)]
@@ -642,7 +642,7 @@ index 890d4a0..c0f4c3e 100644
                  let msg = match Self::do_hooks_trust_project(&self.session_info.cwd) {
                      Ok(root) => {
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs
-index d43071e..ced02d0 100644
+index d42f1d3..1b2f03b 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs
 @@ -549,13 +549,29 @@ pub(crate) async fn spawn_session_actor(
@@ -679,7 +679,7 @@ index d43071e..ced02d0 100644
          tokio_util::sync::CancellationToken::new(),
      );
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
-index 0c7badb..18dd06f 100644
+index 758bb9e..9268964 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
 @@ -1143,6 +1143,40 @@ impl SessionActor {
@@ -2205,7 +2205,7 @@ index b84ecab..5b95769 100644
      let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
          ImageBuffer::from_pixel(32, 32, Rgba([128, 64, 32, 255]));
 diff --git a/crates/codegen/xai-grok-shell/src/session/compaction.rs b/crates/codegen/xai-grok-shell/src/session/compaction.rs
-index 339718e..007c902 100644
+index 72fb0b3..bfba76f 100644
 --- a/crates/codegen/xai-grok-shell/src/session/compaction.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/compaction.rs
 @@ -603,6 +603,17 @@ impl SessionActor {
@@ -2856,7 +2856,7 @@ index 0000000..a080ff2
 +    }
 +}
 diff --git a/crates/codegen/xai-grok-shell/src/session/mod.rs b/crates/codegen/xai-grok-shell/src/session/mod.rs
-index 75b06b3..0b21200 100644
+index ac43c1c..0dc74ed 100644
 --- a/crates/codegen/xai-grok-shell/src/session/mod.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/mod.rs
 @@ -328,6 +328,8 @@ pub mod helpers;
@@ -2869,10 +2869,10 @@ index 75b06b3..0b21200 100644
  pub mod managed_mcp;
  pub(crate) mod mcp_descriptors;
 diff --git a/crates/codegen/xai-grok-shell/src/session/slash_commands.rs b/crates/codegen/xai-grok-shell/src/session/slash_commands.rs
-index 138e8b6..2d1e60d 100644
+index 33cbaf5..15e8a9a 100644
 --- a/crates/codegen/xai-grok-shell/src/session/slash_commands.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/slash_commands.rs
-@@ -110,6 +110,14 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
+@@ -111,6 +111,14 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
          gate: BuiltinGate::AlwaysOn,
          resolve: |_args| BuiltinAction::ContextInfo,
      },
@@ -2887,7 +2887,7 @@ index 138e8b6..2d1e60d 100644
      BuiltinCommand {
          name: "hooks-trust",
          description: "Trust this project for hook execution",
-@@ -1109,6 +1117,10 @@ pub(super) enum BuiltinAction {
+@@ -1183,6 +1191,10 @@ pub(super) enum BuiltinAction {
      FlushMemory,
      Dream,
      ContextInfo,
@@ -2898,7 +2898,7 @@ index 138e8b6..2d1e60d 100644
      HooksTrust,
      HooksList,
      HooksAdd {
-@@ -1166,6 +1178,43 @@ pub(super) enum BuiltinAction {
+@@ -1240,6 +1252,43 @@ pub(super) enum BuiltinAction {
          input: String,
      },
  }
@@ -2942,7 +2942,7 @@ index 138e8b6..2d1e60d 100644
  impl BuiltinAction {
      pub(crate) fn command_name(&self) -> &'static str {
          match self {
-@@ -1174,6 +1223,7 @@ impl BuiltinAction {
+@@ -1248,6 +1297,7 @@ impl BuiltinAction {
              BuiltinAction::FlushMemory => "flush",
              BuiltinAction::Dream => "dream",
              BuiltinAction::ContextInfo => "context",
@@ -2950,7 +2950,7 @@ index 138e8b6..2d1e60d 100644
              BuiltinAction::HooksTrust => "hooks-trust",
              BuiltinAction::HooksList => "hooks-list",
              BuiltinAction::HooksAdd { .. } => "hooks-add",
-@@ -1208,6 +1258,7 @@ impl BuiltinAction {
+@@ -1282,6 +1332,7 @@ impl BuiltinAction {
              BuiltinAction::FlushMemory => false,
              BuiltinAction::Dream => false,
              BuiltinAction::ContextInfo => false,

@@ -178,6 +178,26 @@ bands under real budgets for that kill test to be meaningful.
 
 ## Sync record
 
+### 2026-08-09 — `a5589e9..8a14c91` (3 squash commits, ~37k insertions)
+
+Wave B slice 0. Ancestry intact (no history reset). `git merge upstream/main`
+completed with **zero conflicts** — ort auto-merged every fork-touched file
+(including root `Cargo.toml`, which retained `crates/lhc/grok-lhc-host` in
+sort order after the common members). No hand resolution required; no LHC
+behavior weakened or deleted. All 10 `LHC-HOOK` markers and Chunk 3A
+surfaces (`slash_commands` / `slash_exec` / `[lhc]` config) verified present.
+
+Auto-merged upstream structural noise on shared files (no fork logic change):
+`mcp_strategy` → `Cell`, `delivery_tools` / `attach_non_interactive` fields,
+`managed_mcp_expires_at` removal, `workflow_max_concurrent_agents`, shell
+version `0.2.120` → `1.0.0`.
+
+Vendor pin **unchanged** at `c136899` (Wave B slice 0: do not bump).
+
+Tripwire: ALL GREEN (sentinel 10/10, compile, fmt ×2, unit 164, golden 5,
+certification 97, chunk3b 10; pin-policy WARN expected for side-branch pin).
+`patches/BASE` advanced to `8a14c91`; state-diff regenerated.
+
 ### 2026-08-06 — `6e38642..a5589e9` (11 squash commits, ~119k insertions)
 
 First real upstream sync on `lhc`. Ancestry intact (no history reset). Four
