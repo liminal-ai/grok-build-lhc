@@ -11,7 +11,7 @@ use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
 use agent_client_protocol as acp;
-use xai_acp_lib::{AcpAgentTx, AcpClientMessageBox, AcpClientRx, acp_send};
+use xai_acp_lib::{AcpAgentTx, AcpClientMessageBox, AcpClientRx, AcpRequest, AcpResult, acp_send};
 use xai_grok_shell::agent::auth_method::AuthMethodKind;
 use xai_grok_shell::agent::config::Config as AgentConfig;
 use xai_grok_shell::extensions::task::{CancelSubagentRequest, KillTaskRequest};
@@ -522,20 +522,195 @@ struct OpenedSession {
     models: ModelState,
     /// Directory the session is anchored to (launch cwd, resume `original_cwd`, or fork `write_cwd`).
     cwd: PathBuf,
+    /// Inbound client traffic observed while the open/load RPC was outstanding
+    /// (before [`HeadlessEmitter::begin_session`]).
+    cold_inbox: ColdAttachInbox,
+}
+
+/// State collected while a cold attach RPC (`session/load`, `session/new`, fork)
+/// is outstanding and the main ACP loop is not yet running.
+///
+/// # Invariant
+///
+/// Nested agent→client messages that require a response (notably
+/// `x.ai/task_completed` from stale-task reconcile, permissions, ext methods)
+/// **must** be answered here. Headless parks on `acp_send` for the attach RPC
+/// and does not enter the post-open `acp_rx` loop until that returns; without
+/// concurrent servicing the transport deadlocks even if the agent defers
+/// completion-receiver ownership.
+///
+/// Synthetic stale-on-load `task_completed` is intentionally quiet: it only
+/// tombstones the task id in [`ColdAttachInbox::completed_bg`] (so a later
+/// out-of-order `task_backgrounded` cannot re-arm wait-for-background).
+/// Stateful lifecycle/stream events are buffered for apply after
+/// `emitter.begin_session` rather than discarded.
+#[derive(Default)]
+struct ColdAttachInbox {
+    pending_bg: HashSet<BackgroundWork>,
+    completed_bg: HashSet<BackgroundWork>,
+    lifecycle: Vec<Lifecycle>,
+    stream: Vec<StreamEvent>,
+}
+
+/// ACP error for client methods that headless cannot fulfill during cold attach
+/// (and must still answer so the agent does not hang).
+fn cold_attach_unsupported(method: &str) -> acp::Error {
+    acp::Error::new(
+        -32601,
+        format!("headless cold attach: {method} not supported"),
+    )
+}
+
+/// Answer one inbound client message during cold attach. Always completes
+/// oneshots; never emits through the headless emitter (session context is not
+/// begun yet).
+fn handle_cold_attach_acp_message(
+    msg: AcpClientMessageBox,
+    inbox: &mut ColdAttachInbox,
+    yolo: bool,
+) {
+    match msg {
+        AcpClientMessageBox::SessionNotification(boxed) => {
+            // Headless load uses `noReplay`; any notification is still acked so
+            // replay/full-attach peers cannot stall the attach RPC.
+            let _ = boxed.response_tx.send(Ok(()));
+        }
+        AcpClientMessageBox::RequestPermission(req) => {
+            if yolo {
+                if let Some(resp) = auto_respond_to_permissions(
+                    &req.request,
+                    &[
+                        acp::PermissionOptionKind::AllowOnce,
+                        acp::PermissionOptionKind::AllowAlways,
+                    ],
+                ) {
+                    let _ = req.response_tx.send(Ok(resp));
+                } else {
+                    let _ = req.response_tx.send(Ok(acp::RequestPermissionResponse::new(
+                        acp::RequestPermissionOutcome::Cancelled,
+                    )));
+                }
+            } else {
+                let _ = req.response_tx.send(Ok(acp::RequestPermissionResponse::new(
+                    acp::RequestPermissionOutcome::Cancelled,
+                )));
+            }
+        }
+        AcpClientMessageBox::ExtNotification(notif) => {
+            let event = handle_ext_notification(&notif);
+            // Ack before any local bookkeeping: the agent (or a deferred drain)
+            // may be waiting on this oneshot to progress nested work.
+            let _ = notif.response_tx.send(Ok(()));
+            match event {
+                ExtEvent::Lifecycle(l) => inbox.lifecycle.push(l),
+                ExtEvent::Stream(event) => inbox.stream.push(*event),
+                other => track_background_lifecycle(
+                    other,
+                    &mut inbox.pending_bg,
+                    &mut inbox.completed_bg,
+                ),
+            }
+        }
+        AcpClientMessageBox::WaitForTerminalExit(args) => {
+            args.response_tx
+                .send(Err(crate::acp::wait_for_exit_not_supported(
+                    "headless cold attach",
+                )))
+                .ok();
+        }
+        AcpClientMessageBox::ExtMethod(args) => reply_headless_ext_method(args),
+        AcpClientMessageBox::ReadTextFile(args) => {
+            let _ = args
+                .response_tx
+                .send(Err(cold_attach_unsupported("fs/read_text_file")));
+        }
+        AcpClientMessageBox::WriteTextFile(args) => {
+            let _ = args
+                .response_tx
+                .send(Err(cold_attach_unsupported("fs/write_text_file")));
+        }
+        AcpClientMessageBox::CreateTerminal(args) => {
+            let _ = args
+                .response_tx
+                .send(Err(cold_attach_unsupported("terminal/create")));
+        }
+        AcpClientMessageBox::TerminalOutput(args) => {
+            let _ = args
+                .response_tx
+                .send(Err(cold_attach_unsupported("terminal/output")));
+        }
+        AcpClientMessageBox::ReleaseTerminal(args) => {
+            let _ = args
+                .response_tx
+                .send(Err(cold_attach_unsupported("terminal/release")));
+        }
+        AcpClientMessageBox::KillTerminalCommand(args) => {
+            let _ = args
+                .response_tx
+                .send(Err(cold_attach_unsupported("terminal/kill")));
+        }
+    }
+}
+
+/// Drive an ACP request while servicing inbound client messages.
+///
+/// Production helper for cold attach: headless must not park solely on the
+/// request oneshot while the agent can enqueue nested client RPCs/notifications
+/// that require an ack (the proven dogfood deadlock on `session/load` +
+/// `x.ai/task_completed`).
+async fn acp_send_servicing_cold_attach<T>(
+    request: T,
+    acp_tx: &AcpAgentTx,
+    acp_rx: &mut AcpClientRx,
+    inbox: &mut ColdAttachInbox,
+    yolo: bool,
+) -> AcpResult<T::Response>
+where
+    T: AcpRequest,
+    xai_acp_lib::AcpAgentMessage: From<xai_acp_lib::AcpArgs<T>>,
+{
+    let mut fut = Box::pin(acp_send(request, acp_tx));
+    loop {
+        tokio::select! {
+            biased;
+            msg = acp_rx.recv() => {
+                match msg {
+                    Some(msg) => {
+                        handle_cold_attach_acp_message(msg.boxed(), inbox, yolo);
+                    }
+                    None => {
+                        // Peer closed the client channel; the request future
+                        // will fail with RecvFailed once the agent side drops.
+                        return fut.await;
+                    }
+                }
+            }
+            res = &mut fut => {
+                // Catch anything enqueued in the same tick as the response.
+                while let Ok(msg) = acp_rx.try_recv() {
+                    handle_cold_attach_acp_message(msg.boxed(), inbox, yolo);
+                }
+                return res;
+            }
+        }
+    }
 }
 
 async fn open_session(
     acp_tx: &AcpAgentTx,
+    acp_rx: &mut AcpClientRx,
     cwd: &Path,
     session_id_flag: Option<&str>,
     restore_code: Option<bool>,
+    yolo: bool,
 ) -> anyhow::Result<OpenedSession> {
     // Sessions open before the agent resolves per-vendor compat; default all-on until it does.
     let mcp_servers =
         cli_config::load_mcp_servers(cwd, &xai_grok_tools::types::compat::CompatConfig::default());
+    let mut cold_inbox = ColdAttachInbox::default();
 
     if let Some(sid) = session_id_flag {
-        let try_load: Result<acp::LoadSessionResponse, _> = acp_send(
+        let try_load: Result<acp::LoadSessionResponse, _> = acp_send_servicing_cold_attach(
             acp::LoadSessionRequest::new(acp::SessionId::new(sid.to_string()), cwd.to_path_buf())
                 .mcp_servers(mcp_servers.clone())
                 .meta({
@@ -547,6 +722,9 @@ async fn open_session(
                     Some(m)
                 }),
             acp_tx,
+            acp_rx,
+            &mut cold_inbox,
+            yolo,
         )
         .await;
         if let Ok(resp) = try_load {
@@ -554,33 +732,41 @@ async fn open_session(
                 session_id: acp::SessionId::new(sid.to_string()),
                 models: ModelState::from(resp.models),
                 cwd: cwd.to_path_buf(),
+                cold_inbox,
             });
         }
         anyhow::bail!("Session does not exist");
     }
 
-    let new_resp: acp::NewSessionResponse = acp_send(
+    let new_resp: acp::NewSessionResponse = acp_send_servicing_cold_attach(
         acp::NewSessionRequest::new(cwd.to_path_buf()).mcp_servers(mcp_servers),
         acp_tx,
+        acp_rx,
+        &mut cold_inbox,
+        yolo,
     )
     .await?;
     Ok(OpenedSession {
         session_id: new_resp.session_id,
         models: ModelState::from(new_resp.models),
         cwd: cwd.to_path_buf(),
+        cold_inbox,
     })
 }
 
 async fn open_session_with_id(
     acp_tx: &AcpAgentTx,
+    acp_rx: &mut AcpClientRx,
     cwd: &Path,
     session_id: &str,
+    yolo: bool,
 ) -> anyhow::Result<OpenedSession> {
     let cwd_str = cwd.to_string_lossy();
     crate::app::session_startup::ensure_session_id_available(session_id, &cwd_str)?;
     let mcp_servers =
         cli_config::load_mcp_servers(cwd, &xai_grok_tools::types::compat::CompatConfig::default());
-    let new_resp: acp::NewSessionResponse = acp_send(
+    let mut cold_inbox = ColdAttachInbox::default();
+    let new_resp: acp::NewSessionResponse = acp_send_servicing_cold_attach(
         acp::NewSessionRequest::new(cwd.to_path_buf())
             .mcp_servers(mcp_servers)
             .meta(
@@ -589,22 +775,28 @@ async fn open_session_with_id(
                     .cloned(),
             ),
         acp_tx,
+        acp_rx,
+        &mut cold_inbox,
+        yolo,
     )
     .await?;
     Ok(OpenedSession {
         session_id: new_resp.session_id,
         models: ModelState::from(new_resp.models),
         cwd: cwd.to_path_buf(),
+        cold_inbox,
     })
 }
 
 async fn fork_then_open(
     acp_tx: &AcpAgentTx,
+    acp_rx: &mut AcpClientRx,
     launch_cwd: &Path,
     parent_id: &str,
     parent_cwd: Option<&Path>,
     new_id: Option<&str>,
     restore_code: Option<bool>,
+    yolo: bool,
 ) -> anyhow::Result<OpenedSession> {
     use crate::app::session_startup::{
         effective_fork_new_cwd, ensure_session_id_available, fork_response_error,
@@ -622,14 +814,25 @@ async fn fork_then_open(
     let fork_params = serde_json::value::to_raw_value(&payload)
         .map_err(|e| anyhow::anyhow!("serialize fork params: {e}"))?;
     let req = acp::ExtRequest::new("x.ai/session/fork", fork_params.into());
-    let resp = acp_send(req, acp_tx).await?;
+    let mut cold_inbox = ColdAttachInbox::default();
+    let resp = acp_send_servicing_cold_attach(req, acp_tx, acp_rx, &mut cold_inbox, yolo).await?;
     if let Some(err) = fork_response_error(resp.0.get()) {
         anyhow::bail!("fork failed: {err}");
     }
     let child = fork_response_new_session_id(resp.0.get())
         .ok_or_else(|| anyhow::anyhow!("fork response missing newSessionId"))?;
-    match open_session(acp_tx, &write_cwd, Some(&child), restore_code).await {
-        Ok(opened) => Ok(opened),
+    match open_session(acp_tx, acp_rx, &write_cwd, Some(&child), restore_code, yolo).await {
+        Ok(mut opened) => {
+            // Preserve fork-phase inbox state under the child load.
+            opened.cold_inbox.pending_bg.extend(cold_inbox.pending_bg);
+            opened
+                .cold_inbox
+                .completed_bg
+                .extend(cold_inbox.completed_bg);
+            opened.cold_inbox.lifecycle.extend(cold_inbox.lifecycle);
+            opened.cold_inbox.stream.extend(cold_inbox.stream);
+            Ok(opened)
+        }
         Err(e) => Err(anyhow::anyhow!(
             "fork succeeded as {child} but load failed: {e}"
         )),
@@ -955,9 +1158,11 @@ pub async fn run_single_turn(
     let t_session = Instant::now();
     xai_grok_telemetry::startup::enter(crate::acp::StartupPhase::SessionCreate);
     let opened = match materialized {
-        MaterializedStartup::NewAuto => open_session(&acp_tx, &cwd, None, None).await,
+        MaterializedStartup::NewAuto => {
+            open_session(&acp_tx, &mut acp_rx, &cwd, None, None, options.yolo).await
+        }
         MaterializedStartup::NewWithId { session_id } => {
-            open_session_with_id(&acp_tx, &cwd, &session_id).await
+            open_session_with_id(&acp_tx, &mut acp_rx, &cwd, &session_id, options.yolo).await
         }
         MaterializedStartup::Resume {
             session_id,
@@ -965,7 +1170,15 @@ pub async fn run_single_turn(
             ..
         } => {
             let load_cwd = original_cwd.as_deref().unwrap_or(cwd.as_path());
-            open_session(&acp_tx, load_cwd, Some(session_id.as_str()), restore_code).await
+            open_session(
+                &acp_tx,
+                &mut acp_rx,
+                load_cwd,
+                Some(session_id.as_str()),
+                restore_code,
+                options.yolo,
+            )
+            .await
         }
         MaterializedStartup::Fork {
             parent_session_id,
@@ -975,11 +1188,13 @@ pub async fn run_single_turn(
         } => {
             fork_then_open(
                 &acp_tx,
+                &mut acp_rx,
                 &cwd,
                 &parent_session_id,
                 parent_cwd.as_deref(),
                 new_session_id.as_deref(),
                 restore_code,
+                options.yolo,
             )
             .await
         }
@@ -988,6 +1203,7 @@ pub async fn run_single_turn(
         session_id,
         models: session_models,
         cwd: session_cwd,
+        cold_inbox,
     } = match opened {
         Ok(v) => v,
         Err(e) => {
@@ -1036,6 +1252,15 @@ pub async fn run_single_turn(
             api_key_auth: is_api_key_auth,
             context_window: session_models.get_context_window(),
         });
+        // Apply cold-attach lifecycle/stream events only after begin_session so
+        // reducers see real session context. Stale task_completed stays quiet
+        // (tombstone only in cold_inbox.completed_bg — no Lifecycle emit).
+        for event in cold_inbox.lifecycle {
+            emitter.on_lifecycle(event);
+        }
+        for event in cold_inbox.stream {
+            emitter.reduce_and_emit(event);
+        }
     }
 
     // One bounded catalog read covers what the session catalog cannot resolve.
@@ -1113,10 +1338,10 @@ pub async fn run_single_turn(
     let mut ttf_logged = false;
     let mut prompt_fut = Box::pin(acp_send(request, &acp_tx));
     let mut prompt_result = None;
-    // Tracked regardless of wait_for_background so the exit reaper always sees running work.
-    let mut pending_bg: HashSet<BackgroundWork> = HashSet::new();
-    // Tombstone of completed ids so an out-of-order backgrounded never re-arms them.
-    let mut completed_bg: HashSet<BackgroundWork> = HashSet::new();
+    // Seed from cold-attach observations (e.g. stale task_completed tombstones,
+    // any true backgrounded seen during load) so wait/reap stay consistent.
+    let mut pending_bg = cold_inbox.pending_bg;
+    let mut completed_bg = cold_inbox.completed_bg;
     let mut prompt_done_at: Option<Instant> = None;
     // On mid-turn channel close, break (not bail) so the exit path still drains and reaps.
     let mut connection_closed = false;

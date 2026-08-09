@@ -200,6 +200,222 @@ fn drain_records_task_backgrounded_delivered_at_exit() {
     );
 }
 
+/// Full-transport regression for the dogfood deadlock:
+/// headless `open_session` / `session/load` parks on `acp_send` before the
+/// main `acp_rx` loop. While load is outstanding the agent can enqueue
+/// `x.ai/task_completed` (stale reconcile) with a completion oneshot. The
+/// production helper must ack that notification **before** `LoadSessionResponse`
+/// returns, preserve quiet/tombstone semantics, and not deadlock.
+#[tokio::test(flavor = "current_thread")]
+async fn cold_load_acks_task_completed_before_load_session_response() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use xai_acp_lib::{AcpAgentMessage, AcpArgs, AcpClientMessage, acp_channels};
+
+    let (client, mut agent) = acp_channels();
+    let acp_tx = client.tx;
+    let mut acp_rx = client.rx;
+
+    let task_completed_acked = Arc::new(AtomicBool::new(false));
+    let acked_flag = task_completed_acked.clone();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            // Peer: receive session/load, inject task_completed that requires an ack,
+            // only then answer LoadSessionResponse (mirrors agent reconcile ordering).
+            let peer = tokio::task::spawn_local(async move {
+                let msg = agent
+                    .rx
+                    .recv()
+                    .await
+                    .expect("client must send session/load");
+                let AcpAgentMessage::LoadSession(args) = msg else {
+                    panic!("expected LoadSession, got {msg:?}");
+                };
+                assert_eq!(args.request.session_id.0.as_ref(), "s-cold-load");
+
+                let payload = serde_json::json!({
+                    "sessionId": "s-cold-load",
+                    "update": {
+                        "sessionUpdate": "task_completed",
+                        "task_snapshot": {
+                            "task_id": "bg-stale-1",
+                            "completed": true,
+                            "signal": "session_restart",
+                        }
+                    },
+                });
+                let raw = serde_json::value::to_raw_value(&payload).unwrap();
+                let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+                agent
+                    .tx
+                    .send(AcpClientMessage::ExtNotification(AcpArgs {
+                        request: acp::ExtNotification::new("x.ai/task_completed", raw.into()),
+                        response_tx: completion_tx,
+                    }))
+                    .expect("enqueue task_completed while load outstanding");
+
+                // Without cold-attach servicing this times out (the historical deadlock).
+                let ack = tokio::time::timeout(Duration::from_secs(2), completion_rx)
+                    .await
+                    .expect(
+                        "x.ai/task_completed was not acknowledged before LoadSessionResponse \
+                         (headless must service acp_rx during outstanding session/load)",
+                    )
+                    .expect("task_completed oneshot closed without ack");
+                assert!(
+                    ack.is_ok(),
+                    "task_completed must be acked Ok(()), got {ack:?}"
+                );
+                acked_flag.store(true, Ordering::SeqCst);
+
+                // Only after the nested client request is acked does load complete.
+                args.response_tx
+                    .send(Ok(acp::LoadSessionResponse::new()))
+                    .expect("deliver LoadSessionResponse after nested ack");
+            });
+
+            let mut inbox = super::ColdAttachInbox::default();
+            let load = super::acp_send_servicing_cold_attach(
+                acp::LoadSessionRequest::new(
+                    acp::SessionId::new("s-cold-load"),
+                    std::path::PathBuf::from("/tmp"),
+                )
+                .meta({
+                    let mut m = acp::Meta::new();
+                    m.insert("noReplay".into(), serde_json::Value::Bool(true));
+                    Some(m)
+                }),
+                &acp_tx,
+                &mut acp_rx,
+                &mut inbox,
+                /*yolo*/ false,
+            );
+
+            let resp = tokio::time::timeout(Duration::from_secs(3), load)
+                .await
+                .expect(
+                    "session/load deadlocked: cold-attach helper failed to return \
+                     after nested task_completed",
+                )
+                .expect("session/load should succeed");
+            let _ = resp;
+
+            assert!(
+                task_completed_acked.load(Ordering::SeqCst),
+                "task_completed must have been acked before load returned"
+            );
+
+            // Quiet/background semantics: synthetic stale completion is a
+            // tombstone only — no pending wait, no lifecycle buffer.
+            assert!(
+                inbox
+                    .completed_bg
+                    .contains(&super::BackgroundWork::Task("bg-stale-1".into())),
+                "stale task_completed must tombstone the task id: {:?}",
+                inbox.completed_bg
+            );
+            assert!(
+                inbox.pending_bg.is_empty(),
+                "stale completion must not leave pending background work: {:?}",
+                inbox.pending_bg
+            );
+            assert!(
+                inbox.lifecycle.is_empty(),
+                "stale task_completed is intentionally quiet (no lifecycle emit)"
+            );
+            assert!(
+                inbox.stream.is_empty(),
+                "stale task_completed must not enqueue stream events"
+            );
+
+            peer.await.expect("peer task");
+        })
+        .await;
+}
+
+/// Permission requests during cold attach must be answered (cancel) rather than
+/// left hanging on an unanswered oneshot.
+#[tokio::test(flavor = "current_thread")]
+async fn cold_attach_answers_permission_request_without_deadlock() {
+    use std::time::Duration;
+
+    use xai_acp_lib::{AcpAgentMessage, AcpArgs, AcpClientMessage, acp_channels};
+
+    let (client, mut agent) = acp_channels();
+    let acp_tx = client.tx;
+    let mut acp_rx = client.rx;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let peer = tokio::task::spawn_local(async move {
+                let msg = agent.rx.recv().await.expect("new_session request");
+                let AcpAgentMessage::NewSession(args) = msg else {
+                    panic!("expected NewSession, got {msg:?}");
+                };
+
+                let (perm_tx, perm_rx) = tokio::sync::oneshot::channel();
+                agent
+                    .tx
+                    .send(AcpClientMessage::RequestPermission(AcpArgs {
+                        request: acp::RequestPermissionRequest::new(
+                            acp::SessionId::new("s-perm"),
+                            acp::ToolCallUpdate::new(
+                                acp::ToolCallId::new(std::sync::Arc::from("tc-1")),
+                                acp::ToolCallUpdateFields::default(),
+                            ),
+                            vec![acp::PermissionOption::new(
+                                acp::PermissionOptionId::new(std::sync::Arc::from("allow-once")),
+                                "Allow once",
+                                acp::PermissionOptionKind::AllowOnce,
+                            )],
+                        ),
+                        response_tx: perm_tx,
+                    }))
+                    .unwrap();
+
+                let outcome = tokio::time::timeout(Duration::from_secs(2), perm_rx)
+                    .await
+                    .expect("permission request not answered during cold attach")
+                    .expect("permission oneshot closed");
+                let resp = outcome.expect("permission reply error");
+                assert!(
+                    matches!(resp.outcome, acp::RequestPermissionOutcome::Cancelled),
+                    "non-yolo cold attach cancels permissions: {:?}",
+                    resp.outcome
+                );
+
+                args.response_tx
+                    .send(Ok(acp::NewSessionResponse::new(acp::SessionId::new(
+                        "s-perm",
+                    ))))
+                    .unwrap();
+            });
+
+            let mut inbox = super::ColdAttachInbox::default();
+            let resp = tokio::time::timeout(
+                Duration::from_secs(3),
+                super::acp_send_servicing_cold_attach(
+                    acp::NewSessionRequest::new(std::path::PathBuf::from("/tmp")),
+                    &acp_tx,
+                    &mut acp_rx,
+                    &mut inbox,
+                    /*yolo*/ false,
+                ),
+            )
+            .await
+            .expect("new_session deadlocked on unanswered permission")
+            .expect("new_session ok");
+            assert_eq!(resp.session_id.0.as_ref(), "s-perm");
+            peer.await.expect("peer");
+        })
+        .await;
+}
+
 /// `begin_session` before the model/effort apply lets a post-open error carry the real context.
 #[test]
 fn post_open_error_carries_real_session_context() {
