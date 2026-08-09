@@ -6,8 +6,42 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::{fs, iter};
 
+/// Collect dependency paths from protoc `--dependency_out` make-style text.
+///
+/// Format is roughly `target: dep1 dep2 \` / newline continuations. Windows
+/// targets look like `C:\temp\out.pbbin: proto\file.proto`.
+fn make_dep_paths(dep_text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut after_target = false;
+    for raw in dep_text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let line = line.strip_suffix('\\').unwrap_or(line).trim();
+        let deps_part = if !after_target {
+            match split_make_dep_rest(line) {
+                Some(rest) => {
+                    after_target = true;
+                    rest
+                }
+                None => continue,
+            }
+        } else {
+            line
+        };
+        for path in deps_part.split_whitespace() {
+            if path.is_empty() || path == "\\" {
+                continue;
+            }
+            out.push(path);
+        }
+    }
+    out
+}
+
 /// Rest of a make-style dep line after the target (`target: deps...`).
-/// Handles Windows drive letters (`C:\foo: D:\bar`).
+/// Handles Windows drive letters (`C:\foo: dep`).
 fn split_make_dep_rest(line: &str) -> Option<&str> {
     // Prefer ": " (colon-space) — never a drive letter form.
     if let Some(i) = line.find(": ") {
@@ -27,13 +61,6 @@ fn split_make_dep_rest(line: &str) -> Option<&str> {
         i += 1;
     }
     None
-}
-
-/// Split a make-deps path list on spaces, keeping `C:\Program Files\...` as one
-/// path when possible by only splitting on spaces not inside... (protoc uses
-/// unquoted space-separated paths; spaces in paths are rare for our tree).
-fn split_make_dep_paths(line: &str) -> impl Iterator<Item = &str> {
-    line.split_whitespace().filter(|p| !p.is_empty() && *p != "\\")
 }
 
 /// Find the protoc well-known types include directory.
@@ -211,35 +238,35 @@ impl XaiProtoBuilder {
             let dep_text = fs::read_to_string(&_dep_tmp.1)
                 .with_context(|| format!("read protoc deps {}", _dep_tmp.1.display()))?;
 
-            let mut lines = dep_text.lines();
-            let first_line = lines.next().context("protoc dependency output is empty")?;
-            // Make-style: `target: dep1 dep2` — on Windows targets are
-            // `C:\path\out.pbbin`, so a naive split on `:` breaks on the drive letter.
-            let rem = split_make_dep_rest(first_line).with_context(|| {
-                format!("protoc dependency line missing target separator: {dep_text:?}")
-            })?;
-            for line in iter::once(rem).chain(lines) {
-                let line = line.trim();
-                let line = line.strip_suffix('\\').unwrap_or(line).trim();
-                if line.is_empty() {
+            // Best-effort cargo:rerun-if-changed from make-style dep output.
+            // On Windows this is advisory: bad path tokens must not fail the
+            // build (protoc already succeeded). Unix keeps the stricter check.
+            for path in make_dep_paths(&dep_text) {
+                if path.contains("/include/google/protobuf/")
+                    || path.contains("\\include\\google\\protobuf\\")
+                {
                     continue;
                 }
-                // One line may list several space-separated paths.
-                for path in split_make_dep_paths(line) {
-                    // Depending on absolute paths like
-                    // /Users/user/homebrew/Cellar/protobuf/29.1/include/google/protobuf/timestamp.proto
-                    // is valid, but we want to have output more deterministic.
-                    if path.contains("/include/google/protobuf/")
-                        || path.contains("\\include\\google\\protobuf\\")
-                    {
-                        continue;
-                    }
-
+                #[cfg(unix)]
+                {
                     if !fs::exists(path)? {
                         return Err(anyhow::anyhow!("dependency file not found: {path}"));
                     }
-
                     println!("cargo:rerun-if-changed={path}");
+                }
+                #[cfg(windows)]
+                {
+                    if fs::exists(path).unwrap_or(false) {
+                        println!("cargo:rerun-if-changed={path}");
+                    }
+                }
+            }
+            #[cfg(unix)]
+            {
+                // Ensure we got *some* dep text on Unix (empty usually means
+                // protoc didn't write deps).
+                if dep_text.trim().is_empty() {
+                    return Err(anyhow::anyhow!("protoc dependency output is empty"));
                 }
             }
         }
