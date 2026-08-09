@@ -55,11 +55,37 @@ pub fn tee_chat_persistence(
 ///
 /// Post-spawn gating uses registry presence, not a re-read of `GROK_LHC`.
 /// Cheap process-wide atomic first — no registry mutex when LHC is off entirely.
+///
+/// **Not** archive-open readiness: registration happens before `LhcSession::open`
+/// completes so turn capture can buffer. For retrieval tools / `/lhc on` success,
+/// use [`capture_archive_ready`] or [`wait_capture_archive_ready`].
 pub fn capture_active(session_id: &str) -> bool {
     if !crate::capture::any_capture_active() {
         return false;
     }
     crate::capture::is_session_registered(session_id)
+}
+
+/// True when a capture worker is registered **and** archive open succeeded.
+pub fn capture_archive_ready(session_id: &str) -> bool {
+    if !crate::capture::any_capture_active() {
+        return false;
+    }
+    crate::capture::lookup_session(session_id).is_some_and(|h| h.is_archive_ready())
+}
+
+/// Bounded wait for archive open success on `session_id`.
+///
+/// Returns the ready handle, or an error if the session is missing, open
+/// refused, or the wait bound elapses while still pending.
+pub async fn wait_capture_archive_ready(
+    session_id: &str,
+    timeout: std::time::Duration,
+) -> Result<crate::capture::CaptureHandle, crate::capture::CaptureOpenWaitError> {
+    let handle = crate::capture::lookup_session(session_id)
+        .ok_or(crate::capture::CaptureOpenWaitError::Failed)?;
+    handle.wait_until_open(timeout).await?;
+    Ok(handle)
 }
 
 struct LhcTeePersistence {

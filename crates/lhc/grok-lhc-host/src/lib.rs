@@ -26,13 +26,15 @@ mod tools;
 mod writeback_gates;
 
 pub use capture::{
-    CAPTURE_QUEUE_CAP, CaptureHandle, RegistrySnapshot, any_capture_active, is_session_registered,
-    lookup_session, lookup_session_snapshot, registry_generation, spawn_capture,
+    CAPTURE_OPEN_WAIT, CAPTURE_QUEUE_CAP, CaptureHandle, CaptureOpenState, CaptureOpenWaitError,
+    RegistrySnapshot, any_capture_active, is_session_registered, lookup_session,
+    lookup_session_snapshot, registry_generation, spawn_capture,
 };
 
 #[cfg(any(test, feature = "test-util"))]
 pub use capture::{
-    registry_lookup_count, reset_registry_lookup_count, set_refresh_interleave_hook_for_test,
+    clear_open_hold_for_test, registry_lookup_count, reset_registry_lookup_count,
+    set_open_hold_for_test, set_refresh_interleave_hook_for_test,
 };
 pub use compact::{
     CompactBridgePlan, CompactChokeAction, CompactEventBridge, CompactMode, compact_mode,
@@ -81,7 +83,9 @@ pub use status::{
     execute_repair, format_health_report, format_repair_plan, format_status_report, health_check,
     plan_repair, status_report,
 };
-pub use tee::{capture_active, tee_chat_persistence};
+pub use tee::{
+    capture_active, capture_archive_ready, tee_chat_persistence, wait_capture_archive_ready,
+};
 pub use tools::{
     GET_MESSAGES_DESCRIPTION, GET_MESSAGES_TOOL_NAME, GET_TURNS_DESCRIPTION, GET_TURNS_TOOL_NAME,
     HISTORY_LABEL_GUIDANCE, IdKind, ParsedRetrievalArgs, RetrievalLifecycleError, dedupe_ids,

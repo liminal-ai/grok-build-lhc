@@ -154,6 +154,7 @@ impl Tool for GetMessagesTool {
 /// Register both retrieval tools for an LHC-active session.
 ///
 /// Idempotent: removes prior registration first (rebuild / re-on safe).
+/// All-or-none: if either registration fails, both tools are unregistered.
 pub(crate) async fn register_lhc_retrieval_tools(
     bridge: &ToolBridge,
     session_id: &str,
@@ -166,7 +167,7 @@ pub(crate) async fn register_lhc_retrieval_tools(
     let turns_schema = retrieval_args_schema("Turn ids, e.g. t211");
     let messages_schema = retrieval_args_schema("Message ids, e.g. m3177");
 
-    bridge
+    if let Err(e) = bridge
         .register_mcp_tools(
             GET_TURNS_TOOL_NAME.to_owned(),
             GetTurnsTool {
@@ -175,15 +176,22 @@ pub(crate) async fn register_lhc_retrieval_tools(
             Some(turns_schema),
         )
         .await
-        .map_err(|e| format!("failed to register get_turns: {e}"))?;
-    bridge
+    {
+        unregister_lhc_retrieval_tools(bridge);
+        return Err(format!("failed to register get_turns: {e}"));
+    }
+    if let Err(e) = bridge
         .register_mcp_tools(
             GET_MESSAGES_TOOL_NAME.to_owned(),
             GetMessagesTool { session },
             Some(messages_schema),
         )
         .await
-        .map_err(|e| format!("failed to register get_messages: {e}"))?;
+    {
+        // Roll back turns so the pair is never half-advertised.
+        unregister_lhc_retrieval_tools(bridge);
+        return Err(format!("failed to register get_messages: {e}"));
+    }
     Ok(())
 }
 
@@ -205,14 +213,18 @@ pub(crate) async fn lhc_retrieval_tools_registered(bridge: &ToolBridge) -> bool 
 mod tests {
     use super::*;
     use grok_lhc_host::{
-        GET_MESSAGES_TOOL_NAME, GET_TURNS_TOOL_NAME, capture_active, env_lock, spawn_capture,
+        CAPTURE_OPEN_WAIT, CaptureOpenWaitError, GET_MESSAGES_TOOL_NAME, GET_TURNS_TOOL_NAME,
+        capture_active, capture_archive_ready, clear_open_hold_for_test, env_lock,
+        set_open_hold_for_test, spawn_capture, wait_capture_archive_ready,
     };
+    use tokio::sync::oneshot;
     use xai_grok_sampling_types::ConversationItem;
     use xai_grok_tools::bridge::ToolBridge;
 
     #[tokio::test]
     async fn toolbridge_register_dispatch_and_lifecycle() {
         let _g = env_lock();
+        clear_open_hold_for_test();
         let root = tempfile::tempdir().unwrap();
         let prev = std::env::var_os("GROK_LHC");
         let prev_root = std::env::var_os("GROK_LHC_ROOT");
@@ -222,6 +234,9 @@ mod tests {
         }
         let sid = "shell-tb-retrieval";
         let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+        wait_capture_archive_ready(sid, CAPTURE_OPEN_WAIT)
+            .await
+            .expect("archive ready");
         handle.persist(&ConversationItem::user("what does the config do?"));
         handle.persist(&ConversationItem::assistant("it configures the server"));
         handle.flush().await.expect("flush");
@@ -334,6 +349,67 @@ mod tests {
         );
         unregister_lhc_retrieval_tools(&bridge);
 
+        match prev {
+            Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+            None => unsafe { std::env::remove_var("GROK_LHC") },
+        }
+        match prev_root {
+            Some(v) => unsafe { std::env::set_var("GROK_LHC_ROOT", v) },
+            None => unsafe { std::env::remove_var("GROK_LHC_ROOT") },
+        }
+    }
+
+    /// Provisional capture (open held): never advertise tools; wait fails
+    /// explicitly; after release, tools may register. Simulates spawn/rebuild
+    /// readiness gate without a full SessionActor.
+    #[tokio::test]
+    async fn provisional_capture_does_not_advertise_tools_until_ready() {
+        let _g = env_lock();
+        clear_open_hold_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("GROK_LHC");
+        let prev_root = std::env::var_os("GROK_LHC_ROOT");
+        unsafe {
+            std::env::set_var("GROK_LHC", "1");
+            std::env::set_var("GROK_LHC_ROOT", root.path());
+        }
+        let sid = "shell-tb-provisional";
+        let (release_tx, release_rx) = oneshot::channel();
+        set_open_hold_for_test(release_rx);
+        let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+        assert!(capture_active(sid));
+        assert!(!capture_archive_ready(sid));
+
+        // Production publication gate: wait for ready before register.
+        let wait = wait_capture_archive_ready(sid, std::time::Duration::from_millis(100)).await;
+        assert_eq!(wait.err(), Some(CaptureOpenWaitError::TimedOut));
+        let bridge = ToolBridge::for_test();
+        // Do not register on provisional — mirrors spawn/rebuild skip path.
+        assert!(!lhc_retrieval_tools_registered(&bridge).await);
+
+        let _ = release_tx.send(());
+        wait_capture_archive_ready(sid, CAPTURE_OPEN_WAIT)
+            .await
+            .expect("ready after release");
+        register_lhc_retrieval_tools(&bridge, sid)
+            .await
+            .expect("register after ready");
+        assert!(lhc_retrieval_tools_registered(&bridge).await);
+
+        // /lhc off always clears definitions even if we only unregister tools
+        // (capture still active) — and again after shutdown (stale path).
+        unregister_lhc_retrieval_tools(&bridge);
+        assert!(!lhc_retrieval_tools_registered(&bridge).await);
+
+        let handle_for_shutdown = handle.clone();
+        tokio::task::spawn_blocking(move || handle_for_shutdown.shutdown_blocking())
+            .await
+            .expect("join shutdown");
+        // Stale cleanup path: unregister with capture already gone.
+        unregister_lhc_retrieval_tools(&bridge);
+        assert!(!lhc_retrieval_tools_registered(&bridge).await);
+
+        clear_open_hold_for_test();
         match prev {
             Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
             None => unsafe { std::env::remove_var("GROK_LHC") },

@@ -6,20 +6,21 @@ use std::thread;
 use std::time::Duration;
 
 use grok_lhc_host::{
-    CaptureHandle, CompactEventBridge, CompactMode, ContextEngine, CountingLhcInferenceSampler,
-    LhcFileConfig, LhcInferenceRequest, MockLhcInferenceSampler, ServeDecision, SourceKindIndex,
-    apply_resolved_config, apply_serve_decision, body_has_tool_cycle, build_writeback_conversation,
-    capture_active, capture_model_or_thinking_change, clear_last_serve_outcome,
-    compare_serve_equivalence, decide_substitution, encode_session_id_for_path,
-    equivalence_snapshot, execute_repair, format_status_report, health_check,
-    inference_sampler_registered, informational_hit_count, is_enabled, last_serve_outcome,
-    lookup_session, native_prompt_indices, observe_serve_equivalence, paths_disagree, plan_repair,
-    preview_call_count, project_conversation_canonical, replace_call_count,
-    reset_compact_call_counters, reset_equivalence_counters, resolve_compact_mode,
-    resolve_lhc_config, serve_compared_turns, serve_fallback_turns, serve_request_context,
-    set_compact_mode_for_test, set_force_classify_list_failure, shadow_preview_compact,
-    shutdown_session, spawn_capture, status_report, structural_hit_count, tee_chat_persistence,
-    thread_file_path,
+    CaptureHandle, CaptureOpenState, CaptureOpenWaitError, CompactEventBridge, CompactMode,
+    ContextEngine, CountingLhcInferenceSampler, LhcFileConfig, LhcInferenceRequest,
+    MockLhcInferenceSampler, ServeDecision, SourceKindIndex, apply_resolved_config,
+    apply_serve_decision, body_has_tool_cycle, build_writeback_conversation, capture_active,
+    capture_archive_ready, capture_model_or_thinking_change, clear_last_serve_outcome,
+    clear_open_hold_for_test, compare_serve_equivalence, decide_substitution,
+    encode_session_id_for_path, equivalence_snapshot, execute_repair, format_status_report,
+    health_check, inference_sampler_registered, informational_hit_count, is_enabled,
+    last_serve_outcome, lookup_session, native_prompt_indices, observe_serve_equivalence,
+    paths_disagree, plan_repair, preview_call_count, project_conversation_canonical,
+    replace_call_count, reset_compact_call_counters, reset_equivalence_counters,
+    resolve_compact_mode, resolve_lhc_config, serve_compared_turns, serve_fallback_turns,
+    serve_request_context, set_compact_mode_for_test, set_force_classify_list_failure,
+    set_open_hold_for_test, shadow_preview_compact, shutdown_session, spawn_capture, status_report,
+    structural_hit_count, tee_chat_persistence, thread_file_path, wait_capture_archive_ready,
 };
 use lhc::intake_stream::{BatchEventOutcome, BatchSkipReason, EventRecord};
 use lhc::shared_tech::view::{
@@ -5579,6 +5580,161 @@ fn wave_b_retrieval_serialized_with_capture() {
         "persist while blocked must still land after release"
     );
 
+    handle.shutdown_blocking();
+    wait_registry_gone(sid);
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC") },
+    }
+    match prev_root {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC_ROOT", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC_ROOT") },
+    }
+}
+
+/// Delayed open: registry presence is provisional; tools/retrieval must not
+/// treat Pending as ready; wait_until_open succeeds only after release.
+#[test]
+fn wave_b_delayed_open_not_ready_until_archive_opens() {
+    let _g = env_lock();
+    clear_open_hold_for_test();
+    let root = TempDir::new().unwrap();
+    let prev = std::env::var_os("GROK_LHC");
+    let prev_root = std::env::var_os("GROK_LHC_ROOT");
+    unsafe {
+        std::env::set_var("GROK_LHC", "1");
+        std::env::set_var("GROK_LHC_ROOT", root.path());
+    }
+    let sid = "wave-b-delayed-open";
+    let (release_tx, release_rx) = oneshot::channel();
+    set_open_hold_for_test(release_rx);
+
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+    assert!(
+        capture_active(sid),
+        "pre-open registry design: capture_active while open held"
+    );
+    assert!(
+        !capture_archive_ready(sid),
+        "archive must not be ready while open is held"
+    );
+    assert_eq!(handle.open_state(), CaptureOpenState::Pending);
+
+    // Retrieval must fail explicitly (not hang on the worker queue).
+    let err = rt_block_on(async {
+        grok_lhc_host::run_get_turns(sid, &serde_json::json!({ "ids": ["t1"] })).await
+    });
+    assert!(
+        err.as_ref().is_err_and(|e| e.contains("not ready")),
+        "pending open must fail retrieval explicitly: {err:?}"
+    );
+
+    // Bounded wait while still pending → TimedOut (do not hang forever).
+    let timed = rt_block_on(async { handle.wait_until_open(Duration::from_millis(80)).await });
+    assert_eq!(timed, Err(CaptureOpenWaitError::TimedOut));
+
+    // Release open; readiness becomes true.
+    let _ = release_tx.send(());
+    rt_block_on(async {
+        wait_capture_archive_ready(sid, Duration::from_secs(5))
+            .await
+            .expect("open after release");
+    });
+    assert!(capture_archive_ready(sid));
+    assert_eq!(handle.open_state(), CaptureOpenState::Ready);
+
+    handle.shutdown_blocking();
+    wait_registry_gone(sid);
+    clear_open_hold_for_test();
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC") },
+    }
+    match prev_root {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC_ROOT", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC_ROOT") },
+    }
+}
+
+/// Refused open: wait_until_open reports Failed; capture leaves registry;
+/// retrieval stays inactive (no hang).
+#[test]
+fn wave_b_refused_open_reports_failed_and_clears_registry() {
+    let _g = env_lock();
+    clear_open_hold_for_test();
+    let root = TempDir::new().unwrap();
+    let prev = std::env::var_os("GROK_LHC");
+    let prev_root = std::env::var_os("GROK_LHC_ROOT");
+    unsafe {
+        std::env::set_var("GROK_LHC", "1");
+        std::env::set_var("GROK_LHC_ROOT", root.path());
+    }
+    let sid = "wave-b-refused-open";
+    // Legitimate session then orphan the thread (registry wiped) → open refuses.
+    {
+        let h = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+        h.persist(&ConversationItem::user("x"));
+        h.flush_blocking();
+        let _ = wait_exact(&h, 1);
+        h.shutdown_blocking();
+        wait_registry_gone(sid);
+    }
+    let registry = root.path().join("registry.sqlite");
+    std::fs::remove_file(&registry).unwrap();
+    let _ = std::fs::remove_file(root.path().join("registry.sqlite-wal"));
+    let _ = std::fs::remove_file(root.path().join("registry.sqlite-shm"));
+    assert!(thread_file_path(root.path(), sid).exists());
+
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+    let open_err = rt_block_on(async { handle.wait_until_open(Duration::from_secs(5)).await });
+    assert_eq!(
+        open_err,
+        Err(CaptureOpenWaitError::Failed),
+        "refused open must surface Failed, not hang"
+    );
+    wait_registry_gone(sid);
+    assert!(!capture_active(sid));
+    assert!(!capture_archive_ready(sid));
+
+    let pull = rt_block_on(async {
+        grok_lhc_host::run_get_turns(sid, &serde_json::json!({ "ids": ["t1"] })).await
+    });
+    assert!(
+        pull.is_err(),
+        "refused session must not serve retrieval: {pull:?}"
+    );
+
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC") },
+    }
+    match prev_root {
+        Some(v) => unsafe { std::env::set_var("GROK_LHC_ROOT", v) },
+        None => unsafe { std::env::remove_var("GROK_LHC_ROOT") },
+    }
+}
+
+/// Successful open path still advertises ready for tool publication consumers.
+#[test]
+fn wave_b_spawn_becomes_archive_ready() {
+    let _g = env_lock();
+    clear_open_hold_for_test();
+    let root = TempDir::new().unwrap();
+    let prev = std::env::var_os("GROK_LHC");
+    let prev_root = std::env::var_os("GROK_LHC_ROOT");
+    unsafe {
+        std::env::set_var("GROK_LHC", "1");
+        std::env::set_var("GROK_LHC_ROOT", root.path());
+    }
+    let sid = "wave-b-ready-ok";
+    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
+    rt_block_on(async {
+        handle
+            .wait_until_open(Duration::from_secs(5))
+            .await
+            .expect("normal open");
+    });
+    assert!(capture_archive_ready(sid));
     handle.shutdown_blocking();
     wait_registry_gone(sid);
     match prev {

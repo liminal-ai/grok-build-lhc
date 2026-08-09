@@ -874,7 +874,7 @@ index 310709b..4f2bdb4 100644
 +    }
 +}
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session.rs b/crates/codegen/xai-grok-shell/src/session/acp_session.rs
-index 9489c62..a0f8fcc 100644
+index 9489c62..1b96123 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session.rs
 @@ -1632,6 +1632,12 @@ mod fs_injection_regression_tests;
@@ -890,29 +890,57 @@ index 9489c62..a0f8fcc 100644
  #[path = "acp_session_tests/observability_bridge_mapping_tests.rs"]
  mod observability_bridge_mapping_tests;
  #[cfg(test)]
+@@ -1904,6 +1910,9 @@ mod laziness_detector_tests;
+ #[path = "acp_session_tests/laziness/laziness_integration_tests.rs"]
+ mod laziness_integration_tests;
+ #[cfg(test)]
++#[path = "acp_session_tests/lhc_retrieval_final_output_tests.rs"]
++mod lhc_retrieval_final_output_tests;
++#[cfg(test)]
+ #[path = "acp_session_tests/load_user_prompts_tests.rs"]
+ mod load_user_prompts_tests;
+ #[cfg(test)]
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/model_switch.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/model_switch.rs
-index e6e5d2a..16e1357 100644
+index e6e5d2a..dcba507 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/model_switch.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/model_switch.rs
-@@ -259,6 +259,24 @@ impl SessionActor {
+@@ -259,6 +259,42 @@ impl SessionActor {
              }
          }
          self.re_register_mcp_tools_on_rebuilt_bridge().await;
 +        // Wave B: rebuilt ToolBridge drops dynamic tools — re-attach retrieval
-+        // tools only when this session still has an active LHC capture worker.
++        // tools only when archive open has succeeded (not provisional registry).
 +        {
 +            let sid = self.session_info.id.0.as_ref();
 +            if grok_lhc_host::capture_active(sid) {
-+                let bridge = self.agent.borrow().tool_bridge().clone();
-+                if let Err(e) =
-+                    crate::session::lhc_retrieval_tools::register_lhc_retrieval_tools(&bridge, sid)
-+                        .await
++                match grok_lhc_host::wait_capture_archive_ready(
++                    sid,
++                    grok_lhc_host::CAPTURE_OPEN_WAIT,
++                )
++                .await
 +                {
-+                    tracing::warn!(
-+                        session_id = %sid,
-+                        error = %e,
-+                        "LHC retrieval tools: re-registration failed after agent rebuild"
-+                    );
++                    Ok(_) => {
++                        let bridge = self.agent.borrow().tool_bridge().clone();
++                        if let Err(e) =
++                            crate::session::lhc_retrieval_tools::register_lhc_retrieval_tools(
++                                &bridge, sid,
++                            )
++                            .await
++                        {
++                            tracing::warn!(
++                                session_id = %sid,
++                                error = %e,
++                                "LHC retrieval tools: re-registration failed after agent rebuild"
++                            );
++                        }
++                    }
++                    Err(e) => {
++                        tracing::warn!(
++                            session_id = %sid,
++                            error = %e.message(),
++                            "LHC retrieval tools: skipped after rebuild — archive not ready"
++                        );
++                    }
 +                }
 +            }
 +        }
@@ -1014,10 +1042,10 @@ index 217033f..92b746e 100644
              self.tool_context
                  .record_task_model_output(u64::from(u.completion_tokens));
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/slash_exec.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/slash_exec.rs
-index 890d4a0..5b37b26 100644
+index 890d4a0..097ac8b 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/slash_exec.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/slash_exec.rs
-@@ -82,6 +82,125 @@ impl SessionActor {
+@@ -82,6 +82,212 @@ impl SessionActor {
                  ok_end_turn(0, None)
              }
              BuiltinAction::ContextInfo => ok_end_turn(0, None),
@@ -1048,15 +1076,16 @@ index 890d4a0..5b37b26 100644
 +                        }
 +                    }
 +                    LhcSlashOp::Off => {
++                        // Always drop retrieval definitions — even when capture
++                        // is inactive — so a refused/provisional open cannot leave
++                        // stale get_turns/get_messages advertised after worker death.
++                        {
++                            let bridge = self.agent.borrow().tool_bridge().clone();
++                            crate::session::lhc_retrieval_tools::unregister_lhc_retrieval_tools(
++                                &bridge,
++                            );
++                        }
 +                        if grok_lhc_host::capture_active(sid) {
-+                            // Drop model-visible tools before capture teardown so
-+                            // a concurrent tool list cannot advertise a dead session.
-+                            {
-+                                let bridge = self.agent.borrow().tool_bridge().clone();
-+                                crate::session::lhc_retrieval_tools::unregister_lhc_retrieval_tools(
-+                                    &bridge,
-+                                );
-+                            }
 +                            grok_lhc_host::shutdown_session(sid);
 +                            // Unregisters immediately; worker settles in-flight
 +                            // background work under a short drainSettled cap.
@@ -1069,12 +1098,70 @@ index 890d4a0..5b37b26 100644
 +                             Use `/lhc on` to re-attach."
 +                                .to_owned()
 +                        } else {
-+                            "**LHC:** capture was not active for this session.".to_owned()
++                            "**LHC:** capture was not active for this session \
++                             (retrieval tools cleared if present)."
++                                .to_owned()
 +                        }
 +                    }
 +                    LhcSlashOp::On => {
-+                        if grok_lhc_host::capture_active(sid) {
++                        if grok_lhc_host::capture_archive_ready(sid) {
++                            // Idempotent tool re-attach if rebuild dropped them.
++                            let bridge = self.agent.borrow().tool_bridge().clone();
++                            if let Err(e) =
++                                crate::session::lhc_retrieval_tools::register_lhc_retrieval_tools(
++                                    &bridge, sid,
++                                )
++                                .await
++                            {
++                                tracing::warn!(
++                                    session_id = %sid,
++                                    error = %e,
++                                    "LHC retrieval tools: re-registration failed on /lhc on (already ready)"
++                                );
++                            }
 +                            "**LHC:** capture already active for this session.".to_owned()
++                        } else if grok_lhc_host::capture_active(sid) {
++                            // Registered but archive still opening — wait (bounded)
++                            // rather than claiming success on registry presence alone.
++                            match grok_lhc_host::wait_capture_archive_ready(
++                                sid,
++                                grok_lhc_host::CAPTURE_OPEN_WAIT,
++                            )
++                            .await
++                            {
++                                Ok(_) => {
++                                    let bridge = self.agent.borrow().tool_bridge().clone();
++                                    if let Err(e) = crate::session::lhc_retrieval_tools::register_lhc_retrieval_tools(
++                                        &bridge,
++                                        sid,
++                                    )
++                                    .await
++                                    {
++                                        tracing::warn!(
++                                            session_id = %sid,
++                                            error = %e,
++                                            "LHC retrieval tools: registration failed after open wait"
++                                        );
++                                        format!(
++                                            "**LHC:** archive opened but retrieval tools failed to register: {e}"
++                                        )
++                                    } else {
++                                        "**LHC:** capture started for this session \
++                                         (archive open completed)."
++                                            .to_owned()
++                                    }
++                                }
++                                Err(e) => {
++                                    // Avoid leaving a provisional worker that makes
++                                    // the next /lhc on report "already active".
++                                    grok_lhc_host::shutdown_session(sid);
++                                    let bridge = self.agent.borrow().tool_bridge().clone();
++                                    crate::session::lhc_retrieval_tools::unregister_lhc_retrieval_tools(
++                                        &bridge,
++                                    );
++                                    format!("**LHC:** failed to start capture — {}.", e.message())
++                                }
++                            }
 +                        } else if !grok_lhc_host::is_enabled() {
 +                            "**LHC:** process gate is off.\n\n\
 +                             Set `GROK_LHC=1` or `[lhc] enabled = true` (then restart / \
@@ -1102,35 +1189,63 @@ index 890d4a0..5b37b26 100644
 +                                Some(sampler),
 +                            ) {
 +                                Some(_) => {
-+                                    let bridge = self.agent.borrow().tool_bridge().clone();
-+                                    if let Err(e) = crate::session::lhc_retrieval_tools::register_lhc_retrieval_tools(
-+                                        &bridge,
++                                    match grok_lhc_host::wait_capture_archive_ready(
 +                                        sid,
++                                        grok_lhc_host::CAPTURE_OPEN_WAIT,
 +                                    )
 +                                    .await
 +                                    {
-+                                        tracing::warn!(
-+                                            session_id = %sid,
-+                                            error = %e,
-+                                            "LHC retrieval tools: registration failed on /lhc on"
-+                                        );
++                                        Ok(_) => {
++                                            let bridge = self.agent.borrow().tool_bridge().clone();
++                                            if let Err(e) = crate::session::lhc_retrieval_tools::register_lhc_retrieval_tools(
++                                                &bridge,
++                                                sid,
++                                            )
++                                            .await
++                                            {
++                                                tracing::warn!(
++                                                    session_id = %sid,
++                                                    error = %e,
++                                                    "LHC retrieval tools: registration failed on /lhc on"
++                                                );
++                                                // Roll back capture so success is truthful.
++                                                grok_lhc_host::shutdown_session(sid);
++                                                format!(
++                                                    "**LHC:** archive opened but retrieval tools \
++                                                     failed to register: {e}"
++                                                )
++                                            } else {
++                                                let compact_line =
++                                                    if grok_lhc_host::inference_sampler_registered(sid)
++                                                    {
++                                                        "**ModelCall compact:** available (sampler registered)."
++                                                    } else {
++                                                        "**ModelCall compact:** unavailable — sampler did not \
++                                                     register; start a new session to restore compaction."
++                                                    };
++                                                format!(
++                                                    "**LHC:** capture started for this session.\n\n\
++                                                     Existing native history was submitted as bootstrap \
++                                                     (dedup prevents double-record on re-enable).\n\n\
++                                                     **Active context engine:** (no serve turn yet) — the \
++                                                     next model turn records whether LHC substituted or \
++                                                     fail-opened to native.\n\n\
++                                                     {compact_line}"
++                                                )
++                                            }
++                                        }
++                                        Err(e) => {
++                                            grok_lhc_host::shutdown_session(sid);
++                                            let bridge = self.agent.borrow().tool_bridge().clone();
++                                            crate::session::lhc_retrieval_tools::unregister_lhc_retrieval_tools(
++                                                &bridge,
++                                            );
++                                            format!(
++                                                "**LHC:** failed to start capture — {}.",
++                                                e.message()
++                                            )
++                                        }
 +                                    }
-+                                    let compact_line =
-+                                        if grok_lhc_host::inference_sampler_registered(sid) {
-+                                            "**ModelCall compact:** available (sampler registered)."
-+                                        } else {
-+                                            "**ModelCall compact:** unavailable — sampler did not \
-+                                         register; start a new session to restore compaction."
-+                                        };
-+                                    format!(
-+                                        "**LHC:** capture started for this session.\n\n\
-+                                         Existing native history was submitted as bootstrap \
-+                                         (dedup prevents double-record on re-enable).\n\n\
-+                                         **Active context engine:** (no serve turn yet) — the \
-+                                         next model turn records whether LHC substituted or \
-+                                         fail-opened to native.\n\n\
-+                                         {compact_line}"
-+                                    )
 +                                }
 +                                None => "**LHC:** failed to start capture (see logs).".to_owned(),
 +                            }
@@ -1144,7 +1259,7 @@ index 890d4a0..5b37b26 100644
                  let msg = match Self::do_hooks_trust_project(&self.session_info.cwd) {
                      Ok(root) => {
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs
-index d42f1d3..af6c3c2 100644
+index d42f1d3..887f5ac 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs
 @@ -549,13 +549,29 @@ pub(crate) async fn spawn_session_actor(
@@ -1180,29 +1295,112 @@ index d42f1d3..af6c3c2 100644
          chat_state_event_tx,
          tokio_util::sync::CancellationToken::new(),
      );
-@@ -1022,6 +1038,22 @@ pub(crate) async fn spawn_session_actor(
+@@ -1022,6 +1038,39 @@ pub(crate) async fn spawn_session_actor(
          .tool_bridge()
          .update_resource(task_wake_suppressed)
          .await;
-+    // Wave B: register get_turns/get_messages only when this session's LHC
-+    // capture is already active (spawn-time tee opened a worker).
-+    if grok_lhc_host::capture_active(session_info.id.0.as_ref()) {
-+        if let Err(e) = crate::session::lhc_retrieval_tools::register_lhc_retrieval_tools(
-+            agent.tool_bridge(),
-+            session_info.id.0.as_ref(),
-+        )
-+        .await
-+        {
-+            tracing::warn!(
-+                session_id = %session_info.id.0,
-+                error = %e,
-+                "LHC retrieval tools: registration failed at spawn"
-+            );
++    // Wave B: register get_turns/get_messages only after archive open succeeds
++    // (not mere registry presence — open may still be pending or refused).
++    {
++        let sid = session_info.id.0.as_ref();
++        if grok_lhc_host::capture_active(sid) {
++            match grok_lhc_host::wait_capture_archive_ready(sid, grok_lhc_host::CAPTURE_OPEN_WAIT)
++                .await
++            {
++                Ok(_) => {
++                    if let Err(e) =
++                        crate::session::lhc_retrieval_tools::register_lhc_retrieval_tools(
++                            agent.tool_bridge(),
++                            sid,
++                        )
++                        .await
++                    {
++                        tracing::warn!(
++                            session_id = %session_info.id.0,
++                            error = %e,
++                            "LHC retrieval tools: registration failed at spawn"
++                        );
++                    }
++                }
++                Err(e) => {
++                    tracing::warn!(
++                        session_id = %session_info.id.0,
++                        error = %e.message(),
++                        "LHC retrieval tools: skipped at spawn — archive not ready"
++                    );
++                }
++            }
 +        }
 +    }
      let harness_metrics = if telemetry_enabled || xai_grok_telemetry::external::is_active() {
          let plugin_names = plugin_registry
              .as_ref()
+diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/tool_calls.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/tool_calls.rs
+index bda2da8..5109da4 100644
+--- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/tool_calls.rs
++++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/tool_calls.rs
+@@ -2337,13 +2337,30 @@ impl SessionActor {
+         } else {
+             result.prompt_text
+         };
++        // LHC retrieval tools return SDK-formatted historical envelopes.
++        // Preserve bytes exactly: no base64/PDF extraction (would strip data
++        // URIs into live image follow-ups) and no worktree PathRewriter (would
++        // mutate historical cwd strings after impressions were calculated).
++        let is_lhc_retrieval_tool = matches!(
++            effective_tool_name,
++            grok_lhc_host::GET_TURNS_TOOL_NAME | grok_lhc_host::GET_MESSAGES_TOOL_NAME
++        ) || matches!(
++            requested_tool_name,
++            grok_lhc_host::GET_TURNS_TOOL_NAME | grok_lhc_host::GET_MESSAGES_TOOL_NAME
++        );
+         let mut inline_images: Vec<ContentPart> = Vec::new();
+-        let extraction = if !self.is_cursor_harness()
++        let extraction = if is_lhc_retrieval_tool {
++            xai_grok_tools::util::base64_images::ExtractionResult {
++                text: prompt_text,
++                images: Vec::new(),
++            }
++        } else if !self.is_cursor_harness()
+             && !matches!(
+                 result.output,
+                 ToolsToolOutput::ReadFile(ReadFileOutput::ImageContent(_))
+                     | ToolsToolOutput::ReadFile(ReadFileOutput::PdfPageImages(_))
+-            ) {
++            )
++        {
+             xai_grok_tools::util::base64_images::extract_base64_images(prompt_text)
+         } else {
+             xai_grok_tools::util::base64_images::ExtractionResult {
+@@ -2352,12 +2369,22 @@ impl SessionActor {
+             }
+         };
+         let mut extracted_images = extraction.images;
+-        split_tool_layer_for_harness(
+-            self.is_cursor_harness(),
+-            &mut extracted_images,
+-            tool_layer_images,
+-        );
+-        let mut prompt_text = maybe_rewrite(path_rewriter.as_ref(), extraction.text);
++        if is_lhc_retrieval_tool {
++            // Discard any tool-layer images; historical payload is text-only.
++            extracted_images.clear();
++            let _ = tool_layer_images;
++        } else {
++            split_tool_layer_for_harness(
++                self.is_cursor_harness(),
++                &mut extracted_images,
++                tool_layer_images,
++            );
++        }
++        let mut prompt_text = if is_lhc_retrieval_tool {
++            extraction.text
++        } else {
++            maybe_rewrite(path_rewriter.as_ref(), extraction.text)
++        };
+         if !self.is_cursor_harness()
+             && let ToolsToolOutput::ReadFile(ReadFileOutput::ImageContent(ref image_content)) =
+                 result.output
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
 index 758bb9e..b8839b2 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
@@ -2561,6 +2759,244 @@ index 0000000..38451cb
 +        None => unsafe { std::env::remove_var("GROK_LHC_INFERENCE_MODEL") },
 +    }
 +}
+diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/lhc_retrieval_final_output_tests.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/lhc_retrieval_final_output_tests.rs
+new file mode 100644
+index 0000000..c9560e9
+--- /dev/null
++++ b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/lhc_retrieval_final_output_tests.rs
+@@ -0,0 +1,232 @@
++//! Production-path final tool-result fidelity for LHC retrieval tools.
++//!
++//! `get_turns` / `get_messages` return SDK-formatted historical envelopes.
++//! After `handle_bridge_tool_success`, the model-visible `ConversationItem`
++//! must retain those bytes exactly — no base64/PDF extraction (no live image
++//! follow-ups) and no worktree PathRewriter on historical cwd strings.
++
++use super::support::*;
++use super::*;
++use xai_grok_sampling_types::{ContentPart, ConversationItem};
++use xai_grok_tools::types::output::{TextOutput, ToolOutput, ToolRunResult};
++
++fn tool_result_text(item: &ConversationItem) -> &str {
++    match item {
++        ConversationItem::ToolResult(tr) => tr.content.as_ref(),
++        other => panic!("expected ToolResult, got {other:?}"),
++    }
++}
++
++fn followup_has_data_image(followups: &[ConversationItem]) -> bool {
++    followups.iter().any(|item| match item {
++        ConversationItem::User(u) => u
++            .content
++            .iter()
++            .any(|p| matches!(p, ContentPart::Image { url } if url.starts_with("data:image/"))),
++        _ => false,
++    })
++}
++
++/// Historical SDK envelope with image + PDF data URIs and plain + URL-encoded
++/// real cwd paths — all must survive finalization byte-for-byte.
++fn historical_sdk_envelope(real_cwd: &str) -> String {
++    let encoded = urlencoding::encode(real_cwd);
++    format!(
++        "<recall tool=\"get_messages\">\n\
++         <m1>\n\
++         screenshot was data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==\n\
++         and a doc data:application/pdf;base64,JVBERi0xLjQKJeLjz9MKMyAwIG9iago8PC9UeXBlL1BhZ2UKPj4KZW5kb2JqCnhyZWYKMCAwCjAwMDAwMDAwMDAgNjU1MzUgZiAKdHJhaWxlcgo8PC9TaXplIDQ+Pj4Kc3RhcnR4cmVmCjEwJSVFT0YK\n\
++         cwd plain: {real_cwd}/src/main.rs\n\
++         cwd encoded: {encoded}%2Fsrc%2Fmain.rs\n\
++         </m1>\n\
++         </recall>"
++    )
++}
++
++fn text_run_result(prompt: &str) -> ToolRunResult {
++    ToolRunResult {
++        output: ToolOutput::Text(TextOutput::from(prompt)),
++        prompt_text: prompt.to_owned(),
++        effective_tool_name: None,
++    }
++}
++
++/// Production final path: `handle_bridge_tool_success` → model-visible tool_result.
++#[tokio::test(flavor = "current_thread")]
++async fn handle_bridge_tool_success_preserves_get_messages_sdk_bytes_exactly() {
++    let local = tokio::task::LocalSet::new();
++    local
++        .run_until(async {
++            let (gateway_tx, _) =
++                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
++            let (persistence_tx, _) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
++            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
++            assert!(!actor.is_cursor_harness());
++
++            // Worktree rewrite would map real → display if not exempted.
++            let real_cwd = actor.session_info.cwd.clone();
++            let display_cwd = "/project/original".to_string();
++            assert_ne!(
++                real_cwd, display_cwd,
++                "test needs real_cwd ≠ display for PathRewriter coverage"
++            );
++            actor
++                .display_cwd
++                .set(display_cwd.clone())
++                .expect("display_cwd set once");
++            assert!(
++                actor.path_rewriter().is_some(),
++                "path rewriter must be active so exemption is exercised"
++            );
++
++            let sdk_text = historical_sdk_envelope(&real_cwd);
++            let parsed_args = serde_json::json!({ "ids": ["m1"] });
++            let followups = actor
++                .handle_bridge_tool_success(
++                    &acp::ToolCallId::new("tc-lhc-msg"),
++                    "tc-lhc-msg",
++                    grok_lhc_host::GET_MESSAGES_TOOL_NAME,
++                    grok_lhc_host::GET_MESSAGES_TOOL_NAME,
++                    DrainedToolSuccess::new(text_run_result(&sdk_text)),
++                    0,
++                    "test-model",
++                    &parsed_args,
++                )
++                .await
++                .expect("bridge success");
++
++            assert!(
++                followups.is_empty(),
++                "retrieval must not emit deferred image follow-ups: {followups:?}"
++            );
++            assert!(
++                !followup_has_data_image(&followups),
++                "no live image messages from historical data URIs"
++            );
++
++            let conv = actor.chat_state_handle.get_conversation().await;
++            let tool = conv
++                .iter()
++                .rev()
++                .find(|i| matches!(i, ConversationItem::ToolResult(_)))
++                .expect("tool result pushed");
++            let text = tool_result_text(tool);
++            assert_eq!(
++                text, sdk_text,
++                "final tool-result text must match SDK envelope byte-for-byte"
++            );
++            // Explicit regressions the exemption exists to prevent:
++            assert!(
++                text.contains("data:image/png;base64,"),
++                "historical image data URI must remain: {text}"
++            );
++            assert!(
++                text.contains("data:application/pdf;base64,"),
++                "historical PDF data URI must remain: {text}"
++            );
++            assert!(
++                text.contains(&real_cwd),
++                "plain real cwd must not be rewritten to display: {text}"
++            );
++            assert!(
++                text.contains(urlencoding::encode(&real_cwd).as_ref()),
++                "URL-encoded real cwd must not be rewritten: {text}"
++            );
++            assert!(
++                !text.contains(&display_cwd),
++                "display cwd must not appear after rewrite exemption: {text}"
++            );
++            assert!(
++                !text.contains("[image content will be provided separately]"),
++                "must not replace historical images with extraction placeholder: {text}"
++            );
++        })
++        .await;
++}
++
++/// Same exemption for get_turns (symmetric production path).
++#[tokio::test(flavor = "current_thread")]
++async fn handle_bridge_tool_success_preserves_get_turns_sdk_bytes_exactly() {
++    let local = tokio::task::LocalSet::new();
++    local
++        .run_until(async {
++            let (gateway_tx, _) =
++                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
++            let (persistence_tx, _) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
++            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
++            let real_cwd = actor.session_info.cwd.clone();
++            actor
++                .display_cwd
++                .set("/other/display/path".into())
++                .expect("display_cwd");
++            let sdk_text = historical_sdk_envelope(&real_cwd);
++            let followups = actor
++                .handle_bridge_tool_success(
++                    &acp::ToolCallId::new("tc-lhc-turns"),
++                    "tc-lhc-turns",
++                    grok_lhc_host::GET_TURNS_TOOL_NAME,
++                    grok_lhc_host::GET_TURNS_TOOL_NAME,
++                    DrainedToolSuccess::new(text_run_result(&sdk_text)),
++                    0,
++                    "test-model",
++                    &serde_json::json!({ "ids": ["t1"] }),
++                )
++                .await
++                .expect("bridge success");
++            assert!(followups.is_empty(), "no live follow-ups: {followups:?}");
++            let conv = actor.chat_state_handle.get_conversation().await;
++            let tool = conv
++                .iter()
++                .rev()
++                .find(|i| matches!(i, ConversationItem::ToolResult(_)))
++                .expect("tool result");
++            assert_eq!(tool_result_text(tool), sdk_text);
++        })
++        .await;
++}
++
++/// Unrelated tools still get extraction + path rewrite (exemption is narrow).
++#[tokio::test(flavor = "current_thread")]
++async fn handle_bridge_tool_success_still_rewrites_unrelated_tool_paths() {
++    let local = tokio::task::LocalSet::new();
++    local
++        .run_until(async {
++            let (gateway_tx, _) =
++                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
++            let (persistence_tx, _) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
++            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
++            let real_cwd = actor.session_info.cwd.clone();
++            let display = "/display/root".to_string();
++            actor.display_cwd.set(display.clone()).expect("display_cwd");
++            let body = format!("wrote file at {real_cwd}/out.txt");
++            let _ = actor
++                .handle_bridge_tool_success(
++                    &acp::ToolCallId::new("tc-bash"),
++                    "tc-bash",
++                    "bash",
++                    "bash",
++                    DrainedToolSuccess::new(text_run_result(&body)),
++                    0,
++                    "test-model",
++                    &serde_json::json!({}),
++                )
++                .await
++                .expect("bridge success");
++            let conv = actor.chat_state_handle.get_conversation().await;
++            let tool = conv
++                .iter()
++                .rev()
++                .find(|i| matches!(i, ConversationItem::ToolResult(_)))
++                .expect("tool result");
++            let text = tool_result_text(tool);
++            assert!(
++                text.contains(&display),
++                "unrelated tools must still path-rewrite: {text}"
++            );
++            assert!(
++                !text.contains(&real_cwd),
++                "real cwd should be rewritten for non-retrieval tools: {text}"
++            );
++        })
++        .await;
++}
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/record_response_token_usage_tests.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/record_response_token_usage_tests.rs
 index 037bc05..e658248 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/record_response_token_usage_tests.rs
@@ -3598,10 +4034,10 @@ index 0000000..a080ff2
 +}
 diff --git a/crates/codegen/xai-grok-shell/src/session/lhc_retrieval_tools.rs b/crates/codegen/xai-grok-shell/src/session/lhc_retrieval_tools.rs
 new file mode 100644
-index 0000000..7bd08d4
+index 0000000..4b4a044
 --- /dev/null
 +++ b/crates/codegen/xai-grok-shell/src/session/lhc_retrieval_tools.rs
-@@ -0,0 +1,346 @@
+@@ -0,0 +1,422 @@
 +//! LHC Wave B retrieval tools — direct ToolBridge registration.
 +//!
 +//! Registered only while capture is active for the owning session. Tools bind
@@ -3758,6 +4194,7 @@ index 0000000..7bd08d4
 +/// Register both retrieval tools for an LHC-active session.
 +///
 +/// Idempotent: removes prior registration first (rebuild / re-on safe).
++/// All-or-none: if either registration fails, both tools are unregistered.
 +pub(crate) async fn register_lhc_retrieval_tools(
 +    bridge: &ToolBridge,
 +    session_id: &str,
@@ -3770,7 +4207,7 @@ index 0000000..7bd08d4
 +    let turns_schema = retrieval_args_schema("Turn ids, e.g. t211");
 +    let messages_schema = retrieval_args_schema("Message ids, e.g. m3177");
 +
-+    bridge
++    if let Err(e) = bridge
 +        .register_mcp_tools(
 +            GET_TURNS_TOOL_NAME.to_owned(),
 +            GetTurnsTool {
@@ -3779,15 +4216,22 @@ index 0000000..7bd08d4
 +            Some(turns_schema),
 +        )
 +        .await
-+        .map_err(|e| format!("failed to register get_turns: {e}"))?;
-+    bridge
++    {
++        unregister_lhc_retrieval_tools(bridge);
++        return Err(format!("failed to register get_turns: {e}"));
++    }
++    if let Err(e) = bridge
 +        .register_mcp_tools(
 +            GET_MESSAGES_TOOL_NAME.to_owned(),
 +            GetMessagesTool { session },
 +            Some(messages_schema),
 +        )
 +        .await
-+        .map_err(|e| format!("failed to register get_messages: {e}"))?;
++    {
++        // Roll back turns so the pair is never half-advertised.
++        unregister_lhc_retrieval_tools(bridge);
++        return Err(format!("failed to register get_messages: {e}"));
++    }
 +    Ok(())
 +}
 +
@@ -3809,14 +4253,18 @@ index 0000000..7bd08d4
 +mod tests {
 +    use super::*;
 +    use grok_lhc_host::{
-+        GET_MESSAGES_TOOL_NAME, GET_TURNS_TOOL_NAME, capture_active, env_lock, spawn_capture,
++        CAPTURE_OPEN_WAIT, CaptureOpenWaitError, GET_MESSAGES_TOOL_NAME, GET_TURNS_TOOL_NAME,
++        capture_active, capture_archive_ready, clear_open_hold_for_test, env_lock,
++        set_open_hold_for_test, spawn_capture, wait_capture_archive_ready,
 +    };
++    use tokio::sync::oneshot;
 +    use xai_grok_sampling_types::ConversationItem;
 +    use xai_grok_tools::bridge::ToolBridge;
 +
 +    #[tokio::test]
 +    async fn toolbridge_register_dispatch_and_lifecycle() {
 +        let _g = env_lock();
++        clear_open_hold_for_test();
 +        let root = tempfile::tempdir().unwrap();
 +        let prev = std::env::var_os("GROK_LHC");
 +        let prev_root = std::env::var_os("GROK_LHC_ROOT");
@@ -3826,6 +4274,9 @@ index 0000000..7bd08d4
 +        }
 +        let sid = "shell-tb-retrieval";
 +        let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
++        wait_capture_archive_ready(sid, CAPTURE_OPEN_WAIT)
++            .await
++            .expect("archive ready");
 +        handle.persist(&ConversationItem::user("what does the config do?"));
 +        handle.persist(&ConversationItem::assistant("it configures the server"));
 +        handle.flush().await.expect("flush");
@@ -3938,6 +4389,67 @@ index 0000000..7bd08d4
 +        );
 +        unregister_lhc_retrieval_tools(&bridge);
 +
++        match prev {
++            Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
++            None => unsafe { std::env::remove_var("GROK_LHC") },
++        }
++        match prev_root {
++            Some(v) => unsafe { std::env::set_var("GROK_LHC_ROOT", v) },
++            None => unsafe { std::env::remove_var("GROK_LHC_ROOT") },
++        }
++    }
++
++    /// Provisional capture (open held): never advertise tools; wait fails
++    /// explicitly; after release, tools may register. Simulates spawn/rebuild
++    /// readiness gate without a full SessionActor.
++    #[tokio::test]
++    async fn provisional_capture_does_not_advertise_tools_until_ready() {
++        let _g = env_lock();
++        clear_open_hold_for_test();
++        let root = tempfile::tempdir().unwrap();
++        let prev = std::env::var_os("GROK_LHC");
++        let prev_root = std::env::var_os("GROK_LHC_ROOT");
++        unsafe {
++            std::env::set_var("GROK_LHC", "1");
++            std::env::set_var("GROK_LHC_ROOT", root.path());
++        }
++        let sid = "shell-tb-provisional";
++        let (release_tx, release_rx) = oneshot::channel();
++        set_open_hold_for_test(release_rx);
++        let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
++        assert!(capture_active(sid));
++        assert!(!capture_archive_ready(sid));
++
++        // Production publication gate: wait for ready before register.
++        let wait = wait_capture_archive_ready(sid, std::time::Duration::from_millis(100)).await;
++        assert_eq!(wait.err(), Some(CaptureOpenWaitError::TimedOut));
++        let bridge = ToolBridge::for_test();
++        // Do not register on provisional — mirrors spawn/rebuild skip path.
++        assert!(!lhc_retrieval_tools_registered(&bridge).await);
++
++        let _ = release_tx.send(());
++        wait_capture_archive_ready(sid, CAPTURE_OPEN_WAIT)
++            .await
++            .expect("ready after release");
++        register_lhc_retrieval_tools(&bridge, sid)
++            .await
++            .expect("register after ready");
++        assert!(lhc_retrieval_tools_registered(&bridge).await);
++
++        // /lhc off always clears definitions even if we only unregister tools
++        // (capture still active) — and again after shutdown (stale path).
++        unregister_lhc_retrieval_tools(&bridge);
++        assert!(!lhc_retrieval_tools_registered(&bridge).await);
++
++        let handle_for_shutdown = handle.clone();
++        tokio::task::spawn_blocking(move || handle_for_shutdown.shutdown_blocking())
++            .await
++            .expect("join shutdown");
++        // Stale cleanup path: unregister with capture already gone.
++        unregister_lhc_retrieval_tools(&bridge);
++        assert!(!lhc_retrieval_tools_registered(&bridge).await);
++
++        clear_open_hold_for_test();
 +        match prev {
 +            Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
 +            None => unsafe { std::env::remove_var("GROK_LHC") },

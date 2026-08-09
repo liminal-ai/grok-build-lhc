@@ -124,12 +124,53 @@ enum CaptureCmd {
     Shutdown(Option<oneshot::Sender<()>>),
 }
 
+/// Archive-open readiness for a capture worker.
+///
+/// Registry presence (pre-open buffer) is separate: turns may queue while
+/// [`Pending`], but retrieval tool publication and `/lhc on` success wait for
+/// [`Ready`]. [`Failed`] means open refused and the worker is exiting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureOpenState {
+    /// Registered; `LhcSession::open` not finished yet.
+    Pending,
+    /// Archive open succeeded; retrieval is safe to advertise.
+    Ready,
+    /// Archive open refused; worker unregisters and exits.
+    Failed,
+}
+
+/// Default bound for waiting on archive open (local SQLite; ms in practice).
+pub const CAPTURE_OPEN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Why [`CaptureHandle::wait_until_open`] did not observe [`CaptureOpenState::Ready`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureOpenWaitError {
+    /// Open refused (or worker died before ready).
+    Failed,
+    /// Bound elapsed while still pending.
+    TimedOut,
+}
+
+impl CaptureOpenWaitError {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Failed => "LHC archive open refused",
+            Self::TimedOut => "LHC archive open timed out",
+        }
+    }
+}
+
 struct CaptureShared {
     session_id: String,
     worker_id: u64,
     tx: mpsc::Sender<CaptureCmd>,
     /// Always-writable shutdown signal — never blocked by a full queue.
     shutdown_tx: watch::Sender<bool>,
+    /// Archive open rendezvous — starts Pending; worker sets Ready or Failed.
+    open_tx: watch::Sender<CaptureOpenState>,
+    /// Keeps the watch channel open so worker `send` updates are retained
+    /// even when no waiter is currently subscribed.
+    _open_rx: watch::Receiver<CaptureOpenState>,
     /// Crash signal: worker exits immediately without drain/close.
     /// Test-only — must not exist in the shipping default-feature build.
     #[cfg(any(test, feature = "test-util"))]
@@ -525,6 +566,57 @@ impl CaptureHandle {
         self.inner.tx.is_closed()
     }
 
+    /// Latest archive-open state (Pending / Ready / Failed).
+    pub fn open_state(&self) -> CaptureOpenState {
+        *self.inner.open_tx.borrow()
+    }
+
+    /// True only after `LhcSession::open` succeeded for this worker.
+    pub fn is_archive_ready(&self) -> bool {
+        self.open_state() == CaptureOpenState::Ready
+    }
+
+    /// Wait until archive open succeeds, fails, or `timeout` elapses.
+    ///
+    /// Used by retrieval tool publication and `/lhc on` — not by turn tee
+    /// capture, which may queue while open is still pending.
+    pub async fn wait_until_open(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<(), CaptureOpenWaitError> {
+        let mut rx = self.inner.open_tx.subscribe();
+        if *rx.borrow_and_update() == CaptureOpenState::Ready {
+            return Ok(());
+        }
+        if *rx.borrow() == CaptureOpenState::Failed {
+            return Err(CaptureOpenWaitError::Failed);
+        }
+        let wait = async {
+            loop {
+                if rx.changed().await.is_err() {
+                    // Sender dropped without Ready → treat as failed open.
+                    return Err(CaptureOpenWaitError::Failed);
+                }
+                match *rx.borrow_and_update() {
+                    CaptureOpenState::Ready => return Ok(()),
+                    CaptureOpenState::Failed => return Err(CaptureOpenWaitError::Failed),
+                    CaptureOpenState::Pending => continue,
+                }
+            }
+        };
+        match tokio::time::timeout(timeout, wait).await {
+            Ok(result) => result,
+            Err(_) => {
+                // Re-check in case Ready raced the timeout edge.
+                match self.open_state() {
+                    CaptureOpenState::Ready => Ok(()),
+                    CaptureOpenState::Failed => Err(CaptureOpenWaitError::Failed),
+                    CaptureOpenState::Pending => Err(CaptureOpenWaitError::TimedOut),
+                }
+            }
+        }
+    }
+
     pub fn dropped_count(&self) -> u64 {
         self.inner.dropped.load(Ordering::Relaxed)
     } // via Arc
@@ -795,7 +887,40 @@ pub fn take_and_run_refresh_interleave_hook() {
     }
 }
 
+/// Test-only: one-shot hold before `LhcSession::open` (delayed-open tests).
+///
+/// Install a receiver; the capture worker awaits it (or sender drop) before
+/// opening the archive. Take/clear is one-shot so other tests are unaffected.
+#[cfg(any(test, feature = "test-util"))]
+static OPEN_HOLD: Mutex<Option<oneshot::Receiver<()>>> = Mutex::new(None);
+
+/// Install a hold that the next capture worker waits on before archive open.
+#[cfg(any(test, feature = "test-util"))]
+pub fn set_open_hold_for_test(rx: oneshot::Receiver<()>) {
+    *OPEN_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = Some(rx);
+}
+
+/// Clear any unused open hold (test cleanup).
+#[cfg(any(test, feature = "test-util"))]
+pub fn clear_open_hold_for_test() {
+    *OPEN_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+#[cfg(any(test, feature = "test-util"))]
+async fn await_open_hold_for_test() {
+    let hold = OPEN_HOLD.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(rx) = hold {
+        // Sender drop or explicit signal both release the hold.
+        let _ = rx.await;
+    }
+}
+
 /// Spawn a dedicated OS thread + tokio runtime owning the LHC session.
+///
+/// Returns a handle as soon as the session is **registered** (pre-open buffer
+/// for turn capture). Archive open completes asynchronously; use
+/// [`CaptureHandle::wait_until_open`] / [`CaptureHandle::is_archive_ready`]
+/// before publishing retrieval tools or treating `/lhc on` as success.
 pub fn spawn_capture(
     session_id: &str,
     cwd: Option<&str>,
@@ -812,6 +937,9 @@ pub fn spawn_capture(
     }
     let (tx, mut rx) = mpsc::channel::<CaptureCmd>(CAPTURE_QUEUE_CAP);
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    // Retain `open_rx` on the shared handle so `send(Ready|Failed)` is not lost
+    // when no waiter has subscribed yet (tokio watch drops updates if no rx).
+    let (open_tx, open_rx) = watch::channel(CaptureOpenState::Pending);
     #[cfg(any(test, feature = "test-util"))]
     let (crash_tx, mut crash_rx) = watch::channel(false);
     let worker_id = next_worker_id();
@@ -825,6 +953,8 @@ pub fn spawn_capture(
         worker_id,
         tx: tx.clone(),
         shutdown_tx,
+        open_tx: open_tx.clone(),
+        _open_rx: open_rx,
         #[cfg(any(test, feature = "test-util"))]
         crash_tx,
         dropped: Arc::clone(&dropped),
@@ -859,6 +989,7 @@ pub fn spawn_capture(
                 Ok(rt) => rt,
                 Err(err) => {
                     error!(?err, "LHC: failed to build capture runtime");
+                    let _ = open_tx.send(CaptureOpenState::Failed);
                     unregister_inference_sampler(&session_id_for_worker);
                     unregister_worker(&session_id_for_worker, worker_id_for_exit);
                     return;
@@ -866,8 +997,12 @@ pub fn spawn_capture(
             };
             rt.block_on(async move {
                 // Open refusal must not block the host caller. Return
-                // the handle immediately; on refuse the worker unregisters and
-                // exits so `capture_active` becomes false without a rendezvous.
+                // the handle immediately; on refuse the worker signals Failed,
+                // unregisters, and exits. Callers that need readiness wait on
+                // the open rendezvous instead of polling registry presence.
+                #[cfg(any(test, feature = "test-util"))]
+                await_open_hold_for_test().await;
+
                 let Some((session, mut tracker)) = LhcSession::open(
                     &session_id_for_worker,
                     cwd_owned.as_deref(),
@@ -875,10 +1010,12 @@ pub fn spawn_capture(
                 )
                 .await
                 else {
+                    let _ = open_tx.send(CaptureOpenState::Failed);
                     unregister_inference_sampler(&session_id_for_worker);
                     unregister_worker(&session_id_for_worker, worker_id_for_exit);
                     return;
                 };
+                let _ = open_tx.send(CaptureOpenState::Ready);
 
                 let mut session = session;
                 // Tip is tracked on the session; item keys always use ITEM_KEY_GENERATION.

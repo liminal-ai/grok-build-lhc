@@ -109,15 +109,16 @@ impl SessionActor {
                         }
                     }
                     LhcSlashOp::Off => {
+                        // Always drop retrieval definitions — even when capture
+                        // is inactive — so a refused/provisional open cannot leave
+                        // stale get_turns/get_messages advertised after worker death.
+                        {
+                            let bridge = self.agent.borrow().tool_bridge().clone();
+                            crate::session::lhc_retrieval_tools::unregister_lhc_retrieval_tools(
+                                &bridge,
+                            );
+                        }
                         if grok_lhc_host::capture_active(sid) {
-                            // Drop model-visible tools before capture teardown so
-                            // a concurrent tool list cannot advertise a dead session.
-                            {
-                                let bridge = self.agent.borrow().tool_bridge().clone();
-                                crate::session::lhc_retrieval_tools::unregister_lhc_retrieval_tools(
-                                    &bridge,
-                                );
-                            }
                             grok_lhc_host::shutdown_session(sid);
                             // Unregisters immediately; worker settles in-flight
                             // background work under a short drainSettled cap.
@@ -130,12 +131,70 @@ impl SessionActor {
                              Use `/lhc on` to re-attach."
                                 .to_owned()
                         } else {
-                            "**LHC:** capture was not active for this session.".to_owned()
+                            "**LHC:** capture was not active for this session \
+                             (retrieval tools cleared if present)."
+                                .to_owned()
                         }
                     }
                     LhcSlashOp::On => {
-                        if grok_lhc_host::capture_active(sid) {
+                        if grok_lhc_host::capture_archive_ready(sid) {
+                            // Idempotent tool re-attach if rebuild dropped them.
+                            let bridge = self.agent.borrow().tool_bridge().clone();
+                            if let Err(e) =
+                                crate::session::lhc_retrieval_tools::register_lhc_retrieval_tools(
+                                    &bridge, sid,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    session_id = %sid,
+                                    error = %e,
+                                    "LHC retrieval tools: re-registration failed on /lhc on (already ready)"
+                                );
+                            }
                             "**LHC:** capture already active for this session.".to_owned()
+                        } else if grok_lhc_host::capture_active(sid) {
+                            // Registered but archive still opening — wait (bounded)
+                            // rather than claiming success on registry presence alone.
+                            match grok_lhc_host::wait_capture_archive_ready(
+                                sid,
+                                grok_lhc_host::CAPTURE_OPEN_WAIT,
+                            )
+                            .await
+                            {
+                                Ok(_) => {
+                                    let bridge = self.agent.borrow().tool_bridge().clone();
+                                    if let Err(e) = crate::session::lhc_retrieval_tools::register_lhc_retrieval_tools(
+                                        &bridge,
+                                        sid,
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(
+                                            session_id = %sid,
+                                            error = %e,
+                                            "LHC retrieval tools: registration failed after open wait"
+                                        );
+                                        format!(
+                                            "**LHC:** archive opened but retrieval tools failed to register: {e}"
+                                        )
+                                    } else {
+                                        "**LHC:** capture started for this session \
+                                         (archive open completed)."
+                                            .to_owned()
+                                    }
+                                }
+                                Err(e) => {
+                                    // Avoid leaving a provisional worker that makes
+                                    // the next /lhc on report "already active".
+                                    grok_lhc_host::shutdown_session(sid);
+                                    let bridge = self.agent.borrow().tool_bridge().clone();
+                                    crate::session::lhc_retrieval_tools::unregister_lhc_retrieval_tools(
+                                        &bridge,
+                                    );
+                                    format!("**LHC:** failed to start capture — {}.", e.message())
+                                }
+                            }
                         } else if !grok_lhc_host::is_enabled() {
                             "**LHC:** process gate is off.\n\n\
                              Set `GROK_LHC=1` or `[lhc] enabled = true` (then restart / \
@@ -163,35 +222,63 @@ impl SessionActor {
                                 Some(sampler),
                             ) {
                                 Some(_) => {
-                                    let bridge = self.agent.borrow().tool_bridge().clone();
-                                    if let Err(e) = crate::session::lhc_retrieval_tools::register_lhc_retrieval_tools(
-                                        &bridge,
+                                    match grok_lhc_host::wait_capture_archive_ready(
                                         sid,
+                                        grok_lhc_host::CAPTURE_OPEN_WAIT,
                                     )
                                     .await
                                     {
-                                        tracing::warn!(
-                                            session_id = %sid,
-                                            error = %e,
-                                            "LHC retrieval tools: registration failed on /lhc on"
-                                        );
+                                        Ok(_) => {
+                                            let bridge = self.agent.borrow().tool_bridge().clone();
+                                            if let Err(e) = crate::session::lhc_retrieval_tools::register_lhc_retrieval_tools(
+                                                &bridge,
+                                                sid,
+                                            )
+                                            .await
+                                            {
+                                                tracing::warn!(
+                                                    session_id = %sid,
+                                                    error = %e,
+                                                    "LHC retrieval tools: registration failed on /lhc on"
+                                                );
+                                                // Roll back capture so success is truthful.
+                                                grok_lhc_host::shutdown_session(sid);
+                                                format!(
+                                                    "**LHC:** archive opened but retrieval tools \
+                                                     failed to register: {e}"
+                                                )
+                                            } else {
+                                                let compact_line =
+                                                    if grok_lhc_host::inference_sampler_registered(sid)
+                                                    {
+                                                        "**ModelCall compact:** available (sampler registered)."
+                                                    } else {
+                                                        "**ModelCall compact:** unavailable — sampler did not \
+                                                     register; start a new session to restore compaction."
+                                                    };
+                                                format!(
+                                                    "**LHC:** capture started for this session.\n\n\
+                                                     Existing native history was submitted as bootstrap \
+                                                     (dedup prevents double-record on re-enable).\n\n\
+                                                     **Active context engine:** (no serve turn yet) — the \
+                                                     next model turn records whether LHC substituted or \
+                                                     fail-opened to native.\n\n\
+                                                     {compact_line}"
+                                                )
+                                            }
+                                        }
+                                        Err(e) => {
+                                            grok_lhc_host::shutdown_session(sid);
+                                            let bridge = self.agent.borrow().tool_bridge().clone();
+                                            crate::session::lhc_retrieval_tools::unregister_lhc_retrieval_tools(
+                                                &bridge,
+                                            );
+                                            format!(
+                                                "**LHC:** failed to start capture — {}.",
+                                                e.message()
+                                            )
+                                        }
                                     }
-                                    let compact_line =
-                                        if grok_lhc_host::inference_sampler_registered(sid) {
-                                            "**ModelCall compact:** available (sampler registered)."
-                                        } else {
-                                            "**ModelCall compact:** unavailable — sampler did not \
-                                         register; start a new session to restore compaction."
-                                        };
-                                    format!(
-                                        "**LHC:** capture started for this session.\n\n\
-                                         Existing native history was submitted as bootstrap \
-                                         (dedup prevents double-record on re-enable).\n\n\
-                                         **Active context engine:** (no serve turn yet) — the \
-                                         next model turn records whether LHC substituted or \
-                                         fail-opened to native.\n\n\
-                                         {compact_line}"
-                                    )
                                 }
                                 None => "**LHC:** failed to start capture (see logs).".to_owned(),
                             }

@@ -2337,13 +2337,30 @@ impl SessionActor {
         } else {
             result.prompt_text
         };
+        // LHC retrieval tools return SDK-formatted historical envelopes.
+        // Preserve bytes exactly: no base64/PDF extraction (would strip data
+        // URIs into live image follow-ups) and no worktree PathRewriter (would
+        // mutate historical cwd strings after impressions were calculated).
+        let is_lhc_retrieval_tool = matches!(
+            effective_tool_name,
+            grok_lhc_host::GET_TURNS_TOOL_NAME | grok_lhc_host::GET_MESSAGES_TOOL_NAME
+        ) || matches!(
+            requested_tool_name,
+            grok_lhc_host::GET_TURNS_TOOL_NAME | grok_lhc_host::GET_MESSAGES_TOOL_NAME
+        );
         let mut inline_images: Vec<ContentPart> = Vec::new();
-        let extraction = if !self.is_cursor_harness()
+        let extraction = if is_lhc_retrieval_tool {
+            xai_grok_tools::util::base64_images::ExtractionResult {
+                text: prompt_text,
+                images: Vec::new(),
+            }
+        } else if !self.is_cursor_harness()
             && !matches!(
                 result.output,
                 ToolsToolOutput::ReadFile(ReadFileOutput::ImageContent(_))
                     | ToolsToolOutput::ReadFile(ReadFileOutput::PdfPageImages(_))
-            ) {
+            )
+        {
             xai_grok_tools::util::base64_images::extract_base64_images(prompt_text)
         } else {
             xai_grok_tools::util::base64_images::ExtractionResult {
@@ -2352,12 +2369,22 @@ impl SessionActor {
             }
         };
         let mut extracted_images = extraction.images;
-        split_tool_layer_for_harness(
-            self.is_cursor_harness(),
-            &mut extracted_images,
-            tool_layer_images,
-        );
-        let mut prompt_text = maybe_rewrite(path_rewriter.as_ref(), extraction.text);
+        if is_lhc_retrieval_tool {
+            // Discard any tool-layer images; historical payload is text-only.
+            extracted_images.clear();
+            let _ = tool_layer_images;
+        } else {
+            split_tool_layer_for_harness(
+                self.is_cursor_harness(),
+                &mut extracted_images,
+                tool_layer_images,
+            );
+        }
+        let mut prompt_text = if is_lhc_retrieval_tool {
+            extraction.text
+        } else {
+            maybe_rewrite(path_rewriter.as_ref(), extraction.text)
+        };
         if !self.is_cursor_harness()
             && let ToolsToolOutput::ReadFile(ReadFileOutput::ImageContent(ref image_content)) =
                 result.output

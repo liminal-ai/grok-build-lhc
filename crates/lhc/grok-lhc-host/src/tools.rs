@@ -306,6 +306,9 @@ pub fn format_messages_result(receipt: &RetrievalReceipt<RetrievedMessage>) -> S
 pub enum RetrievalLifecycleError {
     /// No capture worker for this session (LHC off / never opened / shut down).
     Inactive,
+    /// Worker registered but archive open still pending (or not yet Ready).
+    /// Fail explicitly — do not queue retrieval indefinitely while open is pending.
+    NotReady,
     /// Worker channel closed mid-flight.
     WorkerGone,
 }
@@ -316,12 +319,19 @@ impl RetrievalLifecycleError {
             Self::Inactive => {
                 "LHC capture is not active for this session — get_turns/get_messages require an open LHC session"
             }
+            Self::NotReady => {
+                "LHC archive is not ready yet — get_turns/get_messages require a successful open"
+            }
             Self::WorkerGone => "LHC capture worker is gone — cannot retrieve history",
         }
     }
 }
 
-/// Resolve the active capture handle for `session_id` only — never another session.
+/// Resolve the active **ready** capture handle for `session_id` only.
+///
+/// Registry presence alone is insufficient: open must have succeeded
+/// ([`crate::capture::CaptureHandle::is_archive_ready`]). Pending open fails
+/// with [`RetrievalLifecycleError::NotReady`] rather than hanging on the queue.
 pub fn resolve_capture_for_retrieval(
     session_id: &str,
 ) -> Result<crate::capture::CaptureHandle, RetrievalLifecycleError> {
@@ -329,7 +339,14 @@ pub fn resolve_capture_for_retrieval(
     if !crate::capture::any_capture_active() {
         return Err(RetrievalLifecycleError::Inactive);
     }
-    crate::capture::lookup_session(session_id).ok_or(RetrievalLifecycleError::Inactive)
+    let handle =
+        crate::capture::lookup_session(session_id).ok_or(RetrievalLifecycleError::Inactive)?;
+    use crate::capture::CaptureOpenState;
+    match handle.open_state() {
+        CaptureOpenState::Ready => Ok(handle),
+        CaptureOpenState::Pending => Err(RetrievalLifecycleError::NotReady),
+        CaptureOpenState::Failed => Err(RetrievalLifecycleError::Inactive),
+    }
 }
 
 /// Validate args and run `get_turns` through the session's capture worker.

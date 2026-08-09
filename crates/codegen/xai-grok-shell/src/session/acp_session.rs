@@ -1910,6 +1910,9 @@ mod laziness_detector_tests;
 #[path = "acp_session_tests/laziness/laziness_integration_tests.rs"]
 mod laziness_integration_tests;
 #[cfg(test)]
+#[path = "acp_session_tests/lhc_retrieval_final_output_tests.rs"]
+mod lhc_retrieval_final_output_tests;
+#[cfg(test)]
 #[path = "acp_session_tests/load_user_prompts_tests.rs"]
 mod load_user_prompts_tests;
 #[cfg(test)]

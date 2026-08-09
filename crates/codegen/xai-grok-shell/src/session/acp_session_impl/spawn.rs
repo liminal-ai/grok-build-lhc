@@ -1038,20 +1038,37 @@ pub(crate) async fn spawn_session_actor(
         .tool_bridge()
         .update_resource(task_wake_suppressed)
         .await;
-    // Wave B: register get_turns/get_messages only when this session's LHC
-    // capture is already active (spawn-time tee opened a worker).
-    if grok_lhc_host::capture_active(session_info.id.0.as_ref()) {
-        if let Err(e) = crate::session::lhc_retrieval_tools::register_lhc_retrieval_tools(
-            agent.tool_bridge(),
-            session_info.id.0.as_ref(),
-        )
-        .await
-        {
-            tracing::warn!(
-                session_id = %session_info.id.0,
-                error = %e,
-                "LHC retrieval tools: registration failed at spawn"
-            );
+    // Wave B: register get_turns/get_messages only after archive open succeeds
+    // (not mere registry presence — open may still be pending or refused).
+    {
+        let sid = session_info.id.0.as_ref();
+        if grok_lhc_host::capture_active(sid) {
+            match grok_lhc_host::wait_capture_archive_ready(sid, grok_lhc_host::CAPTURE_OPEN_WAIT)
+                .await
+            {
+                Ok(_) => {
+                    if let Err(e) =
+                        crate::session::lhc_retrieval_tools::register_lhc_retrieval_tools(
+                            agent.tool_bridge(),
+                            sid,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            session_id = %session_info.id.0,
+                            error = %e,
+                            "LHC retrieval tools: registration failed at spawn"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %session_info.id.0,
+                        error = %e.message(),
+                        "LHC retrieval tools: skipped at spawn — archive not ready"
+                    );
+                }
+            }
         }
     }
     let harness_metrics = if telemetry_enabled || xai_grok_telemetry::external::is_active() {

@@ -194,6 +194,26 @@ bands under real budgets for that kill test to be meaningful.
 
 ## Sync record
 
+### 2026-08-09 — Wave B Slice 3 validation R2: final-output fidelity + open readiness
+
+Correction on top of Slice 3 retrieval tools (still pin `dd251ec`; `main`
+stays `8a14c91`). No new LHC-HOOK markers (still 10). No SDK/vendor edits.
+
+- **Final tool-result fidelity:** `handle_bridge_tool_success` exempts exactly
+  `get_turns` / `get_messages` from base64/PDF extraction and worktree
+  `PathRewriter`. SDK historical envelopes (including `data:image` /
+  `data:application/pdf` and plain + URL-encoded real cwd strings) stay
+  byte-for-byte; no deferred live image follow-ups. Unrelated tools still
+  extract/rewrite.
+- **Archive-open readiness:** capture still registers pre-open (turn buffer
+  preserved), but a bounded `CaptureOpenState` rendezvous (`Pending` /
+  `Ready` / `Failed`) gates retrieval tool publication and `/lhc on` success.
+  Spawn, `/lhc on`, and agent rebuild wait for open success (not mere
+  `capture_active`). Retrieval calls fail explicitly while open is pending
+  (`NotReady`) rather than queue forever. `/lhc off` always unregisters both
+  retrieval definitions (stale cleanup after refused/provisional open).
+  Registration is all-or-none (rollback on partial failure).
+
 ### 2026-08-09 — Wave B Slice 3: retrieval tools (`get_turns` / `get_messages`)
 
 Smallest native Grok integration for history pull (still pin `dd251ec`;
