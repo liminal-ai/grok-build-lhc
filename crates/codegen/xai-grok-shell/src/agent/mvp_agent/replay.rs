@@ -53,6 +53,52 @@ impl ReplayCompletionDrain {
     }
 }
 
+/// Drain notification completion receivers *after* the load critical path.
+///
+/// Cold / `noReplay` clients (notably the headless pager) withhold acks for
+/// session-scoped live notifications such as `x.ai/task_completed` until
+/// `LoadSessionResponse` returns. Awaiting those receivers inside
+/// `replay_transcript_gate` — before the session actor is spawned and before
+/// the response is sent — deadlocks forever.
+///
+/// Receivers are never dropped: a `LocalSet` task owns them to completion and
+/// logs failures. Call only from the agent's LocalSet (same as every other
+/// `spawn_local` post-response path).
+pub(super) fn defer_load_completion_drain(
+    completions: Vec<ReplayCompletionRx>,
+    kind: &'static str,
+) {
+    if completions.is_empty() {
+        return;
+    }
+    let count = completions.len();
+    tokio::task::spawn_local(async move {
+        for (index, rx) in completions.into_iter().enumerate() {
+            match rx.await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        kind,
+                        index,
+                        error = %err,
+                        "deferred load notification completion failed"
+                    );
+                }
+                Err(_) => {
+                    // Gateway/client dropped the oneshot before ack — process
+                    // exit or disconnect. Not a delivery bug in the emitter.
+                    tracing::debug!(
+                        kind,
+                        index,
+                        "deferred load notification completion cancelled"
+                    );
+                }
+            }
+        }
+        tracing::debug!(kind, count, "deferred load completion drain finished");
+    });
+}
+
 impl MvpAgent {
     /// Records written before completions were bounded can still be too long
     /// for a client to read. `None` drops one that cannot be shrunk, which
@@ -382,7 +428,43 @@ impl MvpAgent {
 
 #[cfg(test)]
 mod drain_tests {
-    use super::{REPLAY_COMPLETION_WINDOW, ReplayCompletionDrain};
+    use super::{REPLAY_COMPLETION_WINDOW, ReplayCompletionDrain, defer_load_completion_drain};
+
+    /// Deferred drain owns receivers (never silent-drop) and finishes after acks.
+    #[tokio::test(flavor = "current_thread")]
+    async fn defer_load_completion_drain_awaits_acks_without_drop() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let finished = std::rc::Rc::new(std::cell::Cell::new(false));
+                let flag = finished.clone();
+                defer_load_completion_drain(vec![rx], "test_defer");
+                // Drain is scheduled but must not complete until we ack.
+                tokio::task::yield_now().await;
+                assert!(!flag.get());
+                // Observe drain completion by spawning a follower after ack.
+                tokio::task::spawn_local(async move {
+                    // Give the deferred task a turn after we send below.
+                    for _ in 0..4 {
+                        tokio::task::yield_now().await;
+                    }
+                    flag.set(true);
+                });
+                tx.send(Ok(())).unwrap();
+                for _ in 0..16 {
+                    if finished.get() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert!(
+                    finished.get(),
+                    "deferred drain task must run to completion after ack"
+                );
+            })
+            .await;
+    }
 
     #[tokio::test]
     async fn completion_window_drains_all_ready_receivers() {

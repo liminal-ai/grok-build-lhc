@@ -672,6 +672,368 @@ index 900cf59..e7ac3ea 100644
      xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::ModelSwitched {
          session_id: session_id.0.to_string(),
          previous_model_id: previous_model_id.to_string(),
+diff --git a/crates/codegen/xai-grok-shell/src/agent/mvp_agent/mod.rs b/crates/codegen/xai-grok-shell/src/agent/mvp_agent/mod.rs
+index b310035..89a1dd6 100644
+--- a/crates/codegen/xai-grok-shell/src/agent/mvp_agent/mod.rs
++++ b/crates/codegen/xai-grok-shell/src/agent/mvp_agent/mod.rs
+@@ -1488,8 +1488,11 @@ impl MvpAgent {
+     }
+     /// Emit `task_completed` for background tasks that were replayed as
+     /// "Running" but whose processes no longer exist (cold session load).
+-    /// Returns completion receivers so the caller can drain them before
+-    /// returning LoadSessionResponse.
++    /// Returns completion receivers the load gate must own (never drop): drain
++    /// them **after** `LoadSessionResponse` can return — see
++    /// [`replay::defer_load_completion_drain`]. Awaiting them on the pre-actor
++    /// critical path deadlocks cold / `noReplay` clients that withhold acks
++    /// until load finishes.
+     pub(super) fn reconcile_stale_background_tasks(
+         &self,
+         session_id: &acp::SessionId,
+diff --git a/crates/codegen/xai-grok-shell/src/agent/mvp_agent/replay.rs b/crates/codegen/xai-grok-shell/src/agent/mvp_agent/replay.rs
+index 3f79cde..887e727 100644
+--- a/crates/codegen/xai-grok-shell/src/agent/mvp_agent/replay.rs
++++ b/crates/codegen/xai-grok-shell/src/agent/mvp_agent/replay.rs
+@@ -53,6 +53,52 @@ impl ReplayCompletionDrain {
+     }
+ }
+ 
++/// Drain notification completion receivers *after* the load critical path.
++///
++/// Cold / `noReplay` clients (notably the headless pager) withhold acks for
++/// session-scoped live notifications such as `x.ai/task_completed` until
++/// `LoadSessionResponse` returns. Awaiting those receivers inside
++/// `replay_transcript_gate` — before the session actor is spawned and before
++/// the response is sent — deadlocks forever.
++///
++/// Receivers are never dropped: a `LocalSet` task owns them to completion and
++/// logs failures. Call only from the agent's LocalSet (same as every other
++/// `spawn_local` post-response path).
++pub(super) fn defer_load_completion_drain(
++    completions: Vec<ReplayCompletionRx>,
++    kind: &'static str,
++) {
++    if completions.is_empty() {
++        return;
++    }
++    let count = completions.len();
++    tokio::task::spawn_local(async move {
++        for (index, rx) in completions.into_iter().enumerate() {
++            match rx.await {
++                Ok(Ok(())) => {}
++                Ok(Err(err)) => {
++                    tracing::warn!(
++                        kind,
++                        index,
++                        error = %err,
++                        "deferred load notification completion failed"
++                    );
++                }
++                Err(_) => {
++                    // Gateway/client dropped the oneshot before ack — process
++                    // exit or disconnect. Not a delivery bug in the emitter.
++                    tracing::debug!(
++                        kind,
++                        index,
++                        "deferred load notification completion cancelled"
++                    );
++                }
++            }
++        }
++        tracing::debug!(kind, count, "deferred load completion drain finished");
++    });
++}
++
+ impl MvpAgent {
+     /// Records written before completions were bounded can still be too long
+     /// for a client to read. `None` drops one that cannot be shrunk, which
+@@ -382,7 +428,43 @@ impl MvpAgent {
+ 
+ #[cfg(test)]
+ mod drain_tests {
+-    use super::{REPLAY_COMPLETION_WINDOW, ReplayCompletionDrain};
++    use super::{REPLAY_COMPLETION_WINDOW, ReplayCompletionDrain, defer_load_completion_drain};
++
++    /// Deferred drain owns receivers (never silent-drop) and finishes after acks.
++    #[tokio::test(flavor = "current_thread")]
++    async fn defer_load_completion_drain_awaits_acks_without_drop() {
++        let local = tokio::task::LocalSet::new();
++        local
++            .run_until(async {
++                let (tx, rx) = tokio::sync::oneshot::channel();
++                let finished = std::rc::Rc::new(std::cell::Cell::new(false));
++                let flag = finished.clone();
++                defer_load_completion_drain(vec![rx], "test_defer");
++                // Drain is scheduled but must not complete until we ack.
++                tokio::task::yield_now().await;
++                assert!(!flag.get());
++                // Observe drain completion by spawning a follower after ack.
++                tokio::task::spawn_local(async move {
++                    // Give the deferred task a turn after we send below.
++                    for _ in 0..4 {
++                        tokio::task::yield_now().await;
++                    }
++                    flag.set(true);
++                });
++                tx.send(Ok(())).unwrap();
++                for _ in 0..16 {
++                    if finished.get() {
++                        break;
++                    }
++                    tokio::task::yield_now().await;
++                }
++                assert!(
++                    finished.get(),
++                    "deferred drain task must run to completion after ack"
++                );
++            })
++            .await;
++    }
+ 
+     #[tokio::test]
+     async fn completion_window_drains_all_ready_receivers() {
+diff --git a/crates/codegen/xai-grok-shell/src/agent/mvp_agent/replay_tests.rs b/crates/codegen/xai-grok-shell/src/agent/mvp_agent/replay_tests.rs
+index b0a8a52..e6c9023 100644
+--- a/crates/codegen/xai-grok-shell/src/agent/mvp_agent/replay_tests.rs
++++ b/crates/codegen/xai-grok-shell/src/agent/mvp_agent/replay_tests.rs
+@@ -203,6 +203,49 @@ async fn a_stale_task_completion_is_frame_bounded() {
+     assert!(params.contains("session_restart"));
+ }
+ 
++/// Receivers from stale reconcile must be owned by a deferred drain, not
++/// dropped at the emit site — dropping would lose delivery observability and
++/// cancel the oneshot before the client can ack.
++#[tokio::test(flavor = "current_thread")]
++async fn stale_reconcile_receivers_survive_until_deferred_ack() {
++    let local = tokio::task::LocalSet::new();
++    local
++        .run_until(async {
++            let (agent, mut rx) = build_agent_with_gateway();
++            let dir = tempfile::tempdir().unwrap();
++            let path = dir.path().join("updates.jsonl");
++            std::fs::write(
++                &path,
++                r#"{"timestamp":1,"method":"_x.ai/session/update","params":{"sessionId":"s","update":{"sessionUpdate":"task_backgrounded","task_id":"own-1","command":"true","cwd":"/tmp"}}}
++"#,
++            )
++            .unwrap();
++
++            let completions =
++                agent.reconcile_stale_background_tasks(&acp::SessionId::new("s"), &Some(path));
++            assert_eq!(completions.len(), 1, "one orphan must emit one completion");
++
++            // Enqueued on the gateway before any drain.
++            let msg = rx.try_recv().expect("task_completed enqueued");
++            let AcpClientMessage::ExtNotification(args) = msg else {
++                panic!("expected ExtNotification, got {msg:?}");
++            };
++            assert!(
++                args.request.params.get().contains("own-1")
++                    || args.request.method.as_ref() == "x.ai/task_completed"
++            );
++
++            super::replay::defer_load_completion_drain(completions, "test_ownership");
++            // Still no ack — load response can proceed while receiver is held.
++            tokio::task::yield_now().await;
++            args.response_tx.send(Ok(())).unwrap();
++            for _ in 0..8 {
++                tokio::task::yield_now().await;
++            }
++        })
++        .await;
++}
++
+ fn build_agent_with_gateway() -> (
+     MvpAgent,
+     tokio::sync::mpsc::UnboundedReceiver<AcpClientMessage>,
+diff --git a/crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_setup.rs b/crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_setup.rs
+index 3ecb3b0..9056910 100644
+--- a/crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_setup.rs
++++ b/crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_setup.rs
+@@ -1057,6 +1057,12 @@ impl MvpAgent {
+     /// Replay-gate phase: replay the transcript (unless `no_replay`), reopen
+     /// the live-output gate, drain deltas so replay precedes the response.
+     /// Stale-task reconciliation runs even under `no_replay`: it corrects state.
++    ///
++    /// Stale `task_completed` notifications are still emitted here, but their
++    /// completion receivers are **deferred** via
++    /// [`super::replay::defer_load_completion_drain`]: cold clients withhold
++    /// those acks until `LoadSessionResponse`, so awaiting them on this critical
++    /// path deadlocks before the session actor spawns.
+     async fn replay_transcript_gate(
+         &self,
+         session_id: &acp::SessionId,
+@@ -1119,6 +1125,8 @@ impl MvpAgent {
+                 .gateway_enabled
+                 .store(true, std::sync::atomic::Ordering::Relaxed);
+         }
++        // Replay/delta acks: clients apply `isReplay` under the load barrier and
++        // ack before LoadSessionResponse. Keep this ordering contract.
+         for rx in delta_completions {
+             let _ = rx.await;
+         }
+@@ -1126,9 +1134,9 @@ impl MvpAgent {
+             let _timer = crate::instrumentation_timer!("session.reconcile_stale_tasks");
+             self.reconcile_stale_background_tasks(&session_id, &updates_file_path)
+         };
+-        for rx in reconcile_completions {
+-            let _ = rx.await;
+-        }
++        // Do not await reconcile receivers here. `x.ai/task_completed` is not
++        // load-barrier ReplayHead; headless withholds ack until load finishes.
++        super::replay::defer_load_completion_drain(reconcile_completions, "stale_task_reconcile");
+         Ok((initial_total_tokens, unfinished_subagents))
+     }
+     /// Reconnect phase: re-apply per-client capability and permission state
+@@ -1486,3 +1494,148 @@ pub(super) fn load_request_for_resume(args: acp::ResumeSessionRequest) -> acp::L
+         .mcp_servers(mcp_servers)
+         .meta(meta.unwrap_or_default())
+ }
++
++#[cfg(test)]
++mod stale_reconcile_gate_tests {
++    use super::super::MvpAgent;
++    use super::ReplayRouting;
++    use std::time::Duration;
++
++    use agent_client_protocol as acp;
++    use xai_acp_lib::{AcpAgentGatewaySender as GatewaySender, AcpClientMessage};
++    use xai_grok_paths::AbsPathBuf;
++
++    /// Cold / `noReplay` load gate with a stale background task: the client
++    /// withholds `x.ai/task_completed` ack until after the gate returns (stands
++    /// in for LoadSessionResponse). Prove the gate returns without deadlock,
++    /// the notification was already enqueued, and the deferred drain completes
++    /// once the client acks.
++    #[tokio::test(flavor = "current_thread")]
++    async fn cold_noreplay_stale_task_gate_returns_before_task_completed_ack() {
++        let local = tokio::task::LocalSet::new();
++        local
++            .run_until(async {
++                let (agent, mut gw_rx) = build_agent_with_gateway();
++                let dir = tempfile::tempdir().unwrap();
++                let updates = dir.path().join("updates.jsonl");
++                std::fs::write(
++                    &updates,
++                    r#"{"timestamp":1,"method":"_x.ai/session/update","params":{"sessionId":"s-stale-cold","update":{"sessionUpdate":"task_backgrounded","task_id":"bg-stale-1","command":"sleep 999","cwd":"/tmp"}}}
++"#,
++                )
++                .unwrap();
++
++                let session_id = acp::SessionId::new("s-stale-cold");
++                let cwd = AbsPathBuf::new(std::path::PathBuf::from("/tmp")).unwrap();
++                let updates_file_path = Some(updates);
++
++                // Run the load-gate critical path while deliberately not acking
++                // any gateway messages (headless withholds until LoadSessionResponse).
++                let gate = agent.replay_transcript_gate(
++                    &session_id,
++                    &cwd,
++                    &updates_file_path,
++                    ReplayRouting {
++                        persist_data: None,
++                        target_client_id: None,
++                        cursor: None,
++                    },
++                    /*no_replay*/ true,
++                );
++                let gate_result = tokio::time::timeout(Duration::from_secs(2), gate)
++                    .await
++                    .expect(
++                        "replay_transcript_gate deadlocked awaiting task_completed ack \
++                         before LoadSessionResponse (cold/noReplay stale reconcile)",
++                    )
++                    .expect("gate should succeed");
++                assert_eq!(gate_result.1.len(), 0, "no unfinished subagents expected");
++
++                // Notification must already be enqueued for the client.
++                let mut held_acks = Vec::new();
++                let mut saw_task_completed = false;
++                while let Ok(msg) = gw_rx.try_recv() {
++                    if let AcpClientMessage::ExtNotification(args) = msg {
++                        let method = args.request.method.as_ref();
++                        let params = args.request.params.get();
++                        if method == "x.ai/task_completed" || params.contains("task_completed") {
++                            saw_task_completed = true;
++                            assert!(
++                                params.contains("bg-stale-1") || params.contains("session_restart"),
++                                "stale reconcile payload missing task id / signal: {params}"
++                            );
++                        }
++                        held_acks.push(args.response_tx);
++                    }
++                }
++                assert!(
++                    saw_task_completed,
++                    "stale reconcile must still emit x.ai/task_completed (not suppress it)"
++                );
++
++                // Client acks only after the "load response" (gate return).
++                for tx in held_acks {
++                    let _ = tx.send(Ok(()));
++                }
++                // Let the deferred drain task observe the acks.
++                for _ in 0..8 {
++                    tokio::task::yield_now().await;
++                }
++            })
++            .await;
++    }
++
++    /// Full-replay path still drains delta completions on the critical path
++    /// (ordering contract). With no deltas and no orphans, the gate is a no-op.
++    #[tokio::test(flavor = "current_thread")]
++    async fn replay_gate_empty_updates_no_completions_returns() {
++        let local = tokio::task::LocalSet::new();
++        local
++            .run_until(async {
++                let (agent, mut gw_rx) = build_agent_with_gateway();
++                let dir = tempfile::tempdir().unwrap();
++                let updates = dir.path().join("updates.jsonl");
++                std::fs::write(&updates, "").unwrap();
++                let session_id = acp::SessionId::new("s-empty");
++                let cwd = AbsPathBuf::new(std::path::PathBuf::from("/tmp")).unwrap();
++                let result = agent
++                    .replay_transcript_gate(
++                        &session_id,
++                        &cwd,
++                        &Some(updates),
++                        ReplayRouting {
++                            persist_data: None,
++                            target_client_id: None,
++                            cursor: None,
++                        },
++                        /*no_replay*/ false,
++                    )
++                    .await
++                    .expect("empty replay");
++                assert_eq!(result.0, 0);
++                assert!(gw_rx.try_recv().is_err(), "no notifications for empty file");
++            })
++            .await;
++    }
++
++    fn build_agent_with_gateway() -> (
++        MvpAgent,
++        tokio::sync::mpsc::UnboundedReceiver<AcpClientMessage>,
++    ) {
++        use crate::agent::config::Config as AgentConfig;
++        use crate::auth::{AuthManager, GrokComConfig};
++
++        let temp_dir = tempfile::tempdir().unwrap();
++        let auth_manager =
++            std::sync::Arc::new(AuthManager::new(temp_dir.path(), GrokComConfig::default()));
++        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
++        let agent = MvpAgent::new(
++            GatewaySender::new(tx),
++            &AgentConfig::default(),
++            auth_manager,
++            None,
++        )
++        .expect("valid test config");
++        (agent, rx)
++    }
++}
 diff --git a/crates/codegen/xai-grok-shell/src/config/mod.rs b/crates/codegen/xai-grok-shell/src/config/mod.rs
 index 94b838d..c75d0c1 100644
 --- a/crates/codegen/xai-grok-shell/src/config/mod.rs

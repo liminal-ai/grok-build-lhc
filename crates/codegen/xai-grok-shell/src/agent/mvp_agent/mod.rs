@@ -1488,8 +1488,11 @@ impl MvpAgent {
     }
     /// Emit `task_completed` for background tasks that were replayed as
     /// "Running" but whose processes no longer exist (cold session load).
-    /// Returns completion receivers so the caller can drain them before
-    /// returning LoadSessionResponse.
+    /// Returns completion receivers the load gate must own (never drop): drain
+    /// them **after** `LoadSessionResponse` can return — see
+    /// [`replay::defer_load_completion_drain`]. Awaiting them on the pre-actor
+    /// critical path deadlocks cold / `noReplay` clients that withhold acks
+    /// until load finishes.
     pub(super) fn reconcile_stale_background_tasks(
         &self,
         session_id: &acp::SessionId,

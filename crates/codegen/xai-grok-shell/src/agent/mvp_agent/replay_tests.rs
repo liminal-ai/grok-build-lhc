@@ -203,6 +203,49 @@ async fn a_stale_task_completion_is_frame_bounded() {
     assert!(params.contains("session_restart"));
 }
 
+/// Receivers from stale reconcile must be owned by a deferred drain, not
+/// dropped at the emit site — dropping would lose delivery observability and
+/// cancel the oneshot before the client can ack.
+#[tokio::test(flavor = "current_thread")]
+async fn stale_reconcile_receivers_survive_until_deferred_ack() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (agent, mut rx) = build_agent_with_gateway();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("updates.jsonl");
+            std::fs::write(
+                &path,
+                r#"{"timestamp":1,"method":"_x.ai/session/update","params":{"sessionId":"s","update":{"sessionUpdate":"task_backgrounded","task_id":"own-1","command":"true","cwd":"/tmp"}}}
+"#,
+            )
+            .unwrap();
+
+            let completions =
+                agent.reconcile_stale_background_tasks(&acp::SessionId::new("s"), &Some(path));
+            assert_eq!(completions.len(), 1, "one orphan must emit one completion");
+
+            // Enqueued on the gateway before any drain.
+            let msg = rx.try_recv().expect("task_completed enqueued");
+            let AcpClientMessage::ExtNotification(args) = msg else {
+                panic!("expected ExtNotification, got {msg:?}");
+            };
+            assert!(
+                args.request.params.get().contains("own-1")
+                    || args.request.method.as_ref() == "x.ai/task_completed"
+            );
+
+            super::replay::defer_load_completion_drain(completions, "test_ownership");
+            // Still no ack — load response can proceed while receiver is held.
+            tokio::task::yield_now().await;
+            args.response_tx.send(Ok(())).unwrap();
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+}
+
 fn build_agent_with_gateway() -> (
     MvpAgent,
     tokio::sync::mpsc::UnboundedReceiver<AcpClientMessage>,
