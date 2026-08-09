@@ -16,8 +16,8 @@
 > - [**Install & use**](lhc-docs/INSTALL.md) — build and run
 > - [**LHC project**](https://github.com/liminal-ai/long-horizon-context) — the shared engine
 >
-> No prebuilt fork releases yet — use this source tree. Official `grok`
-> installers do **not** include LHC.
+> Releases: [GitHub Releases](https://github.com/liminal-ai/grok-build-lhc/releases)
+> (tag `v*`). Official `curl \| x.ai/cli` installers do **not** include LHC.
 >
 > Everything below is upstream's README.
 

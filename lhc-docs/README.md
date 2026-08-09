@@ -60,7 +60,7 @@ Deeper design (bands, archive vs view, ethics of not erasing history): LHC
 |---|---|
 | **`lhc`** (default) | Product: Grok + LHC |
 | **`main`** | Upstream mirror only |
-| **Releases** | No prebuilt fork binaries yet — [build from source](INSTALL.md). Fork releases may come later. |
+| **Releases** | [GitHub Releases](https://github.com/liminal-ai/grok-build-lhc/releases) via tag `v*` / Actions (see [Install](INSTALL.md)). |
 
 ## Where to go next
 

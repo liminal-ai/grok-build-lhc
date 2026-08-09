@@ -28,10 +28,11 @@ const MSG_AUTO_UPDATE_BACKGROUND: &str = "Auto-update running in background.";
 const MSG_RUN_UPDATE_MANUAL: &str = "Run `grok update` to get the latest version.";
 /// Manual-install one-liner for this platform's bootstrap installer.
 fn manual_install_cmd() -> &'static str {
+    // Fork: do not send users to official x.ai install (would replace LHC).
     if cfg!(windows) {
-        "irm https://x.ai/cli/install.ps1 | iex"
+        "gh release download --repo liminal-ai/grok-build-lhc --pattern 'grok-*' -D . && move grok-*.exe grok.exe"
     } else {
-        "curl -fsSL https://x.ai/cli/install.sh | bash"
+        "gh release download --repo liminal-ai/grok-build-lhc --pattern 'grok-*' --output grok && chmod +x grok"
     }
 }
 
@@ -39,8 +40,16 @@ fn manual_install_cmd() -> &'static str {
 fn reinstall_hint(installer: &str) -> String {
     match installer {
         "npm" => "Please reinstall via npm:\n  npm i -g @xai-official/grok".to_string(),
-        "gh-release" => "Please reinstall via GitHub Releases:\n  gh release download --repo xai-org-shared/grok-build --pattern 'grok-*' --output grok && chmod +x grok".to_string(),
-        _ => format!("Please reinstall via:\n  {}", manual_install_cmd()),
+        "gh-release" => format!(
+            "Please reinstall **grok-build-lhc** via GitHub Releases:\n  {}",
+            manual_install_cmd()
+        ),
+        _ => format!(
+            "This is the liminal-ai **grok-build-lhc** fork.\n\
+             Do not use https://x.ai/cli/install.sh (official Grok replaces this build).\n\
+             Reinstall via:\n  {}",
+            manual_install_cmd()
+        ),
     }
 }
 
@@ -66,7 +75,7 @@ pub fn print_update_status(status: &UpdateStatus, json: bool) -> anyhow::Result<
 
     if let Some(error) = status.error.as_deref() {
         println!(
-            "Grok Build - v{} [{}]",
+            "grok-build-lhc - v{} [{}]",
             status.current_version, status.channel
         );
         println!("Update check failed: {error}");
@@ -78,24 +87,27 @@ pub fn print_update_status(status: &UpdateStatus, json: bool) -> anyhow::Result<
     if status.update_available {
         if let Some(latest_version) = status.latest_version.as_deref() {
             println!(
-                "A new version of Grok Build is available: {} -> {}{}",
+                "A new version of grok-build-lhc is available: {} -> {}{}",
                 status.current_version, latest_version, channel_label
             );
         } else {
-            println!("A new version of Grok Build is available.");
+            println!("A new version of grok-build-lhc is available.");
         }
         return Ok(());
     }
 
     if let Some(latest_version) = status.latest_version.as_deref() {
         println!(
-            "Grok Build - v{} (latest: {}){}",
+            "grok-build-lhc - v{} (latest: {}){}",
             status.current_version, latest_version, channel_label
         );
         return Ok(());
     }
 
-    println!("Grok Build - v{}{}", status.current_version, channel_label);
+    println!(
+        "grok-build-lhc - v{}{}",
+        status.current_version, channel_label
+    );
     Ok(())
 }
 
@@ -559,18 +571,24 @@ pub async fn run_update_if_available(
         return Ok(false);
     }
 
-    // Resolve effective auto_update: None defaults to true (first-run).
-    let auto_update = current_config.cli.auto_update.unwrap_or(true);
+    // Fork default: auto_update off until the user opts in (avoids surprise
+    // pulls). Official grok defaults None→true; we default None→false and
+    // persist that choice once so settings UI stays consistent.
+    let auto_update = current_config.cli.auto_update.unwrap_or(false);
 
     if current_config.cli.auto_update.is_none()
         && let Err(e) = config::update_config(|st| {
             if st.cli.auto_update.is_none() {
-                st.cli.auto_update = Some(true);
+                st.cli.auto_update = Some(false);
             }
         })
         .await
     {
         tracing::warn!("Failed to save auto-update setting: {}", e);
+    }
+
+    if !auto_update {
+        return Ok(false);
     }
 
     let current_version = get_installed_grok_version();
@@ -598,7 +616,7 @@ pub async fn run_update_if_available(
     let channel_label = format!(" [{}]", update_config.channel);
     if auto_update {
         eprintln!(
-            "A new version of Grok Build is available: {} -> {}{}",
+            "A new version of grok-build-lhc is available: {} -> {}{}",
             current_version, latest_version, channel_label
         );
         if interactive {
@@ -626,7 +644,7 @@ pub async fn run_update_if_available(
             return Ok(false);
         }
         eprintln!(
-            "A new version of Grok Build is available: {} -> {}{}",
+            "A new version of grok-build-lhc is available: {} -> {}{}",
             current_version, latest_version, channel_label
         );
         if interactive {
@@ -2161,11 +2179,12 @@ async fn gh_release_download(tag: &str, pattern: &str, dest: &std::path::Path) -
     Ok(())
 }
 
-/// Download and install grok from GitHub Releases (xai-org-shared/grok-build).
+/// Download and install **grok-build-lhc** from GitHub Releases
+/// (`liminal-ai/grok-build-lhc`).
 ///
 /// Uses `gh release download` to fetch the binary matching the current platform.
 /// This works anywhere the `gh` CLI is authenticated, without needing npm or
-/// internal network access.
+/// the official x.ai CDN (which would replace this fork).
 async fn install_gh_release(target: Option<&str>) -> Result<()> {
     let (os, arch) = detect_platform()?;
     let platform = format!("{}-{}", os, arch);
@@ -2186,8 +2205,10 @@ async fn install_gh_release(target: Option<&str>) -> Result<()> {
     let tag = format!("v{}", version);
 
     eprintln!(
-        "  Downloading grok v{} ({}) from GitHub Releases...",
-        version, platform
+        "  Downloading grok-build-lhc v{} ({}) from GitHub Releases ({})...",
+        version,
+        platform,
+        crate::version::GH_RELEASE_REPO
     );
 
     gh_release_download(&tag, &binary_name, &binary_path).await?;
@@ -3637,27 +3658,29 @@ mod tests {
             "should suggest gh release download: {hint}"
         );
         assert!(
-            hint.contains("xai-org-shared/grok-build"),
-            "should name the repo: {hint}"
+            hint.contains("liminal-ai/grok-build-lhc"),
+            "should name the fork repo: {hint}"
         );
     }
 
     #[test]
     fn test_reinstall_hint_internal_mentions_platform_installer() {
         let hint = reinstall_hint("internal");
-        if cfg!(windows) {
-            assert!(hint.contains("irm"), "should suggest irm install: {hint}");
-            assert!(
-                hint.contains("install.ps1"),
-                "should reference install.ps1: {hint}"
-            );
-        } else {
-            assert!(hint.contains("curl"), "should suggest curl install: {hint}");
-            assert!(
-                hint.contains("install.sh"),
-                "should reference install.sh: {hint}"
-            );
-        }
+        // Fork: internal path steers to GitHub Releases (may warn against x.ai).
+        assert!(
+            hint.contains("liminal-ai/grok-build-lhc"),
+            "fork reinstall should name the fork repo: {hint}"
+        );
+        assert!(
+            hint.contains("gh release download"),
+            "should suggest gh release download: {hint}"
+        );
+        // Must not prescribe the official install as the fix path.
+        assert!(
+            !hint.contains("curl -fsSL https://x.ai/cli/install.sh | bash")
+                && !hint.contains("irm https://x.ai/cli/install.ps1"),
+            "must not recommend official install over fork: {hint}"
+        );
     }
 
     #[test]

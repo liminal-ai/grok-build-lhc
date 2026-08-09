@@ -390,9 +390,24 @@ Chunk 1 means the first real upstream sync already has a proven fallback.)
 
 ## Never run
 
-- `grok upgrade` / any self-update: this is a source checkout; self-update
-  would clobber the tree.
+- Official `curl | https://x.ai/cli/install.sh` (or install.ps1) on a machine
+  where this fork is installed as `grok` — it replaces the binary with stock
+  xAI Grok. Fork updates go through **GitHub Releases** on
+  `liminal-ai/grok-build-lhc` (`grok update` / gh-release installer).
+- `grok upgrade` against xAI channels from a **source checkout** can still
+  clobber a dev tree; prefer git pull / rebuild for development.
 - `git merge` after a suspected history reset (see drill above).
+
+## Releases
+
+- Workflow: [`.github/workflows/release.yml`](.github/workflows/release.yml)
+- Trigger: push tag `vX.Y.Z` or workflow_dispatch
+- Assets: `grok-{ver}-linux-x86_64`, `grok-{ver}-macos-aarch64`,
+  `grok-{ver}-windows-x86_64.exe` (+ SHA256SUMS)
+- Runners: Blacksmith (`blacksmith-32vcpu-ubuntu-2404`,
+  `blacksmith-12vcpu-macos-26`, `blacksmith-32vcpu-windows-2025`)
+- Updater: `GH_RELEASE_REPO = liminal-ai/grok-build-lhc`; UI says
+  **grok-build-lhc**. Auto-update defaults **off** until the user opts in.
 
 ## Host obligations toward LHC (from the port's acceptance record)
 

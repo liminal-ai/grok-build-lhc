@@ -37,13 +37,44 @@ cargo install dotslash   # if needed
 rustup show              # confirm toolchain
 ```
 
-## 3. Build
+## 3. Install from GitHub Releases (preferred)
+
+When a release exists on
+[liminal-ai/grok-build-lhc releases](https://github.com/liminal-ai/grok-build-lhc/releases):
+
+```bash
+# Linux x86_64 example — asset names: grok-{version}-{os}-{arch}
+VERSION=0.1.0   # set to the release you want
+gh release download "v${VERSION}" --repo liminal-ai/grok-build-lhc \
+  --pattern "grok-${VERSION}-linux-x86_64" --output grok
+chmod +x grok
+sudo mv grok /usr/local/bin/grok   # or ~/.local/bin/grok
+```
+
+| Platform | Asset pattern |
+|---|---|
+| Linux x86_64 | `grok-*-linux-x86_64` |
+| macOS Apple Silicon | `grok-*-macos-aarch64` |
+| Windows x86_64 | `grok-*-windows-x86_64.exe` |
+
+Installs as **`grok`**. This is the **liminal-ai LHC fork**, not official xAI.
+Do **not** update with `curl \| https://x.ai/cli/install.sh` — that replaces
+the fork with stock Grok.
+
+After install, `grok update` (when you enable auto-update or run it manually)
+pulls from **this repo’s** GitHub Releases and prints **grok-build-lhc**.
+
+Cut a release: push tag `vX.Y.Z` on `lhc`, or Actions → **Release** →
+workflow_dispatch. CI builds on Blacksmith (Linux/macOS/Windows).
+
+## 4. Build from source
 
 From the repo root:
 
 ```bash
 cargo build -p xai-grok-pager-bin --release
-# binary: target/release/xai-grok-pager  (name may match upstream packaging)
+# binary: target/release/xai-grok-pager
+cp target/release/xai-grok-pager ~/.local/bin/grok   # optional
 ```
 
 Faster check:
@@ -56,18 +87,15 @@ cargo check -p grok-lhc-host
 There is no separate cargo feature flag for LHC — the adapter is a normal
 workspace member.
 
-## 4. Run
-
-Launch the TUI the same way you would from a source build of Grok Build:
+## 5. Run
 
 ```bash
-cargo run -p xai-grok-pager-bin
-# or run the release binary you built
+grok
+# or: cargo run -p xai-grok-pager-bin
 ```
 
-**LHC is on by default** in this fork. You do not need `GROK_LHC=1` for
-normal use. Storage defaults to `~/.lhc` (override with `GROK_LHC_ROOT` or
-`[lhc].root`).
+**LHC is on by default** in this fork. Storage defaults to `~/.lhc`
+(override with `GROK_LHC_ROOT` or `[lhc].root`).
 
 In a session:
 
@@ -81,7 +109,7 @@ In a session:
 History retrieval tools (`get_turns` / `get_messages`) are available while
 capture is active so the agent can refresh low-fidelity spans from the archive.
 
-## 5. Disable (troubleshooting only)
+## 6. Disable (troubleshooting only)
 
 If you need to rule LHC out of a bug:
 
@@ -95,7 +123,7 @@ export GROK_LHC=0
 Then restart the process. For a clean side-by-side against stock Grok, use
 **upstream** binaries/builds—not this fork with the gate flipped.
 
-## 6. Optional config
+## 7. Optional config
 
 ```toml
 [lhc]
@@ -118,7 +146,7 @@ export GROK_LHC_COMPACT_EXPERIMENTAL=1
 Do not arm replace casually on a session you cannot afford to rewrite. See
 `FORK.md` (Gating) and `crates/lhc/grok-lhc-host/MAPPING.md`.
 
-## 7. Verify the fork is intact
+## 8. Verify the fork is intact
 
 ```bash
 ./scripts/check-lhc-hooks.sh

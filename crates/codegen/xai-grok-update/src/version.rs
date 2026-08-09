@@ -11,7 +11,10 @@ use xai_grok_shell::util::grok_home::grok_home;
 
 const TTL_SECONDS_BEFORE_AUTO_UPDATE: Duration = Duration::from_secs(60 * 30);
 const NPM_PACKAGE: &str = "@xai-official/grok";
-pub const GH_RELEASE_REPO: &str = "xai-org-shared/grok-build";
+/// GitHub repo used by the `gh-release` installer path.
+///
+/// This fork publishes to liminal-ai/grok-build-lhc (not xAI's CDN/repo).
+pub const GH_RELEASE_REPO: &str = "liminal-ai/grok-build-lhc";
 
 /// Primary CLI base URL: Cloudflare-fronted x.ai endpoint with edge caching
 /// for binaries and origin-respecting no-cache for channel pointers.

@@ -1,0 +1,230 @@
+# Build multi-platform binaries and publish a GitHub Release for grok-build-lhc.
+#
+# Triggers:
+#   - push of tags matching v* (e.g. v0.1.0)
+#   - workflow_dispatch with version input (e.g. 0.1.0)
+#
+# Assets match the gh-release installer layout in xai-grok-update:
+#   grok-{version}-{os}-{arch}[.exe]
+#   e.g. grok-0.1.0-linux-x86_64
+#
+# Linux/macOS/Windows use Blacksmith runners (liminal-ai labels).
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without v prefix (e.g. 0.1.0)"
+        required: true
+        type: string
+      dry_run:
+        description: "Build only; skip creating the GitHub Release"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  prep:
+    name: Resolve version
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+      dry_run: ${{ steps.ver.outputs.dry_run }}
+    steps:
+      - id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            V="${{ inputs.version }}"
+            V="${V#v}"
+            DRY="${{ inputs.dry_run }}"
+          else
+            REF="${GITHUB_REF_NAME}"
+            V="${REF#v}"
+            DRY="false"
+          fi
+          if [[ ! "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-].*)?$ ]]; then
+            echo "Invalid version: $V (want X.Y.Z or X.Y.Z-suffix)" >&2
+            exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "tag=v$V" >> "$GITHUB_OUTPUT"
+          echo "dry_run=$DRY" >> "$GITHUB_OUTPUT"
+          echo "Resolved version=$V tag=v$V dry_run=$DRY"
+
+  build:
+    name: Build ${{ matrix.label }}
+    needs: prep
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            runner: blacksmith-32vcpu-ubuntu-2404
+            os: linux
+            arch: x86_64
+            ext: ""
+          - label: macos-aarch64
+            runner: blacksmith-12vcpu-macos-26
+            os: macos
+            arch: aarch64
+            ext: ""
+          - label: windows-x86_64
+            runner: blacksmith-32vcpu-windows-2025
+            os: windows
+            arch: x86_64
+            ext: ".exe"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.0"
+
+      - name: Install DotSlash
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install dotslash --locked
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          command -v dotslash
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.label }}
+          workspaces: "."
+
+      - name: Build release binary
+        shell: bash
+        env:
+          GROK_VERSION: ${{ needs.prep.outputs.version }}
+          PATH: ${{ env.PATH }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo build -p xai-grok-pager-bin --release
+          BIN="target/release/xai-grok-pager${{ matrix.ext }}"
+          test -f "$BIN"
+          # Asset name matches xai-grok-update gh-release installer:
+          #   grok-{version}-{os}-{arch}[.exe]
+          OUT="grok-${{ needs.prep.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}"
+          cp "$BIN" "$OUT"
+          if [ "${{ runner.os }}" != "Windows" ]; then
+            chmod +x "$OUT"
+          fi
+          ls -la "$OUT"
+          "./$OUT" --version 2>/dev/null || "./$OUT" -V 2>/dev/null || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: grok-${{ matrix.label }}
+          path: grok-${{ needs.prep.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub Release
+    needs: [prep, build]
+    if: needs.prep.outputs.dry_run != 'true'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - name: Checkout (for notes)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums + release notes
+        shell: bash
+        env:
+          VERSION: ${{ needs.prep.outputs.version }}
+          TAG: ${{ needs.prep.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -la
+          sha256sum grok-* > SHA256SUMS
+          cat SHA256SUMS
+          UPSTREAM_REV=$(cat ../SOURCE_REV 2>/dev/null || echo unknown)
+          LHC_PIN=$(git -C ../crates/lhc/vendor/long-horizon-context rev-parse --short HEAD 2>/dev/null || echo unknown)
+          {
+            echo "## grok-build-lhc ${TAG}"
+            echo
+            echo "Grok Build fork with **LHC** long-horizon context (liminal-ai)."
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **Fork version** | \`${VERSION}\` |"
+            echo "| **Upstream SOURCE_REV** | \`${UPSTREAM_REV}\` |"
+            echo "| **LHC submodule** | \`${LHC_PIN}\` |"
+            echo
+            echo "### Install"
+            echo
+            echo "Assets are named for the built-in \`gh-release\` updater:"
+            echo "\`grok-${VERSION}-{linux,macos,windows}-{x86_64,aarch64}\`."
+            echo
+            echo "Manual (Linux x86_64 example):"
+            echo
+            echo '```bash'
+            echo "gh release download ${TAG} --repo liminal-ai/grok-build-lhc \\"
+            echo "  --pattern 'grok-${VERSION}-linux-x86_64' --output grok"
+            echo "chmod +x grok && sudo mv grok /usr/local/bin/grok"
+            echo '```'
+            echo
+            echo "Or place the binary on your PATH as \`grok\`. First run may set"
+            echo "\`[cli] installer = \"gh-release\"\` after \`grok update\`."
+            echo
+            echo "This is **not** an official xAI release. Do not use"
+            echo "\`curl | https://x.ai/cli/install.sh\` to update this install."
+            echo
+            echo "### Checksums"
+            echo
+            echo '```'
+            cat SHA256SUMS
+            echo '```'
+          } > ../RELEASE_NOTES.md
+          cat ../RELEASE_NOTES.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prep.outputs.tag }}
+          name: grok-build-lhc ${{ needs.prep.outputs.tag }}
+          body_path: RELEASE_NOTES.md
+          files: |
+            dist/grok-*
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
