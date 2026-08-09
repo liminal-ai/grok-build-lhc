@@ -10,45 +10,91 @@ index 95549a5..987f8ac 100644
      "prod/mc/cli-chat-proxy-types",
      "third_party/dagre_rust",
      "third_party/graphlib_rust",
+diff --git a/crates/codegen/xai-chat-state/src/actor/mod.rs b/crates/codegen/xai-chat-state/src/actor/mod.rs
+index 1c6cf26..1d37c7d 100644
+--- a/crates/codegen/xai-chat-state/src/actor/mod.rs
++++ b/crates/codegen/xai-chat-state/src/actor/mod.rs
+@@ -183,6 +183,9 @@ impl ChatStateActor {
+             } => {
+                 self.record_model_call_usage(model_id, &usage, api_duration_ms, cost_usd_ticks);
+             }
++            ChatStateCommand::RecordResponseIdentity { model_id } => {
++                self.record_response_identity(model_id);
++            }
+             ChatStateCommand::RecordSubagentUsage {
+                 by_model,
+                 attribute_to_prompt,
 diff --git a/crates/codegen/xai-chat-state/src/actor/mutations.rs b/crates/codegen/xai-chat-state/src/actor/mutations.rs
-index 030ede8..d41709a 100644
+index 030ede8..fcd2ea4 100644
 --- a/crates/codegen/xai-chat-state/src/actor/mutations.rs
 +++ b/crates/codegen/xai-chat-state/src/actor/mutations.rs
-@@ -154,7 +154,15 @@ impl ChatStateActor {
+@@ -154,7 +154,25 @@ impl ChatStateActor {
                  "ChatState: push_message updated estimated_tokens_since_model"
              );
          }
 -        self.persistence.persist_message(&item);
-+        // Consume pending model-call usage once on next Assistant persist
-+        // (paired with the hook-8 stash in record_model_call_usage).
++        // Consume pending usage once on Assistant; share identity with
++        // preceding Reasoning siblings (clone), take on trailing Assistant
++        // (paired with the hook-8 stash in record_model_call_usage /
++        // record_response_identity).
 +        let provider_usage = if matches!(item, ConversationItem::Assistant(_)) {
 +            self.state.pending_model_call_usage.take()
 +        } else {
 +            None
 +        };
-+        self.persistence
-+            .persist_message_with_provider_usage(&item, provider_usage.as_ref());
++        let identity = match &item {
++            ConversationItem::Assistant(_) => self.state.pending_assistant_identity.take(),
++            ConversationItem::Reasoning(_) => self.state.pending_assistant_identity.clone(),
++            _ => None,
++        };
++        self.persistence.persist_message_with_provider_usage(
++            &item,
++            provider_usage.as_ref(),
++            identity.as_ref(),
++        );
          self.state.conversation.push(item);
      }
  
-@@ -375,6 +383,8 @@ impl ChatStateActor {
+@@ -375,6 +393,29 @@ impl ChatStateActor {
              api_duration_ms,
              cost_usd_ticks,
          );
-+        // LHC-HOOK 8/10: stash for the next Assistant → LHC assistant_text.providerUsage
++        // LHC-HOOK 8/10: stash usage + identity; share identity with Reasoning;
++        // consume both on Assistant (schema v5 / D3 + Wave B)
 +        self.state.pending_model_call_usage = Some(usage.clone());
++    }
++
++    /// Stash host-observed identity for the current model response (Wave B).
++    ///
++    /// Called **before** response items are pushed, independent of token usage.
++    /// `model_id` is the resolved response model when present — never filled
++    /// from current config. API is the actor's live `sampling_config.api_backend`
++    /// at this response boundary (the backend that produced the response).
++    /// Stash site pairs with the hook-8 marker on `record_model_call_usage`
++    /// (same side-channel family).
++    pub(super) fn record_response_identity(&mut self, model_id: Option<String>) {
++        let model = model_id.filter(|m| !m.is_empty());
++        let api = Some(
++            crate::api_backend_label(self.state.sampling_config.api_backend.clone()).to_string(),
++        );
++        self.state.pending_assistant_identity = Some(crate::HostAssistantIdentity {
++            provider: crate::HostAssistantIdentity::PROVIDER_XAI.to_string(),
++            model,
++            api,
++        });
      }
  
      pub(super) fn record_subagent_usage(
 diff --git a/crates/codegen/xai-chat-state/src/actor/state.rs b/crates/codegen/xai-chat-state/src/actor/state.rs
-index cde5e59..99fd0e2 100644
+index cde5e59..d5cf597 100644
 --- a/crates/codegen/xai-chat-state/src/actor/state.rs
 +++ b/crates/codegen/xai-chat-state/src/actor/state.rs
-@@ -153,6 +153,14 @@ pub(crate) struct ChatState {
+@@ -153,6 +153,22 @@ pub(crate) struct ChatState {
      /// persist last_turn_usage). Always overwritten by the most recent turn —
      /// historical turns are not retained here.
      pub last_turn_usage: Option<TokenUsage>,
-+    // LHC-HOOK 7/10: last model-call TokenUsage for assistant_text.providerUsage (schema v5 / D3)
++    // LHC-HOOK 7/10: pending model-call TokenUsage + assistant identity for LHC
++    // assistant_text / assistant_thinking (schema v5 / D3 + Wave B identity)
 +    /// Pending per-model-call usage for the next `Assistant` persist.
 +    ///
 +    /// Set by `record_model_call_usage` (FIFO before `PushAssistantResponse` on
@@ -56,22 +102,30 @@ index cde5e59..99fd0e2 100644
 +    /// persisted — a second `Assistant` without an intervening record gets
 +    /// `None`. Not persisted across restore/snapshot; LHC-only side channel.
 +    pub pending_model_call_usage: Option<TokenUsage>,
++    /// Pending host-observed identity for the current model response.
++    ///
++    /// Stamped by `record_response_identity` **before** response items are
++    /// pushed (usage-independent). Cloned onto each preceding `Reasoning`
++    /// persist; taken once on the trailing `Assistant` so identity cannot
++    /// leak to the next response. Bootstrap/replace never invents this.
++    pub pending_assistant_identity: Option<crate::HostAssistantIdentity>,
      /// Billing for the open prompt (cleared on next prompt; not persisted).
      pub prompt_usage: Option<UsageLedger>,
      /// Lifetime session billing (not persisted).
-@@ -240,6 +248,7 @@ impl ChatState {
+@@ -240,6 +256,8 @@ impl ChatState {
              estimated_tokens_since_model: 0,
              estimate_at_last_response: initial_tokens,
              last_turn_usage: None,
 +            pending_model_call_usage: None,
++            pending_assistant_identity: None,
              prompt_usage: None,
              session_usage: UsageLedger::default(),
              turn_capture: None,
 diff --git a/crates/codegen/xai-chat-state/src/actor/tests.rs b/crates/codegen/xai-chat-state/src/actor/tests.rs
-index c3eada8..c671674 100644
+index c3eada8..44f95e0 100644
 --- a/crates/codegen/xai-chat-state/src/actor/tests.rs
 +++ b/crates/codegen/xai-chat-state/src/actor/tests.rs
-@@ -453,6 +453,66 @@ async fn record_token_usage_emits_event() {
+@@ -453,6 +453,182 @@ async fn record_token_usage_emits_event() {
      assert_eq!(tokens, 1000);
  }
  
@@ -88,6 +142,7 @@ index c3eada8..c671674 100644
 +        total_tokens: 120,
 +        reasoning_tokens: 5,
 +        cached_prompt_tokens: 40,
++        cache_creation_prompt_tokens: 0,
 +    };
 +
 +    h.handle
@@ -109,6 +164,10 @@ index c3eada8..c671674 100644
 +            r,
 +            PersistenceRecord::Message(ConversationItem::Assistant(_))
 +                | PersistenceRecord::MessageWithProviderUsage(ConversationItem::Assistant(_), _)
++                | PersistenceRecord::MessageWithCaptureFacts {
++                    item: ConversationItem::Assistant(_),
++                    ..
++                }
 +        )
 +    });
 +
@@ -135,65 +194,286 @@ index c3eada8..c671674 100644
 +    assert!(assistant_records.next().is_none());
 +}
 +
++/// Wave B: reasoning + trailing Assistant share the same identity even without
++/// provider usage; identity does not leak to the next response.
++#[tokio::test]
++async fn pending_identity_shared_with_reasoning_and_consumed_on_assistant() {
++    use crate::HostAssistantIdentity;
++    use xai_grok_sampling_types::{ApiBackend, ConversationItem, synthesized_reasoning_item};
++
++    let mut h = TestHarness::new();
++    // Stamp a responses backend so identity.api is observable.
++    let mut cfg = h.handle.get_sampling_config().await.unwrap();
++    cfg.api_backend = ApiBackend::Responses;
++    h.handle.update_sampling_config(cfg);
++    let _ = h.handle.get_conversation().await;
++
++    h.handle.record_response_identity(Some("grok-4".into()));
++    let _ = h.handle.get_conversation().await;
++
++    h.handle
++        .push_tool_result(ConversationItem::Reasoning(synthesized_reasoning_item(
++            "plan",
++        )));
++    let _ = h.handle.get_conversation().await;
++    h.handle
++        .push_assistant_response(ConversationItem::assistant("answer"));
++    let _ = h.handle.get_conversation().await;
++
++    // Second response without a new identity stamp must not inherit.
++    h.handle
++        .push_assistant_response(ConversationItem::assistant("next"));
++    let _ = h.handle.get_conversation().await;
++
++    let records = h.persistence_rx.drain();
++    let expected = HostAssistantIdentity {
++        provider: "xai".into(),
++        model: Some("grok-4".into()),
++        api: Some("responses".into()),
++    };
++
++    let mut with_id = records.into_iter().filter_map(|r| match r {
++        PersistenceRecord::MessageWithCaptureFacts {
++            item,
++            identity: Some(id),
++            ..
++        } => Some((item, id)),
++        _ => None,
++    });
++
++    let (r_item, r_id) = with_id.next().expect("reasoning carries identity");
++    assert!(matches!(r_item, ConversationItem::Reasoning(_)));
++    assert_eq!(r_id, expected);
++
++    let (a_item, a_id) = with_id.next().expect("assistant carries same identity");
++    assert_eq!(a_item.text_content(), "answer");
++    assert_eq!(a_id, expected);
++
++    assert!(
++        with_id.next().is_none(),
++        "identity must not leak to the next assistant"
++    );
++}
++
++/// Wave B: consecutive responses with different models do not cross-label.
++#[tokio::test]
++async fn identity_does_not_leak_across_model_change() {
++    use crate::HostAssistantIdentity;
++    use xai_grok_sampling_types::ApiBackend;
++
++    let mut h = TestHarness::new();
++    let mut cfg = h.handle.get_sampling_config().await.unwrap();
++    cfg.api_backend = ApiBackend::Responses;
++    h.handle.update_sampling_config(cfg);
++    let _ = h.handle.get_conversation().await;
++
++    h.handle.record_response_identity(Some("model-a".into()));
++    let _ = h.handle.get_conversation().await;
++    h.handle
++        .push_assistant_response(ConversationItem::assistant("a"));
++    let _ = h.handle.get_conversation().await;
++
++    h.handle.record_response_identity(Some("model-b".into()));
++    let _ = h.handle.get_conversation().await;
++    h.handle
++        .push_assistant_response(ConversationItem::assistant("b"));
++    let _ = h.handle.get_conversation().await;
++
++    let records = h.persistence_rx.drain();
++    let ids: Vec<_> = records
++        .into_iter()
++        .filter_map(|r| match r {
++            PersistenceRecord::MessageWithCaptureFacts {
++                item: ConversationItem::Assistant(a),
++                identity: Some(id),
++                ..
++            } => Some((a.content.to_string(), id)),
++            _ => None,
++        })
++        .collect();
++    assert_eq!(ids.len(), 2);
++    assert_eq!(ids[0].0, "a");
++    assert_eq!(
++        ids[0].1,
++        HostAssistantIdentity {
++            provider: "xai".into(),
++            model: Some("model-a".into()),
++            api: Some("responses".into()),
++        }
++    );
++    assert_eq!(ids[1].0, "b");
++    assert_eq!(ids[1].1.model.as_deref(), Some("model-b"));
++}
++
  #[tokio::test]
  async fn record_last_turn_usage_round_trip() {
      use xai_grok_sampling_types::TokenUsage;
+diff --git a/crates/codegen/xai-chat-state/src/commands.rs b/crates/codegen/xai-chat-state/src/commands.rs
+index 625ad90..d32f642 100644
+--- a/crates/codegen/xai-chat-state/src/commands.rs
++++ b/crates/codegen/xai-chat-state/src/commands.rs
+@@ -99,6 +99,10 @@ pub enum ChatStateCommand {
+         cost_usd_ticks: Option<i64>,
+     },
+ 
++    /// Stash host-observed assistant identity for the current model response.
++    /// Usage-independent — fires even when the provider reports no token usage.
++    RecordResponseIdentity { model_id: Option<String> },
++
+     /// Subagent usage into session (and prompt when attributable). Replies when applied.
+     RecordSubagentUsage {
+         by_model: Vec<(String, crate::usage::UsageTotals)>,
+diff --git a/crates/codegen/xai-chat-state/src/handle.rs b/crates/codegen/xai-chat-state/src/handle.rs
+index e58fd57..06dd26c 100644
+--- a/crates/codegen/xai-chat-state/src/handle.rs
++++ b/crates/codegen/xai-chat-state/src/handle.rs
+@@ -126,6 +126,17 @@ impl ChatStateHandle {
+         });
+     }
+ 
++    /// Stash host-observed assistant identity for the current model response.
++    ///
++    /// Call **before** pushing response items. Independent of token usage so a
++    /// valid response without usage still carries provenance. `model_id` is the
++    /// resolved response model when present — never invent from current config.
++    pub fn record_response_identity(&self, model_id: Option<String>) {
++        let _ = self
++            .cmd_tx
++            .send(ChatStateCommand::RecordResponseIdentity { model_id });
++    }
++
+     /// Apply subagent usage; returns false if the actor did not acknowledge.
+     pub async fn record_subagent_usage(
+         &self,
+diff --git a/crates/codegen/xai-chat-state/src/lib.rs b/crates/codegen/xai-chat-state/src/lib.rs
+index 3fdd1dd..f43751f 100644
+--- a/crates/codegen/xai-chat-state/src/lib.rs
++++ b/crates/codegen/xai-chat-state/src/lib.rs
+@@ -48,8 +48,8 @@ pub use compaction_transcript::CompactionDetail;
+ pub use events::ChatStateEvent;
+ pub use handle::ChatStateHandle;
+ pub use persistence::{
+-    ChatPersistence, MockChatPersistence, MockPersistenceReceiver, NullChatPersistence,
+-    PersistenceRecord,
++    ChatPersistence, HostAssistantIdentity, MockChatPersistence, MockPersistenceReceiver,
++    NullChatPersistence, PersistenceRecord, api_backend_label,
+ };
+ pub use types::*;
+ pub use usage::{UsageLedger, UsageTotals};
 diff --git a/crates/codegen/xai-chat-state/src/persistence.rs b/crates/codegen/xai-chat-state/src/persistence.rs
-index 8c3ea9a..b6707fe 100644
+index 8c3ea9a..bf7d499 100644
 --- a/crates/codegen/xai-chat-state/src/persistence.rs
 +++ b/crates/codegen/xai-chat-state/src/persistence.rs
-@@ -8,7 +8,7 @@
+@@ -8,10 +8,56 @@
  use std::io;
  
  use tokio::sync::{mpsc, oneshot};
 -use xai_grok_sampling_types::ConversationItem;
-+use xai_grok_sampling_types::{ConversationItem, TokenUsage};
++use xai_grok_sampling_types::{ApiBackend, ConversationItem, TokenUsage};
  
  use crate::commands::{StrictAppendAck, StrictAppendError};
  
-@@ -24,6 +24,21 @@ pub trait ChatPersistence: Send + 'static {
++/// Host-observed assistant provenance for one model response (Wave B identity).
++///
++/// Captured at the response boundary and attached to `assistant_thinking` /
++/// `assistant_text` LHC events. Partial identity is allowed (`model`/`api` may
++/// be absent); complete identity is required to re-emit opaque reasoning on
++/// serve. Never invent missing fields from later config.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct HostAssistantIdentity {
++    /// Wave B provider label (`"xai"` for Grok).
++    pub provider: String,
++    /// Resolved response model (`AssistantItem.model_id`) when present.
++    pub model: Option<String>,
++    /// Normalized API backend label for the call that produced the response.
++    pub api: Option<String>,
++}
++
++impl HostAssistantIdentity {
++    /// Wave B Grok provider stamp.
++    pub const PROVIDER_XAI: &'static str = "xai";
++
++    /// True when provider, model, and api are all non-empty.
++    pub fn is_complete(&self) -> bool {
++        !self.provider.is_empty()
++            && self.model.as_ref().is_some_and(|m| !m.is_empty())
++            && self.api.as_ref().is_some_and(|a| !a.is_empty())
++    }
++
++    /// Exact complete-identity match (both sides must be complete).
++    pub fn matches_live(&self, live: &Self) -> bool {
++        self.is_complete()
++            && live.is_complete()
++            && self.provider == live.provider
++            && self.model == live.model
++            && self.api == live.api
++    }
++}
++
++/// Stable wire labels for [`ApiBackend`] (snake_case; LHC free-string identity).
++pub fn api_backend_label(backend: ApiBackend) -> &'static str {
++    match backend {
++        ApiBackend::ChatCompletions => "chat_completions",
++        ApiBackend::Responses => "responses",
++        ApiBackend::Messages => "messages",
++    }
++}
++
+ /// Abstraction over chat-specific persistence operations.
+ ///
+ /// The actor owns this exclusively via `Box<dyn ChatPersistence>`, so all
+@@ -24,6 +70,23 @@ pub trait ChatPersistence: Send + 'static {
      /// Persist a single conversation item (append to chat_history.jsonl).
      fn persist_message(&mut self, item: &ConversationItem);
  
-+    // LHC-HOOK 9/10: optional provider usage side-channel for LHC assistant_text (schema v5 / D3)
-+    /// Persist a message, optionally carrying the last model call's provider usage.
++    // LHC-HOOK 9/10: persist_message_with_provider_usage side-channel (usage + identity)
++    /// Persist a message with optional LHC capture facts (usage + identity).
 +    ///
-+    /// Default ignores usage and calls [`Self::persist_message`]. The LHC capture
-+    /// tee overrides this to attach `providerUsage` on `assistant_text` events.
-+    /// Usage is host fact — never interpreted by chat-state itself.
++    /// Default ignores facts and calls [`Self::persist_message`]. The LHC
++    /// capture tee overrides this to attach `providerUsage` and
++    /// provider/model/api provenance. Facts are host-observed — never
++    /// interpreted by chat-state itself. Identity is independent of usage.
 +    fn persist_message_with_provider_usage(
 +        &mut self,
 +        item: &ConversationItem,
 +        provider_usage: Option<&TokenUsage>,
++        identity: Option<&HostAssistantIdentity>,
 +    ) {
-+        let _ = provider_usage;
++        let _ = (provider_usage, identity);
 +        self.persist_message(item);
 +    }
 +
      /// Persist one working-directory switch generation and report commit status.
      fn persist_working_directory_switch_and_ack(
          &mut self,
-@@ -44,8 +59,13 @@ pub trait ChatPersistence: Send + 'static {
+@@ -44,8 +107,20 @@ pub trait ChatPersistence: Send + 'static {
  /// A record of a persistence call, sent over a channel to the test.
  #[derive(Debug, Clone)]
  pub enum PersistenceRecord {
 -    /// A single message was persisted.
-+    /// A single message was persisted (no provider usage attached).
++    /// A single message was persisted (no LHC side-channel facts).
      Message(ConversationItem),
 +    /// A message persisted with the actor's pending model-call usage (schema v5).
 +    ///
-+    /// Emitted only when the actor calls
-+    /// [`ChatPersistence::persist_message_with_provider_usage`] with `Some`.
++    /// Emitted when the actor calls
++    /// [`ChatPersistence::persist_message_with_provider_usage`] with usage and
++    /// no identity.
 +    MessageWithProviderUsage(ConversationItem, TokenUsage),
++    /// A message persisted with LHC capture facts (usage and/or identity).
++    MessageWithCaptureFacts {
++        item: ConversationItem,
++        provider_usage: Option<TokenUsage>,
++        identity: Option<HostAssistantIdentity>,
++    },
      /// A persistence-acknowledged switch append was requested.
      AcknowledgedMessage(ConversationItem),
      /// The full history was replaced.
-@@ -128,12 +148,14 @@ impl MockPersistenceReceiver {
+@@ -128,12 +203,15 @@ impl MockPersistenceReceiver {
          }
      }
  
 -    /// Collect all `Message` items received so far (drains the channel).
-+    /// Collect all `Message` / `MessageWithProviderUsage` items received so far
++    /// Collect all `Message` / side-channel message items received so far
 +    /// (drains the channel).
      pub fn messages(&mut self) -> Vec<ConversationItem> {
          self.drain()
@@ -202,10 +482,11 @@ index 8c3ea9a..b6707fe 100644
 -                PersistenceRecord::Message(item) => Some(item),
 +                PersistenceRecord::Message(item)
 +                | PersistenceRecord::MessageWithProviderUsage(item, _) => Some(item),
++                PersistenceRecord::MessageWithCaptureFacts { item, .. } => Some(item),
                  _ => None,
              })
              .collect()
-@@ -145,6 +167,24 @@ impl ChatPersistence for MockChatPersistence {
+@@ -145,6 +223,32 @@ impl ChatPersistence for MockChatPersistence {
          let _ = self.tx.send(PersistenceRecord::Message(item.clone()));
      }
  
@@ -213,16 +494,24 @@ index 8c3ea9a..b6707fe 100644
 +        &mut self,
 +        item: &ConversationItem,
 +        provider_usage: Option<&TokenUsage>,
++        identity: Option<&HostAssistantIdentity>,
 +    ) {
-+        match provider_usage {
-+            Some(usage) => {
++        match (provider_usage, identity) {
++            (None, None) => {
++                let _ = self.tx.send(PersistenceRecord::Message(item.clone()));
++            }
++            (Some(usage), None) => {
 +                let _ = self.tx.send(PersistenceRecord::MessageWithProviderUsage(
 +                    item.clone(),
 +                    usage.clone(),
 +                ));
 +            }
-+            None => {
-+                let _ = self.tx.send(PersistenceRecord::Message(item.clone()));
++            (usage, ident) => {
++                let _ = self.tx.send(PersistenceRecord::MessageWithCaptureFacts {
++                    item: item.clone(),
++                    provider_usage: usage.cloned(),
++                    identity: ident.cloned(),
++                });
 +            }
 +        }
 +    }
@@ -532,6 +821,22 @@ index 9489c62..a0f8fcc 100644
  #[path = "acp_session_tests/observability_bridge_mapping_tests.rs"]
  mod observability_bridge_mapping_tests;
  #[cfg(test)]
+diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs
+index 217033f..d2112da 100644
+--- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs
++++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs
+@@ -1371,6 +1371,11 @@ impl SessionActor {
+         response: &ConversationResponse,
+         api_duration_ms: Option<u64>,
+     ) {
++        // Wave B identity: always stamp before items are pushed, even when the
++        // provider reports no token usage. Model is the resolved response
++        // model only — never filled from current config.
++        self.chat_state_handle
++            .record_response_identity(response.assistant().and_then(|a| a.model_id.clone()));
+         if let Some(ref u) = response.usage {
+             self.tool_context
+                 .record_task_model_output(u64::from(u.completion_tokens));
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/slash_exec.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/slash_exec.rs
 index 890d4a0..c0f4c3e 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/slash_exec.rs
@@ -679,7 +984,7 @@ index d42f1d3..1b2f03b 100644
          tokio_util::sync::CancellationToken::new(),
      );
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
-index 758bb9e..9268964 100644
+index 758bb9e..1671dbd 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
 @@ -1143,6 +1143,40 @@ impl SessionActor {
@@ -723,22 +1028,39 @@ index 758bb9e..9268964 100644
          xai_grok_telemetry::session_ctx::log_session_event(
              crate::agent::session_metrics::TurnCompletedLifecycle {
                  session_id: self.session_info.id.0.to_string(),
-@@ -2164,7 +2198,55 @@ impl SessionActor {
+@@ -2164,7 +2198,72 @@ impl SessionActor {
                  })),
              );
              let mut request = request;
-+            // LHC-HOOK 4/10: substitute LHC request context (all-LHC or all-native)
-+            // Cheap atomic first, then per-session registry — no mutex when off.
-+            // Hook 4 is instrumented-redundant: observe native vs served (G1);
-+            // observation never changes the served result.
++            // LHC-HOOK 4/10: substitute LHC request context after build_request
++            // (+ live identity for signature gate). Cheap atomic first, then
++            // per-session registry — no mutex when off. Instrumented-redundant
++            // equivalence observation (G1) never changes the served result.
 +            if grok_lhc_host::any_capture_active()
 +                && grok_lhc_host::capture_active(self.session_info.id.0.as_ref())
 +            {
 +                let native_items = std::mem::take(&mut request.items);
 +                let tools_before = request.tools.len();
++                let live_identity = {
++                    let cfg = self.chat_state_handle.get_sampling_config().await;
++                    let model = request
++                        .model
++                        .clone()
++                        .or_else(|| cfg.as_ref().map(|c| c.model.clone()))
++                        .filter(|m| !m.is_empty());
++                    let api = cfg.as_ref().map(|c| {
++                        grok_lhc_host::api_backend_label(c.api_backend.clone()).to_string()
++                    });
++                    Some(grok_lhc_host::LiveRequestIdentity {
++                        provider: grok_lhc_host::HostAssistantIdentity::PROVIDER_XAI.to_string(),
++                        model,
++                        api,
++                    })
++                };
 +                let decision = grok_lhc_host::serve_request_context(
 +                    self.session_info.id.0.as_ref(),
 +                    &native_items,
++                    live_identity.as_ref(),
 +                )
 +                .await;
 +                let observe = grok_lhc_host::equivalence_armed();
