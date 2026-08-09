@@ -171,26 +171,43 @@ jobs:
           shared-key: release-${{ matrix.label }}-v2
           workspaces: "."
 
-      - name: Build release binary
+      - name: Build release binary (Unix)
+        if: runner.os != 'Windows'
         shell: bash
         env:
           GROK_VERSION: ${{ needs.prep.outputs.version }}
         run: |
           set -euo pipefail
           export PATH="$HOME/.cargo/bin:$PATH"
-          command -v cc || command -v cl || true
+          command -v cc
           cargo build -p xai-grok-pager-bin --release
-          BIN="target/release/xai-grok-pager${{ matrix.ext }}"
+          BIN="target/release/xai-grok-pager"
           test -f "$BIN"
-          # Asset name matches xai-grok-update gh-release installer:
-          #   grok-{version}-{os}-{arch}[.exe]
-          OUT="grok-${{ needs.prep.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}"
+          OUT="grok-${{ needs.prep.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}"
           cp "$BIN" "$OUT"
-          if [ "${{ runner.os }}" != "Windows" ]; then
-            chmod +x "$OUT"
-          fi
+          chmod +x "$OUT"
           ls -la "$OUT"
           "./$OUT" --version 2>/dev/null || "./$OUT" -V 2>/dev/null || true
+
+      # Windows: use pwsh (not bash) so protoc/MSVC see a real Windows env.
+      # Git-Bash cargo builds fail protoc with `/dev/stdout: No such file`.
+      - name: Build release binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          GROK_VERSION: ${{ needs.prep.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not $env:PROTOC) { throw "PROTOC not set" }
+          if (-not (Test-Path $env:PROTOC)) { throw "PROTOC missing: $env:PROTOC" }
+          & $env:PROTOC --version
+          cargo build -p xai-grok-pager-bin --release
+          $bin = "target/release/xai-grok-pager.exe"
+          if (-not (Test-Path $bin)) { throw "missing $bin" }
+          $out = "grok-${{ needs.prep.outputs.version }}-windows-x86_64.exe"
+          Copy-Item $bin $out
+          Get-Item $out | Format-List Name, Length
+          & ".\$out" --version
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
