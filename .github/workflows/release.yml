@@ -127,28 +127,25 @@ jobs:
 
       - name: Install protoc (Windows)
         if: runner.os == 'Windows'
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
-          # bin/protoc is a Unix dotslash wrapper — unusable on Windows.
-          # Install a real protoc and set PROTOC for the build.
-          choco install protoc -y --no-progress || true
-          if command -v protoc >/dev/null 2>&1; then
-            PROTOC_PATH="$(command -v protoc)"
-          else
-            VER=29.3
-            curl -fsSL -o /tmp/protoc.zip \
-              "https://github.com/protocolbuffers/protobuf/releases/download/v${VER}/protoc-${VER}-win64.zip"
-            mkdir -p "$HOME/protoc"
-            python - <<'PY'
-          import zipfile, os, pathlib
-          zipfile.ZipFile(r"/tmp/protoc.zip").extractall(os.path.expanduser("~/protoc"))
-          PY
-            PROTOC_PATH="$HOME/protoc/bin/protoc.exe"
-          fi
-          echo "PROTOC=$PROTOC_PATH" >> "$GITHUB_ENV"
-          echo "$(dirname "$PROTOC_PATH")" >> "$GITHUB_PATH"
-          "$PROTOC_PATH" --version
+          # bin/protoc is a Unix dotslash wrapper — not a Win32 binary.
+          # Install official protoc and force PROTOC to a Windows path so cargo
+          # build scripts (native) don't fall through to bin/protoc or MSYS shims.
+          $ver = "29.3"
+          $zip = Join-Path $env:RUNNER_TEMP "protoc.zip"
+          $dest = Join-Path $env:RUNNER_TEMP "protoc"
+          Invoke-WebRequest -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v$ver/protoc-$ver-win64.zip" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          $protoc = Join-Path $dest "bin\protoc.exe"
+          if (-not (Test-Path $protoc)) { throw "protoc.exe missing at $protoc" }
+          & $protoc --version
+          "PROTOC=$protoc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          (Split-Path $protoc) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          # Hide the Unix wrapper so PATH/bin walk cannot pick it up.
+          if (Test-Path "bin\protoc") {
+            Move-Item "bin\protoc" "bin\protoc.dotslash-unix" -Force
+          }
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
