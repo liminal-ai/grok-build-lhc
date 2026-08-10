@@ -22,7 +22,7 @@ pub fn is_enabled() -> bool {
 
 /// Root directory for LHC registry + thread files.
 ///
-/// Override with `GROK_LHC_ROOT` (tests). Default: `~/.lhc` (LHC registry
+/// Override with `GROK_LHC_ROOT` (tests). Default: `~/.grok-lhc` (per-host
 /// convention — see `lhc::threads` registry path).
 pub fn lhc_root() -> std::path::PathBuf {
     if let Ok(root) = std::env::var("GROK_LHC_ROOT") {
@@ -35,7 +35,7 @@ pub fn lhc_root() -> std::path::PathBuf {
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    home.join(".lhc")
+    home.join(".grok-lhc")
 }
 
 /// Process-wide lock for tests that mutate `GROK_LHC*` env vars.

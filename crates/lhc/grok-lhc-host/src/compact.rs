@@ -186,43 +186,20 @@ pub(crate) fn note_replace_call() {
     REPLACE_CALLS.fetch_add(1, Ordering::SeqCst);
 }
 
-fn experimental_replace_enabled() -> bool {
-    match std::env::var("GROK_LHC_COMPACT_EXPERIMENTAL") {
-        Ok(v) => {
-            let t = v.trim();
-            t == "1" || t.eq_ignore_ascii_case("true")
-        }
-        Err(_) => false,
-    }
-}
-
-/// Resolve compact mode from the environment. Single source of truth.
+/// Resolve compact mode. Single source of truth.
 ///
-/// - `GROK_LHC` unset/false → [`CompactMode::Off`]
-/// - `GROK_LHC=1` + `GROK_LHC_COMPACT=replace` + `GROK_LHC_COMPACT_EXPERIMENTAL=1`
-///   → [`CompactMode::Replace`]
-/// - `GROK_LHC=1` + `GROK_LHC_COMPACT=replace` without experimental → **Shadow**
-///   (Replace unreachable; warn once per process via tracing)
-/// - `GROK_LHC=1` otherwise → [`CompactMode::Shadow`]
+/// - `GROK_LHC` unset/true → [`CompactMode::Replace`] — LHC compaction is the
+///   product; this fork does not ship it disarmed.
+/// - `GROK_LHC=0`/`false`/`off` → [`CompactMode::Off`]
+///
+/// The former `GROK_LHC_COMPACT` / `GROK_LHC_COMPACT_EXPERIMENTAL` staging
+/// gates are gone. Shadow survives only as a type for the certification
+/// bridge tests until its machinery is removed.
 pub fn compact_mode() -> CompactMode {
     if !crate::gating::is_enabled() {
         return CompactMode::Off;
     }
-    match std::env::var("GROK_LHC_COMPACT") {
-        Ok(v) if v.trim().eq_ignore_ascii_case("replace") => {
-            if experimental_replace_enabled() {
-                CompactMode::Replace
-            } else {
-                tracing::warn!(
-                    "GROK_LHC_COMPACT=replace ignored without \
-                     GROK_LHC_COMPACT_EXPERIMENTAL=1 (Replace unreachable \
-                     pending accounting ruling); using shadow"
-                );
-                CompactMode::Shadow
-            }
-        }
-        _ => CompactMode::Shadow,
-    }
+    CompactMode::Replace
 }
 
 /// Test helper: pin mode for the current process (certification only).
@@ -269,36 +246,20 @@ mod tests {
     }
 
     #[test]
-    fn replace_requires_experimental_opt_in() {
+    fn replace_is_the_only_live_mode() {
         let _lock = crate::gating::env_lock();
         let prev_lhc = std::env::var_os("GROK_LHC");
-        let prev_c = std::env::var_os("GROK_LHC_COMPACT");
-        let prev_x = std::env::var_os("GROK_LHC_COMPACT_EXPERIMENTAL");
         unsafe {
             std::env::set_var("GROK_LHC", "1");
-            std::env::set_var("GROK_LHC_COMPACT", "replace");
-            std::env::remove_var("GROK_LHC_COMPACT_EXPERIMENTAL");
         }
-        assert_eq!(
-            compact_mode(),
-            CompactMode::Shadow,
-            "replace without experimental must not reach Replace"
-        );
+        assert_eq!(compact_mode(), CompactMode::Replace, "enabled means Replace, no staging gates");
         unsafe {
-            std::env::set_var("GROK_LHC_COMPACT_EXPERIMENTAL", "1");
+            std::env::set_var("GROK_LHC", "0");
         }
-        assert_eq!(compact_mode(), CompactMode::Replace);
+        assert_eq!(compact_mode(), CompactMode::Off, "the kill switch is the only gate");
         match prev_lhc {
             Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
             None => unsafe { std::env::remove_var("GROK_LHC") },
-        }
-        match prev_c {
-            Some(v) => unsafe { std::env::set_var("GROK_LHC_COMPACT", v) },
-            None => unsafe { std::env::remove_var("GROK_LHC_COMPACT") },
-        }
-        match prev_x {
-            Some(v) => unsafe { std::env::set_var("GROK_LHC_COMPACT_EXPERIMENTAL", v) },
-            None => unsafe { std::env::remove_var("GROK_LHC_COMPACT_EXPERIMENTAL") },
         }
     }
 
