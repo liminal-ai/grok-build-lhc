@@ -126,7 +126,8 @@ jobs:
   build-windows:
     name: Build windows-x86_64
     needs: prep
-    runs-on: blacksmith-32vcpu-windows-2025
+    # GitHub-hosted: Blacksmith Windows left this job queued 15+ min with no runner.
+    runs-on: windows-latest
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
