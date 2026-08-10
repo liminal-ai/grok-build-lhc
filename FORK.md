@@ -401,11 +401,12 @@ Chunk 1 means the first real upstream sync already has a proven fallback.)
 ## Releases
 
 - Workflow: [`.github/workflows/release.yml`](.github/workflows/release.yml)
-- Trigger: push tag `vX.Y.Z` or workflow_dispatch
+- **Pipeline:** build (linux/mac/win) → **Daytona Linux smoke on those
+  artifacts** → publish GitHub Release only if smoke passes (no rebuild)
+- Trigger: push tag `vX.Y.Z` or workflow_dispatch (`dry_run` = build+smoke only)
 - Assets: `grok-{ver}-linux-x86_64`, `grok-{ver}-macos-aarch64`,
   `grok-{ver}-windows-x86_64.exe` (+ SHA256SUMS)
-- Runners: Blacksmith (`blacksmith-32vcpu-ubuntu-2404`,
-  `blacksmith-12vcpu-macos-26`, `blacksmith-32vcpu-windows-2025`)
+- Runners: Blacksmith; smoke needs secret `DAYTONA_API_KEY`
 - Updater: `GH_RELEASE_REPO = liminal-ai/grok-build-lhc`; UI says
   **grok-build-lhc**. Auto-update defaults **off** until the user opts in.
 

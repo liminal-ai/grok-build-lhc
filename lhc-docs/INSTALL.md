@@ -65,7 +65,8 @@ After install, `grok update` (when you enable auto-update or run it manually)
 pulls from **this repo’s** GitHub Releases and prints **grok-build-lhc**.
 
 Cut a release: push tag `vX.Y.Z` on `lhc`, or Actions → **Release** →
-workflow_dispatch. CI builds on Blacksmith (Linux/macOS/Windows).
+workflow_dispatch. CI **builds** (Blacksmith) → **Linux smoke** (Daytona on
+the same artifacts) → **publishes** the Release only if smoke passes.
 
 ## 4. Build from source
 

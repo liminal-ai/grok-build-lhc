@@ -1,14 +1,15 @@
-# Build multi-platform binaries and publish a GitHub Release for grok-build-lhc.
+# Build → Linux Daytona smoke → GitHub Release (same artifacts, no rebuild).
 #
 # Triggers:
 #   - push of tags matching v* (e.g. v0.1.0)
-#   - workflow_dispatch with version input (e.g. 0.1.0)
+#   - workflow_dispatch with version input
 #
-# Assets match the gh-release installer layout in xai-grok-update:
-#   grok-{version}-{os}-{arch}[.exe]
-#   e.g. grok-0.1.0-linux-x86_64
+# Pipeline:
+#   1. build linux/mac/windows on Blacksmith
+#   2. smoke Linux artifact on Daytona (same run artifacts)
+#   3. publish Release only if smoke passes
 #
-# Linux/macOS/Windows use Blacksmith runners (liminal-ai labels).
+# dry_run=true: steps 1–2 only (no Release). Use sparingly; prefer full path.
 
 name: Release
 
@@ -23,13 +24,14 @@ on:
         required: true
         type: string
       dry_run:
-        description: "Build only; skip creating the GitHub Release"
+        description: "Build + smoke only; do not create GitHub Release"
         required: false
         type: boolean
         default: false
 
 permissions:
   contents: write
+  actions: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -110,12 +112,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Blacksmith mac images may lack a working `cc`; ensure CLT/Xcode path.
           if ! command -v cc >/dev/null 2>&1; then
-            echo "cc missing; checking xcode-select"
             xcode-select -p || sudo xcode-select --install || true
           fi
-          # Homebrew fallback for cmake/protoc if needed
           if ! command -v cmake >/dev/null 2>&1; then
             brew install cmake || true
           fi
@@ -129,9 +128,6 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # bin/protoc is a Unix dotslash wrapper — not a Win32 binary.
-          # Install official protoc and force PROTOC to a Windows path so cargo
-          # build scripts (native) don't fall through to bin/protoc or MSYS shims.
           $ver = "29.3"
           $zip = Join-Path $env:RUNNER_TEMP "protoc.zip"
           $dest = Join-Path $env:RUNNER_TEMP "protoc"
@@ -142,7 +138,6 @@ jobs:
           & $protoc --version
           "PROTOC=$protoc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           (Split-Path $protoc) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-          # Hide the Unix wrapper so PATH/bin walk cannot pick it up.
           if (Test-Path "bin\protoc") {
             Move-Item "bin\protoc" "bin\protoc.dotslash-unix" -Force
           }
@@ -160,7 +155,6 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.cargo/bin:$PATH"
           command -v dotslash
-          # Warm protoc via repo wrapper on Unix (after build-essential so cc exists).
           if [ "${{ runner.os }}" != "Windows" ] && [ -x bin/protoc ]; then
             bin/protoc --version || true
           fi
@@ -189,8 +183,6 @@ jobs:
           ls -la "$OUT"
           "./$OUT" --version 2>/dev/null || "./$OUT" -V 2>/dev/null || true
 
-      # Windows: use pwsh (not bash) so protoc/MSVC see a real Windows env.
-      # Git-Bash cargo builds fail protoc with `/dev/stdout: No such file`.
       - name: Build release binary (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -217,9 +209,42 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # Gate: same-run Linux artifact → Daytona install + basic checks.
+  # Publish will not run if this fails (no rebuild; no release of unsmoked bits).
+  smoke-linux:
+    name: Smoke Linux (Daytona)
+    needs: [prep, build]
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install smoke deps
+        run: pip install -r scripts/daytona-smoke/requirements.txt
+      - name: Download linux artifact from this run
+        uses: actions/download-artifact@v4
+        with:
+          name: grok-linux-x86_64
+          path: artifacts
+      - name: Run Daytona Linux smoke
+        env:
+          DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DAYTONA_API_KEY:-}" ]; then
+            echo "DAYTONA_API_KEY secret is not set" >&2
+            exit 1
+          fi
+          ART=$(ls artifacts/grok-*-linux-x86_64 | head -1)
+          test -n "$ART"
+          export GROK_ARTIFACT_PATH="$ART"
+          python scripts/daytona-smoke/smoke_linux.py
+
   publish:
     name: Publish GitHub Release
-    needs: [prep, build]
+    needs: [prep, build, smoke-linux]
     if: needs.prep.outputs.dry_run != 'true'
     runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
@@ -258,10 +283,11 @@ jobs:
             echo "| **Fork version** | \`${VERSION}\` |"
             echo "| **Upstream SOURCE_REV** | \`${UPSTREAM_REV}\` |"
             echo "| **LHC submodule** | \`${LHC_PIN}\` |"
+            echo "| **Linux smoke** | Daytona install + --version / --help (same artifacts) |"
             echo
             echo "### Install"
             echo
-            echo "Assets are named for the built-in \`gh-release\` updater:"
+            echo "Assets match the built-in \`gh-release\` updater:"
             echo "\`grok-${VERSION}-{linux,macos,windows}-{x86_64,aarch64}\`."
             echo
             echo "Manual (Linux x86_64 example):"
@@ -272,8 +298,7 @@ jobs:
             echo "chmod +x grok && sudo mv grok /usr/local/bin/grok"
             echo '```'
             echo
-            echo "Or place the binary on your PATH as \`grok\`. First run may set"
-            echo "\`[cli] installer = \"gh-release\"\` after \`grok update\`."
+            echo "Or place the binary on your PATH as \`grok\`."
             echo
             echo "This is **not** an official xAI release. Do not use"
             echo "\`curl | https://x.ai/cli/install.sh\` to update this install."
@@ -291,6 +316,7 @@ jobs:
         with:
           tag_name: ${{ needs.prep.outputs.tag }}
           name: grok-build-lhc ${{ needs.prep.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           body_path: RELEASE_NOTES.md
           files: |
             dist/grok-*
