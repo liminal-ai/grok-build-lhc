@@ -15,12 +15,12 @@ use grok_lhc_host::{
     encode_session_id_for_path, equivalence_snapshot, execute_repair, format_status_report,
     health_check, inference_sampler_registered, informational_hit_count, is_enabled,
     last_serve_outcome, lookup_session, native_prompt_indices, observe_serve_equivalence,
-    paths_disagree, plan_repair, preview_call_count, project_conversation_canonical,
-    replace_call_count, reset_compact_call_counters, reset_equivalence_counters,
-    resolve_compact_mode, resolve_lhc_config, serve_compared_turns, serve_fallback_turns,
-    serve_request_context, set_compact_mode_for_test, set_force_classify_list_failure,
-    set_open_hold_for_test, shadow_preview_compact, shutdown_session, spawn_capture, status_report,
-    structural_hit_count, tee_chat_persistence, thread_file_path, wait_capture_archive_ready,
+    paths_disagree, plan_repair, project_conversation_canonical, replace_call_count,
+    reset_compact_call_counters, reset_equivalence_counters, resolve_compact_mode,
+    resolve_lhc_config, serve_compared_turns, serve_fallback_turns, serve_request_context,
+    set_compact_mode_for_test, set_force_classify_list_failure, set_open_hold_for_test,
+    shutdown_session, spawn_capture, status_report, structural_hit_count, tee_chat_persistence,
+    thread_file_path, wait_capture_archive_ready,
 };
 use lhc::intake_stream::{BatchEventOutcome, BatchSkipReason, EventRecord};
 use lhc::shared_tech::view::{
@@ -3456,9 +3456,6 @@ async fn chunk2_serve_timeout_falls_open_on_blocked_worker() {
 #[test]
 fn chunk2_compact_modes_mutually_exclusive() {
     let _g = env_lock();
-    set_compact_mode_for_test(Some(CompactMode::Shadow));
-    assert!(resolve_compact_mode().native_writes());
-    assert!(!resolve_compact_mode().lhc_writes());
     set_compact_mode_for_test(Some(CompactMode::Replace));
     assert!(!resolve_compact_mode().native_writes());
     assert!(resolve_compact_mode().lhc_writes());
@@ -3494,42 +3491,6 @@ fn chunk2_compact_bridge_one_attempt_per_event() {
     let mut both = CompactEventBridge::new(CompactMode::Replace);
     both.record_replace_result(false);
     assert!(!both.should_attempt_replace());
-}
-
-/// Shadow preview is counted once when invoked.
-#[tokio::test(flavor = "multi_thread")]
-#[allow(clippy::await_holding_lock)]
-async fn chunk2_shadow_preview_is_counted() {
-    let _g = env_lock();
-    reset_compact_call_counters();
-    set_compact_mode_for_test(Some(CompactMode::Shadow));
-    let root = TempDir::new().unwrap();
-    let sid = "cert-chunk2-shadow";
-    let prev = std::env::var_os("GROK_LHC");
-    let prev_root = std::env::var_os("GROK_LHC_ROOT");
-    unsafe {
-        std::env::set_var("GROK_LHC", "1");
-        std::env::set_var("GROK_LHC_ROOT", root.path());
-    }
-    let handle = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
-    // Give open time.
-    thread::sleep(Duration::from_millis(100));
-    shadow_preview_compact(sid).await;
-    assert_eq!(preview_call_count(), 1);
-    assert_eq!(replace_call_count(), 0);
-    set_compact_mode_for_test(None);
-    tokio::task::spawn_blocking(move || handle.shutdown_blocking())
-        .await
-        .unwrap();
-    wait_registry_gone(sid);
-    match prev {
-        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
-        None => unsafe { std::env::remove_var("GROK_LHC") },
-    }
-    match prev_root {
-        Some(v) => unsafe { std::env::set_var("GROK_LHC_ROOT", v) },
-        None => unsafe { std::env::remove_var("GROK_LHC_ROOT") },
-    }
 }
 
 /// Mid-tool-cycle native body is replaced wholesale (never hybrid).

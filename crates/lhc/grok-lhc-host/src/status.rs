@@ -179,9 +179,8 @@ pub async fn status_report(session_id: &str) -> LhcStatusReport {
     let (enabled, enabled_source) = provenance_enabled();
     let applied = applied_config();
     let compact_mode = crate::compact::compact_mode();
-    let compact_source = applied
-        .map(|a| a.compact.source)
-        .unwrap_or(ConfigSource::Default);
+    // Compact tracks enablement only (no separate config key).
+    let compact_source = enabled_source;
     // Live path always follows current env / default (`lhc_root`), not the
     // first-applied OnceLock snapshot — otherwise a stale apply masks
     // `GROK_LHC_ROOT` changes in tests and mid-process overrides.

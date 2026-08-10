@@ -377,14 +377,14 @@ so host accounting and the wire view converge (see write-back section below).
 
 ## Chunk 2 — compact bridge (hook 5)
 
-`CompactMode::{Off, Shadow, Replace}` — single enum, mutually exclusive writers.
+`CompactMode::{Off, Replace}` — single enum, mutually exclusive writers.
 `CompactEventBridge` makes the plan pure and sticky: at most one LHC I/O per
 logical event; fail-open never retries.
 
-- `GROK_LHC` off → `Off`
-- `GROK_LHC=1` → `Shadow` (native writes; LHC `preview_compact` once at choke)
-- `GROK_LHC=1` + `GROK_LHC_COMPACT=replace` + `GROK_LHC_COMPACT_EXPERIMENTAL=1`
-  → `Replace` (experimental; otherwise stays Shadow)
+- `GROK_LHC=0` / off → `Off`
+- enabled (default) → `Replace` (LHC writes; native auto-compact suppressed)
+
+No Shadow path and no staging env gates. Kill switch is `GROK_LHC=0` only.
 
 ### Replace-mode write-back (ruled — not a workaround)
 
@@ -826,8 +826,8 @@ For each `GROK_LHC*` key independently:
 
 1. **Environment variable** if set (including explicit `0` / `false` / `off`)
 2. **`[lhc]` config.toml** (applied only when the section is present)
-3. **Default** — `enabled = true`, root `~/.lhc`, compact `shadow`,
-   equivalence armed, no inference-model override
+3. **Default** — `enabled = true`, root `~/.grok-lhc`, equivalence armed,
+   no inference-model override. Compact is always Replace when enabled.
 
 `LhcConfig::resolve_and_apply` (shell) calls `resolve_lhc_config` +
 `apply_resolved_config`, which **fills unset env vars only for non-default
@@ -837,11 +837,11 @@ sources** — default-on does not leak `GROK_LHC=1` into child env; config
 | TOML field | Env | Notes |
 |---|---|---|
 | `enabled` | `GROK_LHC` | unset → **on**; `0`/`false`/`off` force off; `1`/`true`/`on` force on |
-| `root` | `GROK_LHC_ROOT` | storage root |
-| `compact` | `GROK_LHC_COMPACT` | `shadow` / `replace` |
-| `compact_experimental` | `GROK_LHC_COMPACT_EXPERIMENTAL` | required for Replace |
+| `root` | `GROK_LHC_ROOT` | storage root (default `~/.grok-lhc`) |
 | `equivalence` | `GROK_LHC_EQUIVALENCE` | `0`/`false`/`off` disarms |
 | `inference_model` | `GROK_LHC_INFERENCE_MODEL` | Override derivation model; default `grok-4.5` |
+
+Compact mode is not a config key: on ⇒ Replace, off ⇒ Off.
 
 ### Status surface (`/lhc`)
 
@@ -872,7 +872,6 @@ persists via the normal chat-state path). After a successful Replace compact:
 | Native pre-compaction body in RAM | **No** — replaced |
 | Native session persistence (`updates.jsonl` / session dir) | **Partial** — depends on host persistence of the post-write-back body; prior turns may remain in history files depending on prune policy — **live-cert must confirm** |
 | LHC event log (thread SQLite) | **Yes** — full fidelity; rebuildable |
-| Shadow mode | Native unchanged; LHC preview only |
 
 Turning LHC **off** mid-session (`/lhc off`) stops capture and returns the
 serve path to native; it does **not** undo a prior Replace write-back.

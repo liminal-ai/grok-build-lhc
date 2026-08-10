@@ -95,8 +95,8 @@ grok
 # or: cargo run -p xai-grok-pager-bin
 ```
 
-**LHC is on by default** in this fork. Storage defaults to `~/.lhc`
-(override with `GROK_LHC_ROOT` or `[lhc].root`).
+**LHC is on by default** in this fork: capture, **Replace** compact, and
+storage under `~/.grok-lhc` (override with `GROK_LHC_ROOT` or `[lhc].root`).
 
 In a session:
 
@@ -122,7 +122,7 @@ export GROK_LHC=0
 ```
 
 Then restart the process. For a clean side-by-side against stock Grok, use
-**upstream** binaries/builds—not this fork with the gate flipped.
+**upstream** binaries/builds—not this fork with the kill switch flipped.
 
 ## 7. Optional config
 
@@ -131,21 +131,10 @@ Then restart the process. For a clean side-by-side against stock Grok, use
 # enabled = false              # only to disable
 # root = "/path/to/lhc-storage"
 # inference_model = "grok-4.5" # derivation model; default grok-4.5
-# compact = "shadow"           # default; "replace" needs experimental gate
-# compact_experimental = false
 ```
 
-Env wins when set (`GROK_LHC`, `GROK_LHC_ROOT`, `GROK_LHC_COMPACT`, …).
-
-### Compact replace (advanced / experimental)
-
-```bash
-export GROK_LHC_COMPACT=replace
-export GROK_LHC_COMPACT_EXPERIMENTAL=1
-```
-
-Do not arm replace casually on a session you cannot afford to rewrite. See
-`FORK.md` (Gating) and `crates/lhc/grok-lhc-host/MAPPING.md`.
+Env wins when set (`GROK_LHC`, `GROK_LHC_ROOT`, `GROK_LHC_INFERENCE_MODEL`, …).
+Compact is always Replace while LHC is on — no compact mode key.
 
 ## 8. Verify the fork is intact
 

@@ -119,9 +119,7 @@ pub use session::{
 pub use writeback_gates::{run_five_gates_on_body, run_five_gates_on_body_async};
 
 #[cfg(any(test, feature = "test-util"))]
-pub use compact::{
-    preview_call_count, replace_call_count, reset_compact_call_counters, set_compact_mode_for_test,
-};
+pub use compact::{replace_call_count, reset_compact_call_counters, set_compact_mode_for_test};
 
 #[cfg(any(test, feature = "test-util"))]
 pub use gating::env_lock;
@@ -265,29 +263,6 @@ async fn serve_request_context_inner(
     decide_substitution(native_items, &view, &kinds, live_identity)
 }
 
-/// Shadow-mode: preview LHC compaction without writing. Logs and returns.
-pub async fn shadow_preview_compact(session_id: &str) {
-    if !matches!(resolve_compact_mode(), CompactMode::Shadow) {
-        return;
-    }
-    let Some(handle) = lookup_session(session_id) else {
-        return;
-    };
-    compact::note_preview_call();
-    match handle.preview_compact().await {
-        Ok(outcome) => {
-            tracing::info!(
-                session_id,
-                outcome = ?outcome,
-                "LHC compact shadow: preview_compact complete"
-            );
-        }
-        Err(err) => {
-            tracing::warn!(session_id, %err, "LHC compact shadow: preview_compact failed");
-        }
-    }
-}
-
 /// Result of a successful Replace-mode compact, ready for host write-back.
 #[derive(Debug)]
 pub struct ReplaceCompactWriteback {
@@ -303,10 +278,9 @@ pub struct ReplaceCompactWriteback {
 
 /// Replace-mode: run LHC compact and fetch the post-compact session view.
 ///
-/// Unreachable unless [`CompactMode::Replace`] is active (experimental opt-in).
-/// On success the host **must** write the body into native state via
-/// `replace_conversation_for_compaction` (see MAPPING.md). Flag-off remains
-/// the rollback at every point.
+/// Active when LHC is enabled ([`CompactMode::Replace`]). Kill switch is
+/// `GROK_LHC=0`. On success the host **must** write the body into native
+/// state via `replace_conversation_for_compaction` (see MAPPING.md).
 ///
 /// **Turn abort:** drop-guard aborts the live port
 /// [`lhc::thread_view::CompactAbortSignal`] (`Arc<AtomicBool>`) and the

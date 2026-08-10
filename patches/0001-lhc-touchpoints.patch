@@ -1247,14 +1247,14 @@ index 932ea0b..8390d0e 100644
  xai-grok-workspace = { workspace = true, features = ["test-support"] }
  xai-grok-config = { workspace = true, features = [] }
 diff --git a/crates/codegen/xai-grok-shell/src/agent/config.rs b/crates/codegen/xai-grok-shell/src/agent/config.rs
-index efa8a8e..5a6915f 100644
+index efa8a8e..e560643 100644
 --- a/crates/codegen/xai-grok-shell/src/agent/config.rs
 +++ b/crates/codegen/xai-grok-shell/src/agent/config.rs
 @@ -1423,6 +1423,9 @@ pub struct Config {
      pub subagents: crate::config::SubagentsConfig,
      #[serde(default, skip_serializing)]
      pub memory: crate::config::MemoryConfig,
-+    /// `[lhc]` — Long Horizon Context (off by default; env wins over file).
++    /// `[lhc]` — Long Horizon Context (on by default in this fork; env wins).
 +    #[serde(default, skip_serializing)]
 +    pub lhc: crate::config::LhcConfig,
      #[serde(default, skip_serializing)]
@@ -1272,7 +1272,7 @@ index efa8a8e..5a6915f 100644
              ctx.remote_settings,
          );
          self.memory_config = if mem.enabled { Some(mem) } else { None };
-+        // LHC: env > [lhc] config > default off. Fills unset GROK_LHC* env
++        // LHC: env > [lhc] config > default on. Fills unset GROK_LHC* env
 +        // vars only for non-default sources (defaults must not leak into env).
 +        self.lhc = crate::config::LhcConfig::resolve_and_apply(ctx.raw_config);
          self.disable_web_search = self.disable_web_search || ctx.disable_web_search;
@@ -1668,35 +1668,40 @@ index 3ecb3b0..9056910 100644
 +    }
 +}
 diff --git a/crates/codegen/xai-grok-shell/src/config/mod.rs b/crates/codegen/xai-grok-shell/src/config/mod.rs
-index 94b838d..c75d0c1 100644
+index 94b838d..4388174 100644
 --- a/crates/codegen/xai-grok-shell/src/config/mod.rs
 +++ b/crates/codegen/xai-grok-shell/src/config/mod.rs
-@@ -2031,5 +2031,93 @@ pub(crate) fn remove_hooks_path_from_file(
+@@ -2031,5 +2031,99 @@ pub(crate) fn remove_hooks_path_from_file(
      )?;
      Ok(())
  }
 +/// LHC (Long Horizon Context) configuration (`[lhc]` in config.toml).
 +///
-+/// Off by default. Precedence for each field (documented in
++/// **On by default** in this fork. Precedence for each field (documented in
 +/// `crates/lhc/grok-lhc-host/MAPPING.md`):
 +/// 1. Environment variable if set (`GROK_LHC`, `GROK_LHC_ROOT`, …)
-+/// 2. This config section
-+/// 3. Built-in default (enabled = false)
++/// 2. This config section (when the key is present)
++/// 3. Built-in default (`enabled = true`, …)
++///
++/// Disable for troubleshooting: `GROK_LHC=0` or `[lhc] enabled = false`.
++/// Side-by-side vs stock Grok: use upstream binaries, not this fork with
++/// the gate flipped.
 +///
 +/// ```toml
 +/// [lhc]
-+/// enabled = true
++/// # enabled = false                 # only if you need to disable
 +/// root = "/var/lib/lhc"
-+/// compact = "shadow"          # or "replace" (needs compact_experimental)
++/// compact = "shadow"                # or "replace" (needs compact_experimental)
 +/// compact_experimental = false
 +/// equivalence = true
-+/// inference_model = "grok-4"
++/// inference_model = "grok-4.5"
 +/// ```
 +#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 +#[serde(default)]
 +pub struct LhcConfig {
-+    /// Whether LHC capture/serving should be enabled when env does not say.
-+    pub enabled: bool,
++    /// When set, whether LHC capture/serving is enabled (env still wins).
++    /// Omitted → fork default **on**.
++    pub enabled: Option<bool>,
 +    /// Storage root override (maps to `GROK_LHC_ROOT`).
 +    pub root: Option<std::path::PathBuf>,
 +    /// Compaction mode: `"shadow"` (default) or `"replace"`.
@@ -1738,8 +1743,9 @@ index 94b838d..c75d0c1 100644
 +            },
 +        };
 +        let resolved = grok_lhc_host::resolve_lhc_config(&grok_lhc_host::LhcFileConfig {
-+            // Only attribute provenance to the file when `[lhc]` parsed cleanly.
-+            enabled: if section_ok { Some(file.enabled) } else { None },
++            // Only attribute provenance to the file when `[lhc]` parsed cleanly
++            // and the key was present (`Option` — omit means default-on).
++            enabled: if section_ok { file.enabled } else { None },
 +            root: if section_ok { file.root.clone() } else { None },
 +            compact: if section_ok {
 +                file.compact.clone()
@@ -1766,7 +1772,7 @@ index 94b838d..c75d0c1 100644
  #[cfg(test)]
  mod tests;
 diff --git a/crates/codegen/xai-grok-shell/src/config/tests.rs b/crates/codegen/xai-grok-shell/src/config/tests.rs
-index 310709b..4f2bdb4 100644
+index 310709b..7c2e6d4 100644
 --- a/crates/codegen/xai-grok-shell/src/config/tests.rs
 +++ b/crates/codegen/xai-grok-shell/src/config/tests.rs
 @@ -3735,6 +3735,7 @@ fn kill_switched_cold_cwd_stays_allowed_through_plugins_config_read() {
@@ -1777,13 +1783,13 @@ index 310709b..4f2bdb4 100644
  /// Writeback requires grok.com auth: remote may advertise it, but a non-xai
  /// credential is downgraded to `Local`.
  #[test]
-@@ -3758,3 +3759,90 @@ fn from_remote_gated_requires_xai_auth_for_writeback() {
+@@ -3758,3 +3759,123 @@ fn from_remote_gated_requires_xai_auth_for_writeback() {
          StorageMode::Local
      );
  }
 +
 +#[test]
-+fn lhc_config_default_section_absent_stays_off() {
++fn lhc_config_default_section_absent_stays_on() {
 +    let _guard = MEMORY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 +    let prev = std::env::var_os("GROK_LHC");
 +    let prev_root = std::env::var_os("GROK_LHC_ROOT");
@@ -1795,15 +1801,22 @@ index 310709b..4f2bdb4 100644
 +    }
 +    let config = toml::Value::Table(toml::map::Map::new());
 +    let file = crate::config::LhcConfig::resolve_and_apply(&config);
-+    assert!(!file.enabled);
-+    assert!(!grok_lhc_host::is_enabled());
++    assert!(file.enabled.is_none(), "absent [lhc] leaves enabled unset");
++    assert!(
++        grok_lhc_host::is_enabled(),
++        "fork default is on when env and [lhc] omit enable"
++    );
++    assert!(
++        std::env::var_os("GROK_LHC").is_none(),
++        "default-on must not leak GROK_LHC into env"
++    );
 +    assert!(
 +        std::env::var_os("GROK_LHC_ROOT").is_none(),
-+        "default-off must not set GROK_LHC_ROOT"
++        "default-on must not set GROK_LHC_ROOT"
 +    );
 +    assert!(
 +        std::env::var_os("GROK_LHC_COMPACT").is_none(),
-+        "default-off must not set GROK_LHC_COMPACT"
++        "default-on must not set GROK_LHC_COMPACT"
 +    );
 +    match prev {
 +        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
@@ -1845,8 +1858,8 @@ index 310709b..4f2bdb4 100644
 +    let _guard = MEMORY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 +    let prev = std::env::var_os("GROK_LHC");
 +    unsafe { std::env::remove_var("GROK_LHC") };
-+    // `enabled` must be bool — string typo must not silently become default-off
-+    // while still attributing provenance to config.
++    // `enabled` must be bool — string typo must not silently become a fake
++    // config provenance while still applying a half-read section.
 +    let config: toml::Value = toml::from_str(
 +        r#"
 +        [lhc]
@@ -1855,14 +1868,40 @@ index 310709b..4f2bdb4 100644
 +    )
 +    .unwrap();
 +    let file = crate::config::LhcConfig::resolve_and_apply(&config);
-+    assert!(!file.enabled);
-+    assert!(!grok_lhc_host::is_enabled());
++    assert!(file.enabled.is_none());
++    // Malformed section is ignored → fork default-on still applies.
++    assert!(
++        grok_lhc_host::is_enabled(),
++        "malformed [lhc] is ignored; default remains on"
++    );
 +    let err = grok_lhc_host::config_parse_error();
 +    assert!(
 +        err.as_ref().is_some_and(|e| e.contains("invalid [lhc]")),
 +        "malformed [lhc] must surface a parse error, got {err:?}"
 +    );
 +    grok_lhc_host::clear_config_parse_error();
++    match prev {
++        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
++        None => unsafe { std::env::remove_var("GROK_LHC") },
++    }
++}
++
++#[test]
++fn lhc_config_toml_disables_when_env_unset() {
++    let _guard = MEMORY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
++    let prev = std::env::var_os("GROK_LHC");
++    unsafe { std::env::remove_var("GROK_LHC") };
++    let config: toml::Value = toml::from_str(
++        r#"
++        [lhc]
++        enabled = false
++        "#,
++    )
++    .unwrap();
++    let _ = crate::config::LhcConfig::resolve_and_apply(&config);
++    assert!(!grok_lhc_host::is_enabled());
++    assert_eq!(std::env::var("GROK_LHC").ok().as_deref(), Some("0"));
++    unsafe { std::env::remove_var("GROK_LHC") };
 +    match prev {
 +        Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
 +        None => unsafe { std::env::remove_var("GROK_LHC") },
@@ -2037,10 +2076,10 @@ index 217033f..92b746e 100644
              self.tool_context
                  .record_task_model_output(u64::from(u.completion_tokens));
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/slash_exec.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/slash_exec.rs
-index 890d4a0..097ac8b 100644
+index 890d4a0..7ef49a2 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/slash_exec.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/slash_exec.rs
-@@ -82,6 +82,212 @@ impl SessionActor {
+@@ -82,6 +82,213 @@ impl SessionActor {
                  ok_end_turn(0, None)
              }
              BuiltinAction::ContextInfo => ok_end_turn(0, None),
@@ -2159,8 +2198,9 @@ index 890d4a0..097ac8b 100644
 +                            }
 +                        } else if !grok_lhc_host::is_enabled() {
 +                            "**LHC:** process gate is off.\n\n\
-+                             Set `GROK_LHC=1` or `[lhc] enabled = true` (then restart / \
-+                             reload config) before `/lhc on`."
++                             Unset `GROK_LHC=0` / `false` / `off`, or set \
++                             `[lhc] enabled = true` (then restart / reload config) \
++                             before `/lhc on`. This fork defaults to on."
 +                                .to_owned()
 +                        } else {
 +                            // Mid-session attach: bootstrap from live native history.
@@ -5560,3 +5600,231 @@ index 33cbaf5..15e8a9a 100644
              BuiltinAction::HooksTrust => false,
              BuiltinAction::HooksList => false,
              BuiltinAction::HooksAdd { .. } => true,
+diff --git a/crates/codegen/xai-grok-update/src/auto_update.rs b/crates/codegen/xai-grok-update/src/auto_update.rs
+index a4abba9..ec7a4f2 100644
+--- a/crates/codegen/xai-grok-update/src/auto_update.rs
++++ b/crates/codegen/xai-grok-update/src/auto_update.rs
+@@ -28,10 +28,11 @@ const MSG_AUTO_UPDATE_BACKGROUND: &str = "Auto-update running in background.";
+ const MSG_RUN_UPDATE_MANUAL: &str = "Run `grok update` to get the latest version.";
+ /// Manual-install one-liner for this platform's bootstrap installer.
+ fn manual_install_cmd() -> &'static str {
++    // Fork: do not send users to official x.ai install (would replace LHC).
+     if cfg!(windows) {
+-        "irm https://x.ai/cli/install.ps1 | iex"
++        "gh release download --repo liminal-ai/grok-build-lhc --pattern 'grok-*' -D . && move grok-*.exe grok.exe"
+     } else {
+-        "curl -fsSL https://x.ai/cli/install.sh | bash"
++        "gh release download --repo liminal-ai/grok-build-lhc --pattern 'grok-*' --output grok && chmod +x grok"
+     }
+ }
+ 
+@@ -39,8 +40,16 @@ fn manual_install_cmd() -> &'static str {
+ fn reinstall_hint(installer: &str) -> String {
+     match installer {
+         "npm" => "Please reinstall via npm:\n  npm i -g @xai-official/grok".to_string(),
+-        "gh-release" => "Please reinstall via GitHub Releases:\n  gh release download --repo xai-org-shared/grok-build --pattern 'grok-*' --output grok && chmod +x grok".to_string(),
+-        _ => format!("Please reinstall via:\n  {}", manual_install_cmd()),
++        "gh-release" => format!(
++            "Please reinstall **grok-build-lhc** via GitHub Releases:\n  {}",
++            manual_install_cmd()
++        ),
++        _ => format!(
++            "This is the liminal-ai **grok-build-lhc** fork.\n\
++             Do not use https://x.ai/cli/install.sh (official Grok replaces this build).\n\
++             Reinstall via:\n  {}",
++            manual_install_cmd()
++        ),
+     }
+ }
+ 
+@@ -66,7 +75,7 @@ pub fn print_update_status(status: &UpdateStatus, json: bool) -> anyhow::Result<
+ 
+     if let Some(error) = status.error.as_deref() {
+         println!(
+-            "Grok Build - v{} [{}]",
++            "grok-build-lhc - v{} [{}]",
+             status.current_version, status.channel
+         );
+         println!("Update check failed: {error}");
+@@ -78,24 +87,27 @@ pub fn print_update_status(status: &UpdateStatus, json: bool) -> anyhow::Result<
+     if status.update_available {
+         if let Some(latest_version) = status.latest_version.as_deref() {
+             println!(
+-                "A new version of Grok Build is available: {} -> {}{}",
++                "A new version of grok-build-lhc is available: {} -> {}{}",
+                 status.current_version, latest_version, channel_label
+             );
+         } else {
+-            println!("A new version of Grok Build is available.");
++            println!("A new version of grok-build-lhc is available.");
+         }
+         return Ok(());
+     }
+ 
+     if let Some(latest_version) = status.latest_version.as_deref() {
+         println!(
+-            "Grok Build - v{} (latest: {}){}",
++            "grok-build-lhc - v{} (latest: {}){}",
+             status.current_version, latest_version, channel_label
+         );
+         return Ok(());
+     }
+ 
+-    println!("Grok Build - v{}{}", status.current_version, channel_label);
++    println!(
++        "grok-build-lhc - v{}{}",
++        status.current_version, channel_label
++    );
+     Ok(())
+ }
+ 
+@@ -559,13 +571,15 @@ pub async fn run_update_if_available(
+         return Ok(false);
+     }
+ 
+-    // Resolve effective auto_update: None defaults to true (first-run).
+-    let auto_update = current_config.cli.auto_update.unwrap_or(true);
++    // Fork default: auto_update off until the user opts in (avoids surprise
++    // pulls). Official grok defaults None→true; we default None→false and
++    // persist that choice once so settings UI stays consistent.
++    let auto_update = current_config.cli.auto_update.unwrap_or(false);
+ 
+     if current_config.cli.auto_update.is_none()
+         && let Err(e) = config::update_config(|st| {
+             if st.cli.auto_update.is_none() {
+-                st.cli.auto_update = Some(true);
++                st.cli.auto_update = Some(false);
+             }
+         })
+         .await
+@@ -573,6 +587,10 @@ pub async fn run_update_if_available(
+         tracing::warn!("Failed to save auto-update setting: {}", e);
+     }
+ 
++    if !auto_update {
++        return Ok(false);
++    }
++
+     let current_version = get_installed_grok_version();
+     let policy = config::VersionPolicy::resolve();
+     // Don't write version.json here; only cache after confirming no update is
+@@ -598,7 +616,7 @@ pub async fn run_update_if_available(
+     let channel_label = format!(" [{}]", update_config.channel);
+     if auto_update {
+         eprintln!(
+-            "A new version of Grok Build is available: {} -> {}{}",
++            "A new version of grok-build-lhc is available: {} -> {}{}",
+             current_version, latest_version, channel_label
+         );
+         if interactive {
+@@ -626,7 +644,7 @@ pub async fn run_update_if_available(
+             return Ok(false);
+         }
+         eprintln!(
+-            "A new version of Grok Build is available: {} -> {}{}",
++            "A new version of grok-build-lhc is available: {} -> {}{}",
+             current_version, latest_version, channel_label
+         );
+         if interactive {
+@@ -2161,11 +2179,12 @@ async fn gh_release_download(tag: &str, pattern: &str, dest: &std::path::Path) -
+     Ok(())
+ }
+ 
+-/// Download and install grok from GitHub Releases (xai-org-shared/grok-build).
++/// Download and install **grok-build-lhc** from GitHub Releases
++/// (`liminal-ai/grok-build-lhc`).
+ ///
+ /// Uses `gh release download` to fetch the binary matching the current platform.
+ /// This works anywhere the `gh` CLI is authenticated, without needing npm or
+-/// internal network access.
++/// the official x.ai CDN (which would replace this fork).
+ async fn install_gh_release(target: Option<&str>) -> Result<()> {
+     let (os, arch) = detect_platform()?;
+     let platform = format!("{}-{}", os, arch);
+@@ -2186,8 +2205,10 @@ async fn install_gh_release(target: Option<&str>) -> Result<()> {
+     let tag = format!("v{}", version);
+ 
+     eprintln!(
+-        "  Downloading grok v{} ({}) from GitHub Releases...",
+-        version, platform
++        "  Downloading grok-build-lhc v{} ({}) from GitHub Releases ({})...",
++        version,
++        platform,
++        crate::version::GH_RELEASE_REPO
+     );
+ 
+     gh_release_download(&tag, &binary_name, &binary_path).await?;
+@@ -3637,27 +3658,29 @@ mod tests {
+             "should suggest gh release download: {hint}"
+         );
+         assert!(
+-            hint.contains("xai-org-shared/grok-build"),
+-            "should name the repo: {hint}"
++            hint.contains("liminal-ai/grok-build-lhc"),
++            "should name the fork repo: {hint}"
+         );
+     }
+ 
+     #[test]
+     fn test_reinstall_hint_internal_mentions_platform_installer() {
+         let hint = reinstall_hint("internal");
+-        if cfg!(windows) {
+-            assert!(hint.contains("irm"), "should suggest irm install: {hint}");
+-            assert!(
+-                hint.contains("install.ps1"),
+-                "should reference install.ps1: {hint}"
+-            );
+-        } else {
+-            assert!(hint.contains("curl"), "should suggest curl install: {hint}");
+-            assert!(
+-                hint.contains("install.sh"),
+-                "should reference install.sh: {hint}"
+-            );
+-        }
++        // Fork: internal path steers to GitHub Releases (may warn against x.ai).
++        assert!(
++            hint.contains("liminal-ai/grok-build-lhc"),
++            "fork reinstall should name the fork repo: {hint}"
++        );
++        assert!(
++            hint.contains("gh release download"),
++            "should suggest gh release download: {hint}"
++        );
++        // Must not prescribe the official install as the fix path.
++        assert!(
++            !hint.contains("curl -fsSL https://x.ai/cli/install.sh | bash")
++                && !hint.contains("irm https://x.ai/cli/install.ps1"),
++            "must not recommend official install over fork: {hint}"
++        );
+     }
+ 
+     #[test]
+diff --git a/crates/codegen/xai-grok-update/src/version.rs b/crates/codegen/xai-grok-update/src/version.rs
+index 3aa8fbb..2b4ee76 100644
+--- a/crates/codegen/xai-grok-update/src/version.rs
++++ b/crates/codegen/xai-grok-update/src/version.rs
+@@ -11,7 +11,10 @@ use xai_grok_shell::util::grok_home::grok_home;
+ 
+ const TTL_SECONDS_BEFORE_AUTO_UPDATE: Duration = Duration::from_secs(60 * 30);
+ const NPM_PACKAGE: &str = "@xai-official/grok";
+-pub const GH_RELEASE_REPO: &str = "xai-org-shared/grok-build";
++/// GitHub repo used by the `gh-release` installer path.
++///
++/// This fork publishes to liminal-ai/grok-build-lhc (not xAI's CDN/repo).
++pub const GH_RELEASE_REPO: &str = "liminal-ai/grok-build-lhc";
+ 
+ /// Primary CLI base URL: Cloudflare-fronted x.ai endpoint with edge caching
+ /// for binaries and origin-respecting no-cache for channel pointers.
+diff --git a/crates/codegen/xai-grok-update/tests/test_subprocess.rs b/crates/codegen/xai-grok-update/tests/test_subprocess.rs
+index b031ee7..3eb9a34 100644
+--- a/crates/codegen/xai-grok-update/tests/test_subprocess.rs
++++ b/crates/codegen/xai-grok-update/tests/test_subprocess.rs
+@@ -412,7 +412,7 @@ async fn fetch_gh_release_passes_repo_flag() {
+     let log = g.args_log();
+     assert!(log[0].contains("--repo"), "args: {}", log[0]);
+     assert!(
+-        log[0].contains("xai-org-shared/grok-build"),
++        log[0].contains("liminal-ai/grok-build-lhc"),
+         "args: {}",
+         log[0]
+     );

@@ -608,8 +608,7 @@ impl SessionActor {
             if user_context.is_some() {
                 tracing::warn!(
                     session_id = %self.session_info.id,
-                    "LHC replace mode suppressed /compact; user context was discarded \
-                     (Replace is experimental — see GROK_LHC_COMPACT_EXPERIMENTAL)"
+                    "LHC replace mode suppressed /compact; user context was discarded"
                 );
             }
             return Ok(());
@@ -1883,10 +1882,6 @@ impl SessionActor {
     async fn lhc_compact_drive_native_writer(&self) -> bool {
         let mut bridge =
             grok_lhc_host::CompactEventBridge::new(grok_lhc_host::resolve_compact_mode());
-        if bridge.should_attempt_preview() {
-            grok_lhc_host::shadow_preview_compact(self.session_info.id.0.as_ref()).await;
-            bridge.record_preview_done();
-        }
         if bridge.should_attempt_replace() {
             let ok = self.lhc_replace_and_writeback().await;
             bridge.record_replace_result(ok);

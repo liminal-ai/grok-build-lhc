@@ -3765,11 +3765,9 @@ fn lhc_config_default_section_absent_stays_on() {
     let _guard = MEMORY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let prev = std::env::var_os("GROK_LHC");
     let prev_root = std::env::var_os("GROK_LHC_ROOT");
-    let prev_compact = std::env::var_os("GROK_LHC_COMPACT");
     unsafe {
         std::env::remove_var("GROK_LHC");
         std::env::remove_var("GROK_LHC_ROOT");
-        std::env::remove_var("GROK_LHC_COMPACT");
     }
     let config = toml::Value::Table(toml::map::Map::new());
     let file = crate::config::LhcConfig::resolve_and_apply(&config);
@@ -3786,9 +3784,10 @@ fn lhc_config_default_section_absent_stays_on() {
         std::env::var_os("GROK_LHC_ROOT").is_none(),
         "default-on must not set GROK_LHC_ROOT"
     );
-    assert!(
-        std::env::var_os("GROK_LHC_COMPACT").is_none(),
-        "default-on must not set GROK_LHC_COMPACT"
+    assert_eq!(
+        grok_lhc_host::compact_mode().as_str(),
+        "replace",
+        "enabled means Replace with no staging gates"
     );
     match prev {
         Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
@@ -3797,10 +3796,6 @@ fn lhc_config_default_section_absent_stays_on() {
     match prev_root {
         Some(v) => unsafe { std::env::set_var("GROK_LHC_ROOT", v) },
         None => unsafe { std::env::remove_var("GROK_LHC_ROOT") },
-    }
-    match prev_compact {
-        Some(v) => unsafe { std::env::set_var("GROK_LHC_COMPACT", v) },
-        None => unsafe { std::env::remove_var("GROK_LHC_COMPACT") },
     }
 }
 

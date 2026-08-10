@@ -1,24 +1,17 @@
-//! Compact bridge mode: shadow (default) vs replace (experimental). Chunk 2.
+//! Compact bridge mode: Off vs Replace (product path).
 //!
 //! Mutually exclusive by construction — a single enum consulted once per
-//! decision point, never two independent booleans.
-//!
-//! **Replace is unreachable without an explicit experimental opt-in**
-//! (`GROK_LHC_COMPACT_EXPERIMENTAL=1` plus `GROK_LHC_COMPACT=replace`).
-//! Pending Lee's replace-mode accounting ruling, production must not enter
-//! Replace via env alone.
+//! decision point. When LHC is on, Replace is the only compact mode; the
+//! only kill switch is `GROK_LHC=0`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Who writes compaction for a session request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactMode {
-    /// LHC disabled — native compaction only (and no LHC preview).
+    /// LHC disabled — native compaction only.
     Off,
-    /// Native drives; LHC `preview_compact` records what it would do.
-    Shadow,
     /// LHC `compact` drives; native auto-compact is suppressed.
-    /// Unreachable without `GROK_LHC_COMPACT_EXPERIMENTAL=1`.
     Replace,
 }
 
@@ -26,14 +19,13 @@ impl CompactMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
-            Self::Shadow => "shadow",
             Self::Replace => "replace",
         }
     }
 
     /// Native compaction may write the conversation.
     pub fn native_writes(self) -> bool {
-        matches!(self, Self::Off | Self::Shadow)
+        matches!(self, Self::Off)
     }
 
     /// LHC compact may write the conversation.
@@ -47,8 +39,6 @@ impl CompactMode {
 pub enum CompactBridgePlan {
     /// Native only — no LHC call.
     NativeOnly,
-    /// Run `preview_compact` once, then native.
-    ShadowPreviewThenNative,
     /// Attempt `replace_compact` once at the writer choke point.
     ReplaceOnceAtChoke,
 }
@@ -57,19 +47,13 @@ impl CompactBridgePlan {
     pub fn from_mode(mode: CompactMode) -> Self {
         match mode {
             CompactMode::Off => Self::NativeOnly,
-            CompactMode::Shadow => Self::ShadowPreviewThenNative,
             CompactMode::Replace => Self::ReplaceOnceAtChoke,
         }
     }
 
-    /// Whether the plan may invoke mutating LHC compact (not preview).
+    /// Whether the plan may invoke mutating LHC compact.
     pub fn may_replace(self) -> bool {
         matches!(self, Self::ReplaceOnceAtChoke)
-    }
-
-    /// Whether the plan may invoke LHC preview.
-    pub fn may_preview(self) -> bool {
-        matches!(self, Self::ShadowPreviewThenNative)
     }
 }
 
@@ -88,7 +72,7 @@ pub struct CompactEventBridge {
 /// Outcome after consulting the bridge at the native writer choke point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactChokeAction {
-    /// Proceed with native compaction (shadow preview already done, or off).
+    /// Proceed with native compaction (LHC off or fail-open).
     RunNative,
     /// Skip native — LHC already wrote for this event.
     SkipNativeLhcWrote,
@@ -127,11 +111,6 @@ impl CompactEventBridge {
         self.plan.may_replace() && !self.fail_open && !self.lhc_wrote && self.lhc_attempts == 0
     }
 
-    /// Whether a shadow preview may still be attempted.
-    pub fn should_attempt_preview(&self) -> bool {
-        self.plan.may_preview() && self.lhc_attempts == 0
-    }
-
     /// Record one LHC replace attempt. Fail-open is sticky.
     pub fn record_replace_result(&mut self, ok: bool) {
         self.lhc_attempts = self.lhc_attempts.saturating_add(1);
@@ -142,44 +121,28 @@ impl CompactEventBridge {
         }
     }
 
-    /// Record one shadow preview attempt (counts toward at-most-once I/O).
-    pub fn record_preview_done(&mut self) {
-        self.lhc_attempts = self.lhc_attempts.saturating_add(1);
-    }
-
     /// Action for the native writer after LHC side-effects for this event.
     pub fn choke_action(&self) -> CompactChokeAction {
         if self.lhc_wrote {
             CompactChokeAction::SkipNativeLhcWrote
         } else {
-            // Off, shadow (preview done or not), or replace fail-open → native.
+            // Off or replace fail-open → native.
             CompactChokeAction::RunNative
         }
     }
 }
 
 /// Process-wide counters for certification (test-util / tests only).
-static PREVIEW_CALLS: AtomicU64 = AtomicU64::new(0);
 static REPLACE_CALLS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(any(test, feature = "test-util"))]
 pub fn reset_compact_call_counters() {
-    PREVIEW_CALLS.store(0, Ordering::SeqCst);
     REPLACE_CALLS.store(0, Ordering::SeqCst);
-}
-
-#[cfg(any(test, feature = "test-util"))]
-pub fn preview_call_count() -> u64 {
-    PREVIEW_CALLS.load(Ordering::SeqCst)
 }
 
 #[cfg(any(test, feature = "test-util"))]
 pub fn replace_call_count() -> u64 {
     REPLACE_CALLS.load(Ordering::SeqCst)
-}
-
-pub(crate) fn note_preview_call() {
-    PREVIEW_CALLS.fetch_add(1, Ordering::SeqCst);
 }
 
 pub(crate) fn note_replace_call() {
@@ -191,10 +154,6 @@ pub(crate) fn note_replace_call() {
 /// - `GROK_LHC` unset/true → [`CompactMode::Replace`] — LHC compaction is the
 ///   product; this fork does not ship it disarmed.
 /// - `GROK_LHC=0`/`false`/`off` → [`CompactMode::Off`]
-///
-/// The former `GROK_LHC_COMPACT` / `GROK_LHC_COMPACT_EXPERIMENTAL` staging
-/// gates are gone. Shadow survives only as a type for the certification
-/// bridge tests until its machinery is removed.
 pub fn compact_mode() -> CompactMode {
     if !crate::gating::is_enabled() {
         return CompactMode::Off;
@@ -235,9 +194,8 @@ mod tests {
     #[test]
     fn modes_are_mutually_exclusive_writers() {
         assert!(CompactMode::Off.native_writes() && !CompactMode::Off.lhc_writes());
-        assert!(CompactMode::Shadow.native_writes() && !CompactMode::Shadow.lhc_writes());
         assert!(!CompactMode::Replace.native_writes() && CompactMode::Replace.lhc_writes());
-        for mode in [CompactMode::Off, CompactMode::Shadow, CompactMode::Replace] {
+        for mode in [CompactMode::Off, CompactMode::Replace] {
             assert!(
                 !(mode.native_writes() && mode.lhc_writes()),
                 "{mode:?} must not allow two writers"
@@ -252,11 +210,19 @@ mod tests {
         unsafe {
             std::env::set_var("GROK_LHC", "1");
         }
-        assert_eq!(compact_mode(), CompactMode::Replace, "enabled means Replace, no staging gates");
+        assert_eq!(
+            compact_mode(),
+            CompactMode::Replace,
+            "enabled means Replace, no staging gates"
+        );
         unsafe {
             std::env::set_var("GROK_LHC", "0");
         }
-        assert_eq!(compact_mode(), CompactMode::Off, "the kill switch is the only gate");
+        assert_eq!(
+            compact_mode(),
+            CompactMode::Off,
+            "the kill switch is the only gate"
+        );
         match prev_lhc {
             Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
             None => unsafe { std::env::remove_var("GROK_LHC") },
@@ -283,32 +249,16 @@ mod tests {
             "must not retry after fail-open"
         );
         assert_eq!(b.choke_action(), CompactChokeAction::RunNative);
-        // Simulate a second consult — still sticky.
         assert!(!b.should_attempt_replace());
         assert_eq!(b.lhc_attempts(), 1);
     }
 
     #[test]
     fn bridge_first_fail_second_succeed_impossible_without_reset() {
-        // The sticky machine forbids the buggy "second attempt succeeds and
-        // silently reverts fail-open" shape.
         let mut b = CompactEventBridge::new(CompactMode::Replace);
         b.record_replace_result(false);
         assert!(!b.should_attempt_replace());
-        // Even if a caller ignored should_attempt and recorded again:
         b.record_replace_result(true);
         assert_eq!(b.lhc_attempts(), 2);
-        // After a success record, native is skipped — but production code must
-        // not call record twice. The should_attempt guard is the contract.
-    }
-
-    #[test]
-    fn bridge_shadow_preview_once_then_native() {
-        let mut b = CompactEventBridge::new(CompactMode::Shadow);
-        assert!(b.should_attempt_preview());
-        assert!(!b.should_attempt_replace());
-        b.record_preview_done();
-        assert!(!b.should_attempt_preview());
-        assert_eq!(b.choke_action(), CompactChokeAction::RunNative);
     }
 }

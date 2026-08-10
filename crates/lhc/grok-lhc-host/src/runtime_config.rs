@@ -3,9 +3,10 @@
 //! **Precedence (highest wins per key):**
 //! 1. Environment variable, if set (including explicit `0` / `false` / `off`)
 //! 2. Config-file / host-supplied [`LhcFileConfig`] values
-//! 3. Built-in defaults (`enabled = true`, root `~/.lhc`, compact `shadow`,
+//! 3. Built-in defaults (`enabled = true`, root `~/.grok-lhc`,
 //!    equivalence armed, no inference-model override)
 //!
+//! Compact mode is not a config key: when enabled, Replace is always on.
 //! Applying a resolved config only **fills unset** env vars so existing tests
 //! and gates that set `GROK_LHC*` keep working unchanged. It never overwrites
 //! an env var that is already present.
@@ -20,9 +21,6 @@ use crate::gating;
 pub struct LhcFileConfig {
     pub enabled: Option<bool>,
     pub root: Option<PathBuf>,
-    /// `"shadow"` | `"replace"` (replace still needs experimental gate).
-    pub compact: Option<String>,
-    pub compact_experimental: Option<bool>,
     pub equivalence: Option<bool>,
     pub inference_model: Option<String>,
 }
@@ -44,8 +42,6 @@ pub struct Sourced<T> {
 pub struct ResolvedLhcConfig {
     pub enabled: Sourced<bool>,
     pub root: Sourced<PathBuf>,
-    pub compact: Sourced<String>,
-    pub compact_experimental: Sourced<bool>,
     pub equivalence: Sourced<bool>,
     pub inference_model: Sourced<Option<String>>,
 }
@@ -123,40 +119,6 @@ pub fn resolve_lhc_config(file: &LhcFileConfig) -> ResolvedLhcConfig {
         },
     };
 
-    let compact = match env_string("GROK_LHC_COMPACT") {
-        Some(v) => Sourced {
-            value: v,
-            source: ConfigSource::Env,
-        },
-        None => match &file.compact {
-            Some(v) => Sourced {
-                value: v.clone(),
-                source: ConfigSource::ConfigFile,
-            },
-            None => Sourced {
-                value: "shadow".into(),
-                source: ConfigSource::Default,
-            },
-        },
-    };
-
-    let compact_experimental = match env_truthy("GROK_LHC_COMPACT_EXPERIMENTAL") {
-        Some(v) => Sourced {
-            value: v,
-            source: ConfigSource::Env,
-        },
-        None => match file.compact_experimental {
-            Some(v) => Sourced {
-                value: v,
-                source: ConfigSource::ConfigFile,
-            },
-            None => Sourced {
-                value: false,
-                source: ConfigSource::Default,
-            },
-        },
-    };
-
     // Equivalence: env `0`/`false`/`off` disarms; otherwise default armed.
     // Config file can disarm when env is unset.
     let equivalence = match std::env::var("GROK_LHC_EQUIVALENCE") {
@@ -202,8 +164,6 @@ pub fn resolve_lhc_config(file: &LhcFileConfig) -> ResolvedLhcConfig {
     ResolvedLhcConfig {
         enabled,
         root,
-        compact,
-        compact_experimental,
         equivalence,
         inference_model,
     }
@@ -242,17 +202,6 @@ pub fn apply_resolved_config(resolved: &ResolvedLhcConfig) {
             && resolved.root.source != ConfigSource::Default
         {
             std::env::set_var("GROK_LHC_ROOT", &resolved.root.value);
-        }
-        if std::env::var_os("GROK_LHC_COMPACT").is_none()
-            && resolved.compact.source != ConfigSource::Default
-        {
-            std::env::set_var("GROK_LHC_COMPACT", &resolved.compact.value);
-        }
-        if std::env::var_os("GROK_LHC_COMPACT_EXPERIMENTAL").is_none()
-            && resolved.compact_experimental.value
-            && resolved.compact_experimental.source != ConfigSource::Default
-        {
-            std::env::set_var("GROK_LHC_COMPACT_EXPERIMENTAL", "1");
         }
         if std::env::var_os("GROK_LHC_EQUIVALENCE").is_none()
             && !resolved.equivalence.value
@@ -365,11 +314,9 @@ mod tests {
         let _g = env_lock();
         let prev_lhc = std::env::var_os("GROK_LHC");
         let prev_root = std::env::var_os("GROK_LHC_ROOT");
-        let prev_compact = std::env::var_os("GROK_LHC_COMPACT");
         unsafe {
             std::env::remove_var("GROK_LHC");
             std::env::remove_var("GROK_LHC_ROOT");
-            std::env::remove_var("GROK_LHC_COMPACT");
         }
         let r = resolve_lhc_config(&LhcFileConfig::default());
         assert!(r.enabled.value, "default-on");
@@ -382,10 +329,6 @@ mod tests {
             std::env::var_os("GROK_LHC_ROOT").is_none(),
             "default root must not leak into process env"
         );
-        assert!(
-            std::env::var_os("GROK_LHC_COMPACT").is_none(),
-            "default compact must not leak into process env"
-        );
         match prev_lhc {
             Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
             None => unsafe { std::env::remove_var("GROK_LHC") },
@@ -393,10 +336,6 @@ mod tests {
         match prev_root {
             Some(v) => unsafe { std::env::set_var("GROK_LHC_ROOT", v) },
             None => unsafe { std::env::remove_var("GROK_LHC_ROOT") },
-        }
-        match prev_compact {
-            Some(v) => unsafe { std::env::set_var("GROK_LHC_COMPACT", v) },
-            None => unsafe { std::env::remove_var("GROK_LHC_COMPACT") },
         }
     }
 

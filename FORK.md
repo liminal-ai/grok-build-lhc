@@ -421,18 +421,15 @@ Chunk 1 means the first real upstream sync already has a proven fallback.)
 ## Gating
 
 - **On by default** in this fork. Unset `GROK_LHC` (and no
-  `[lhc] enabled = false`) → capture/serving enabled. Disable only for
-  troubleshooting: `GROK_LHC=0` / `false` / `off`, or
-  `[lhc] enabled = false` (env wins when set). Side-by-side vs stock Grok:
-  use upstream builds, not this fork with the gate flipped.
+  `[lhc] enabled = false`) → capture, serving, and **Replace** compact are
+  active. Disable only for troubleshooting: `GROK_LHC=0` / `false` / `off`,
+  or `[lhc] enabled = false` (env wins when set). Side-by-side vs stock Grok:
+  use **upstream** builds, not this fork with the kill switch flipped.
+- Compact: when LHC is on, mode is always **Replace** (writes back via
+  `replace_conversation_for_compaction`). No staging gates, no Shadow path.
+  One kill switch: `GROK_LHC=0`.
 - `GROK_LHC_ROOT` / `[lhc].root` overrides the LHC storage root (default
-  `~/.lhc`) for tests.
-- `GROK_LHC_COMPACT=replace` alone does **not** enable Replace. Requires also
-  `GROK_LHC_COMPACT_EXPERIMENTAL=1` (or `[lhc] compact_experimental = true`).
-  Without it, mode stays Shadow. When Replace is active, successful compact
-  **writes back** into native state (`replace_conversation_for_compaction`) —
-  ruled architecture, not a workaround (see
-  `crates/lhc/grok-lhc-host/MAPPING.md`).
+  `~/.grok-lhc`) for tests.
 - `GROK_LHC_INFERENCE_MODEL` / `[lhc].inference_model` overrides the derivation
   inference model. **Default is `grok-4.5`** (never the session chat model).
   Thinking is fixed at **low** (`ReasoningEffort::Low`). **Scoped ruling:**
@@ -450,7 +447,8 @@ Chunk 1 means the first real upstream sync already has a proven fallback.)
   drain surface: capped `drainSettled` at session close only. Compact never
   waits on derivation.
 - `/lhc` slash command: status / health / repair / per-session on / off.
-- Live cert checklist: `crates/lhc/grok-lhc-host/LIVE_RUNBOOK.md`.
+- Live cert checklist: `crates/lhc/grok-lhc-host/LIVE_RUNBOOK.md`
+  (rollback + drills; no arming gates).
 
 ## Rollback runbook (Chunk 3A)
 

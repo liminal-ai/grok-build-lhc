@@ -25,18 +25,18 @@ FORK/MAPPING prose. Each item is runnable end-to-end.
   differs. Input-coverage gaps on the harness/G2 seed are accepted (not a
   regen trigger).
 
-**How Replace is armed (needed by L1–L5)**
+**Product defaults (no arming)**
+
+LHC is fully on in this fork: capture + **Replace** compact +
+`~/.grok-lhc` root. Start the shell the way you normally do. Confirm with
+`/lhc status` (capture active, `compact=replace`, inference model shown).
+
+Optional overrides:
 
 ```bash
-# LHC is on by default in this fork — no GROK_LHC=1 required
-export GROK_LHC_COMPACT=replace
-export GROK_LHC_COMPACT_EXPERIMENTAL=1   # required; replace alone stays Shadow
-# optional: export GROK_LHC_ROOT=/tmp/lhc-live-$USER
+# export GROK_LHC_ROOT=/tmp/lhc-live-$USER
 # leave GROK_LHC_INFERENCE_MODEL unset → default grok-4.5
 ```
-
-Then start the shell the way you normally do for this fork. Confirm with
-`/lhc status` (capture active, compact=replace, inference model shown).
 
 **Global stop / rollback**
 
@@ -46,8 +46,8 @@ Then start the shell the way you normally do for this fork. Confirm with
    engine native).
 2. Process-wide: `export GROK_LHC=0` (or `[lhc] enabled = false`); restart.
    Unset alone leaves default-on.
-3. Explicit off is the rollback at every point — do not leave Replace armed
-   after a failed live item unless the failure criteria say to keep evidence.
+3. Explicit off is the only kill switch — do not leave LHC on after a
+   failed live item unless the failure criteria say to keep evidence.
 
 ---
 
@@ -55,7 +55,7 @@ Then start the shell the way you normally do for this fork. Confirm with
 
 | Field | Value |
 |---|---|
-| **Setup** | Repo root. Readable `~/.grok/auth.json` (live bearer). Env as in “How Replace is armed”. No `GROK_LHC_INFERENCE_MODEL` override. |
+| **Setup** | Repo root. Readable `~/.grok/auth.json` (live bearer). LHC on by default (Replace). No `GROK_LHC_INFERENCE_MODEL` override. |
 | **Commands** | `cargo test -p xai-grok-shell --lib l3_g2_real_inference_writeback_body_vs_fixture -- --ignored --nocapture` |
 | **Cadence** | Before each Phase-3 sign-off; after any derivation-lane / sampler / compact-drain change. **Not** in the tripwire (credentials + minutes of network). |
 | **Scenario** | Automated seed ≥ continuation full budget (**6×5000 words/msg**, ≈60k tokens) loaded as **one history batch** at `spawn_capture` — not paced turns with Background gaps. Test calls production `replace_compact_for_writeback` (selection-only; compact never drains). |

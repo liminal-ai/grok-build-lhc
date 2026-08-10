@@ -2046,12 +2046,13 @@ pub(crate) fn remove_hooks_path_from_file(
 /// ```toml
 /// [lhc]
 /// # enabled = false                 # only if you need to disable
-/// root = "/var/lib/lhc"
-/// compact = "shadow"                # or "replace" (needs compact_experimental)
-/// compact_experimental = false
+/// root = "~/.grok-lhc"
 /// equivalence = true
 /// inference_model = "grok-4.5"
 /// ```
+///
+/// Compact is always Replace when enabled; there is no compact mode key.
+/// Kill switch: `GROK_LHC=0` or `enabled = false`.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct LhcConfig {
@@ -2060,10 +2061,6 @@ pub struct LhcConfig {
     pub enabled: Option<bool>,
     /// Storage root override (maps to `GROK_LHC_ROOT`).
     pub root: Option<std::path::PathBuf>,
-    /// Compaction mode: `"shadow"` (default) or `"replace"`.
-    pub compact: Option<String>,
-    /// Gate for Replace mode (maps to `GROK_LHC_COMPACT_EXPERIMENTAL`).
-    pub compact_experimental: bool,
     /// Equivalence instrumentation (default true; set false to disarm).
     pub equivalence: Option<bool>,
     /// Optional inference model override for LHC ModelCall.
@@ -2103,16 +2100,6 @@ impl LhcConfig {
             // and the key was present (`Option` — omit means default-on).
             enabled: if section_ok { file.enabled } else { None },
             root: if section_ok { file.root.clone() } else { None },
-            compact: if section_ok {
-                file.compact.clone()
-            } else {
-                None
-            },
-            compact_experimental: if section_ok {
-                Some(file.compact_experimental)
-            } else {
-                None
-            },
             equivalence: if section_ok { file.equivalence } else { None },
             inference_model: if section_ok {
                 file.inference_model.clone()
