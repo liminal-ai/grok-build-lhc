@@ -1,15 +1,13 @@
 # Build → Linux Daytona smoke → GitHub Release (same artifacts, no rebuild).
 #
-# Triggers:
-#   - push of tags matching v* (e.g. v0.1.0)
-#   - workflow_dispatch with version input
-#
 # Pipeline:
-#   1. build linux/mac/windows on Blacksmith
-#   2. smoke Linux artifact on Daytona (same run artifacts)
-#   3. publish Release only if smoke passes
+#   1. prep version
+#   2. build-linux (gate path) + build-mac / build-windows in parallel
+#   3. smoke Linux artifact on Daytona (needs only build-linux)
+#   4. publish Release after smoke + all platform builds that finished
+#      (mac optional: non-blocking so Blacksmith mac queue cannot stall release)
 #
-# dry_run=true: steps 1–2 only (no Release). Use sparingly; prefer full path.
+# dry_run=true: build + smoke only (no Release). Prefer full path for real cuts.
 
 name: Release
 
@@ -68,64 +66,74 @@ jobs:
           echo "dry_run=$DRY" >> "$GITHUB_OUTPUT"
           echo "Resolved version=$V tag=v$V dry_run=$DRY"
 
-  build:
-    name: Build ${{ matrix.label }}
+  # ── Platform builds (independent jobs so smoke is not gated on mac) ──
+
+  build-linux:
+    name: Build linux-x86_64
     needs: prep
-    runs-on: ${{ matrix.runner }}
+    runs-on: blacksmith-32vcpu-ubuntu-2404
     timeout-minutes: 180
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: linux-x86_64
-            runner: blacksmith-32vcpu-ubuntu-2404
-            os: linux
-            arch: x86_64
-            ext: ""
-          - label: macos-aarch64
-            runner: blacksmith-12vcpu-macos-26
-            os: macos
-            arch: aarch64
-            ext: ""
-          - label: windows-x86_64
-            runner: blacksmith-32vcpu-windows-2025
-            os: windows
-            arch: x86_64
-            ext: ".exe"
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 1
-
-      - name: Install C toolchain (Linux)
-        if: runner.os == 'Linux'
+      - name: Install C toolchain
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config cmake protobuf-compiler
-
-      - name: Install C toolchain (macOS)
-        if: runner.os == 'macOS'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.0"
+      - name: Install DotSlash
         shell: bash
         run: |
           set -euo pipefail
-          if ! command -v cc >/dev/null 2>&1; then
-            xcode-select -p || sudo xcode-select --install || true
-          fi
-          if ! command -v cmake >/dev/null 2>&1; then
-            brew install cmake || true
-          fi
-          if ! command -v protoc >/dev/null 2>&1; then
-            brew install protobuf || true
-          fi
+          cargo install dotslash --locked
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          command -v dotslash
+          if [ -x bin/protoc ]; then bin/protoc --version || true; fi
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-linux-x86_64-v3
+          workspaces: "."
+      - name: Build release binary
+        shell: bash
+        env:
+          GROK_VERSION: ${{ needs.prep.outputs.version }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
           command -v cc
-          cc --version | head -1
+          cargo build -p xai-grok-pager-bin --release
+          BIN="target/release/xai-grok-pager"
+          test -f "$BIN"
+          OUT="grok-${{ needs.prep.outputs.version }}-linux-x86_64"
+          cp "$BIN" "$OUT"
+          chmod +x "$OUT"
+          ls -la "$OUT"
+          "./$OUT" --version 2>/dev/null || "./$OUT" -V 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: grok-linux-x86_64
+          path: grok-${{ needs.prep.outputs.version }}-linux-x86_64
+          if-no-files-found: error
+          retention-days: 14
 
-      - name: Install protoc (Windows)
-        if: runner.os == 'Windows'
+  build-windows:
+    name: Build windows-x86_64
+    needs: prep
+    runs-on: blacksmith-32vcpu-windows-2025
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+      - name: Install protoc
         shell: pwsh
         run: |
           $ver = "29.3"
@@ -141,50 +149,20 @@ jobs:
           if (Test-Path "bin\protoc") {
             Move-Item "bin\protoc" "bin\protoc.dotslash-unix" -Force
           }
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.94.0"
-
       - name: Install DotSlash
         shell: bash
         run: |
           set -euo pipefail
           cargo install dotslash --locked
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.cargo/bin:$PATH"
-          command -v dotslash
-          if [ "${{ runner.os }}" != "Windows" ] && [ -x bin/protoc ]; then
-            bin/protoc --version || true
-          fi
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-${{ matrix.label }}-v2
+          shared-key: release-windows-x86_64-v3
           workspaces: "."
-
-      - name: Build release binary (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        env:
-          GROK_VERSION: ${{ needs.prep.outputs.version }}
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.cargo/bin:$PATH"
-          command -v cc
-          cargo build -p xai-grok-pager-bin --release
-          BIN="target/release/xai-grok-pager"
-          test -f "$BIN"
-          OUT="grok-${{ needs.prep.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}"
-          cp "$BIN" "$OUT"
-          chmod +x "$OUT"
-          ls -la "$OUT"
-          "./$OUT" --version 2>/dev/null || "./$OUT" -V 2>/dev/null || true
-
-      - name: Build release binary (Windows)
-        if: runner.os == 'Windows'
+      - name: Build release binary
         shell: pwsh
         env:
           GROK_VERSION: ${{ needs.prep.outputs.version }}
@@ -200,20 +178,83 @@ jobs:
           Copy-Item $bin $out
           Get-Item $out | Format-List Name, Length
           & ".\$out" --version
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: grok-${{ matrix.label }}
-          path: grok-${{ needs.prep.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}
+          name: grok-windows-x86_64
+          path: grok-${{ needs.prep.outputs.version }}-windows-x86_64.exe
           if-no-files-found: error
           retention-days: 14
 
-  # Gate: same-run Linux artifact → Daytona install + basic checks.
-  # Publish will not run if this fails (no rebuild; no release of unsmoked bits).
+  # Prefer GitHub-hosted macOS so Blacksmith mac capacity cannot stall the release.
+  build-macos:
+    name: Build macos-aarch64
+    needs: prep
+    runs-on: macos-14
+    timeout-minutes: 180
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+      - name: Install C toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v cc >/dev/null 2>&1; then
+            xcode-select -p || sudo xcode-select --install || true
+          fi
+          if ! command -v cmake >/dev/null 2>&1; then
+            brew install cmake || true
+          fi
+          if ! command -v protoc >/dev/null 2>&1; then
+            brew install protobuf || true
+          fi
+          command -v cc
+          cc --version | head -1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.0"
+      - name: Install DotSlash
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install dotslash --locked
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          command -v dotslash
+          if [ -x bin/protoc ]; then bin/protoc --version || true; fi
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-macos-aarch64-v3
+          workspaces: "."
+      - name: Build release binary
+        shell: bash
+        env:
+          GROK_VERSION: ${{ needs.prep.outputs.version }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          command -v cc
+          cargo build -p xai-grok-pager-bin --release
+          BIN="target/release/xai-grok-pager"
+          test -f "$BIN"
+          OUT="grok-${{ needs.prep.outputs.version }}-macos-aarch64"
+          cp "$BIN" "$OUT"
+          chmod +x "$OUT"
+          ls -la "$OUT"
+          "./$OUT" --version 2>/dev/null || "./$OUT" -V 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: grok-macos-aarch64
+          path: grok-${{ needs.prep.outputs.version }}-macos-aarch64
+          if-no-files-found: error
+          retention-days: 14
+
+  # Gate: Linux artifact from this run only — not blocked by mac/windows.
   smoke-linux:
     name: Smoke Linux (Daytona)
-    needs: [prep, build]
+    needs: [prep, build-linux]
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
@@ -242,10 +283,18 @@ jobs:
           export GROK_ARTIFACT_PATH="$ART"
           python scripts/daytona-smoke/smoke_linux.py
 
+  # Publish after Linux smoke + Windows (friends). Mac is best-effort
+  # (continue-on-error) so a starved mac runner cannot block the release.
   publish:
     name: Publish GitHub Release
-    needs: [prep, build, smoke-linux]
-    if: needs.prep.outputs.dry_run != 'true'
+    needs: [prep, build-linux, build-windows, build-macos, smoke-linux]
+    if: |
+      always() &&
+      needs.prep.outputs.dry_run != 'true' &&
+      needs.prep.result == 'success' &&
+      needs.build-linux.result == 'success' &&
+      needs.build-windows.result == 'success' &&
+      needs.smoke-linux.result == 'success'
     runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - name: Checkout (for notes)
@@ -254,9 +303,18 @@ jobs:
           fetch-depth: 1
           submodules: recursive
 
-      - name: Download all build artifacts
+      - name: Download linux + windows artifacts
         uses: actions/download-artifact@v4
         with:
+          path: dist
+          pattern: grok-{linux,windows}-*
+          merge-multiple: true
+
+      - name: Download macos artifact (optional)
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: grok-macos-aarch64
           path: dist
           merge-multiple: true
 
@@ -269,10 +327,16 @@ jobs:
           set -euo pipefail
           cd dist
           ls -la
+          test -f "grok-${VERSION}-linux-x86_64"
+          test -f "grok-${VERSION}-windows-x86_64.exe"
           sha256sum grok-* > SHA256SUMS
           cat SHA256SUMS
           UPSTREAM_REV=$(cat ../SOURCE_REV 2>/dev/null || echo unknown)
           LHC_PIN=$(git -C ../crates/lhc/vendor/long-horizon-context rev-parse --short HEAD 2>/dev/null || echo unknown)
+          MAC_NOTE="included"
+          if [ ! -f "grok-${VERSION}-macos-aarch64" ]; then
+            MAC_NOTE="missing (build optional / failed — Linux+Windows released)"
+          fi
           {
             echo "## grok-build-lhc ${TAG}"
             echo
@@ -284,10 +348,11 @@ jobs:
             echo "| **Upstream SOURCE_REV** | \`${UPSTREAM_REV}\` |"
             echo "| **LHC submodule** | \`${LHC_PIN}\` |"
             echo "| **Linux smoke** | Daytona install + --version / --help (same artifacts) |"
+            echo "| **macOS arm64** | ${MAC_NOTE} |"
             echo
             echo "### Install"
             echo
-            echo "Assets match the built-in \`gh-release\` updater:"
+            echo "Assets match the built-in \`gh-release\` updater where present:"
             echo "\`grok-${VERSION}-{linux,macos,windows}-{x86_64,aarch64}\`."
             echo
             echo "Manual (Linux x86_64 example):"
@@ -321,7 +386,7 @@ jobs:
           files: |
             dist/grok-*
             dist/SHA256SUMS
-          fail_on_unmatched_files: true
+          fail_on_unmatched_files: false
           generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
