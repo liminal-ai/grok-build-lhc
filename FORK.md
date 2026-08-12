@@ -204,6 +204,15 @@ bands under real budgets for that kill test to be meaningful.
 
 ## Sync record
 
+### 2026-08-12 — LIM-40: `8a14c91..be713136` (3 monorepo squashes)
+
+- Merged `upstream/main` into `lhc`; FF `main` to `be713136`.
+- `SOURCE_REV` monorepo id → `5d08d7e4123092567ccd584cd9f99afa2972065c` (distinct from public BASE).
+- `patches/BASE` → `be713136…`; regenerated `0001-lhc-touchpoints.patch`.
+- Conflict: `xai-grok-update` reinstall hints — kept fork GitHub Releases, adopted channel-aware API.
+- Tripwire: see following commit.
+
+
 ### 2026-08-09 — Wave B Slice 3 validation R2: final-output fidelity + open readiness
 
 Correction on top of Slice 3 retrieval tools (still pin `dd251ec`; `main`
