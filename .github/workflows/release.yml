@@ -52,6 +52,7 @@ jobs:
           set -euo pipefail
           python3 -m py_compile scripts/grok-lhc-release/*.py scripts/daytona-smoke/*.py
           sh -n scripts/grok-lhc-release/install.sh
+      - uses: facebook/install-dotslash@1e4e7b3e07eaca387acb98f1d4720e0bee8dbb6a # v2
       - name: Run authoritative fork tripwire
         run: ./scripts/check-lhc-hooks.sh
 
