@@ -1,0 +1,147 @@
+name: Promote Grok LHC release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release SemVer"
+        required: true
+        type: string
+      candidate_run_id:
+        description: "Successful candidate run id"
+        required: true
+        type: string
+      smoke_run_id:
+        description: "Successful Linux smoke run id"
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: grok-lhc-promote-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Promote exact qualified bytes
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 30
+    environment: production
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Verify candidate and smoke identities
+        id: identity
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          SMOKE_RUN_ID: ${{ inputs.smoke_run_id }}
+        run: |
+          set -euo pipefail
+          candidate="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID")"
+          smoke="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SMOKE_RUN_ID")"
+          test "$(jq -r .conclusion <<<"$candidate")" = success
+          test "$(jq -r .path <<<"$candidate")" = .github/workflows/release.yml
+          test "$(jq -r .conclusion <<<"$smoke")" = success
+          test "$(jq -r .path <<<"$smoke")" = .github/workflows/release-smoke.yml
+          source_sha="$(jq -r .head_sha <<<"$candidate")"
+          test "$source_sha" = "$(jq -r .head_sha <<<"$smoke")"
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: grok-lhc-v${{ inputs.version }}-candidate
+          path: candidate
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.candidate_run_id }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: grok-lhc-qualification-${{ inputs.candidate_run_id }}
+          path: qualification
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.smoke_run_id }}
+      - name: Reverify exact candidate and manifest
+        env:
+          VERSION: ${{ inputs.version }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          (cd candidate && sha256sum -c SHA256SUMS)
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          manifest = json.loads(Path("candidate/release-manifest.json").read_text())
+          assert manifest["release_version"] == os.environ["VERSION"]
+          assert manifest["candidate_run_id"] == os.environ["CANDIDATE_RUN_ID"]
+          assert manifest["source_commit"] == os.environ["SOURCE_SHA"]
+          assert manifest["published_platforms"] == ["linux-x86_64"]
+          assert [item["platform"] for item in manifest["artifacts"] if "platform" in item] == ["linux-x86_64"]
+          assert {item["path"] for item in manifest["artifacts"]} == {
+              f"grok-{os.environ['VERSION']}-linux-x86_64", "install.sh"
+          }
+          evidence = json.loads(Path("qualification/qualification.json").read_text())
+          assert evidence == {
+              "candidate_run_id": os.environ["CANDIDATE_RUN_ID"],
+              "version": os.environ["VERSION"],
+              "result": "passed",
+              "platform": "linux-x86_64",
+          }
+          PY
+      - name: Refuse an existing tag or release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          git fetch --tags origin
+          if git show-ref --verify --quiet "refs/tags/v${VERSION}"; then
+            echo "tag v${VERSION} already exists" >&2
+            exit 1
+          fi
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[].tag_name' > existing-releases.txt
+          if grep -Fxq "v${VERSION}" existing-releases.txt; then
+            echo "release v${VERSION} already exists" >&2
+            exit 1
+          fi
+      - name: Write truthful release notes
+        env:
+          VERSION: ${{ inputs.version }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          SMOKE_RUN_ID: ${{ inputs.smoke_run_id }}
+        run: |
+          cat > RELEASE_NOTES.md <<EOF
+          ## Grok-LHC v${VERSION}
+
+          This release publishes one prebuilt Linux x86-64 binary. The exact
+          candidate bytes passed Daytona install, identity, default-on LHC
+          prompt/assistant/turn persistence, uninstall, and data-preservation
+          checks. Windows x86-64 and macOS Apple Silicon remain maintained
+          source-compatibility targets but are not prebuilt in this release lane.
+
+          Candidate run: ${CANDIDATE_RUN_ID}
+          Linux smoke run: ${SMOKE_RUN_ID}
+          LHC thread schema: v6
+
+          This is not an official xAI release. Verify SHA256SUMS and
+          release-manifest.json before installation.
+          EOF
+      - name: Publish without rebuilding
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
+        with:
+          tag_name: v${{ inputs.version }}
+          name: Grok-LHC v${{ inputs.version }}
+          target_commitish: ${{ steps.identity.outputs.source_sha }}
+          body_path: RELEASE_NOTES.md
+          files: |
+            candidate/grok-*-linux-x86_64
+            candidate/install.sh
+            candidate/release-manifest.json
+            candidate/SHA256SUMS
+          fail_on_unmatched_files: true
+          generate_release_notes: false

@@ -43,19 +43,19 @@ When a release exists on
 [liminal-ai/grok-build-lhc releases](https://github.com/liminal-ai/grok-build-lhc/releases):
 
 ```bash
-# Linux x86_64 example — asset names: grok-{version}-{os}-{arch}
-VERSION=0.1.0   # set to the release you want
+VERSION=0.2.0   # set to the release you want
+mkdir -p "grok-lhc-v${VERSION}"
 gh release download "v${VERSION}" --repo liminal-ai/grok-build-lhc \
-  --pattern "grok-${VERSION}-linux-x86_64" --output grok
-chmod +x grok
-sudo mv grok /usr/local/bin/grok   # or ~/.local/bin/grok
+  --dir "grok-lhc-v${VERSION}"
+sh "grok-lhc-v${VERSION}/install.sh" --version "$VERSION" \
+  --asset-dir "grok-lhc-v${VERSION}"
 ```
 
 | Platform | Asset pattern |
 |---|---|
 | Linux x86_64 | `grok-*-linux-x86_64` |
-| macOS Apple Silicon | `grok-*-macos-aarch64` |
-| Windows x86_64 | `grok-*-windows-x86_64.exe` |
+| macOS Apple Silicon | source compatibility maintained; no current prebuilt |
+| Windows x86_64 | source compatibility maintained; no current prebuilt |
 
 Installs as **`grok`**. This is the **liminal-ai LHC fork**, not official xAI.
 Do **not** update with `curl \| https://x.ai/cli/install.sh` — that replaces
@@ -64,9 +64,11 @@ the fork with stock Grok.
 After install, `grok update` (when you enable auto-update or run it manually)
 pulls from **this repo’s** GitHub Releases and prints **grok-build-lhc**.
 
-Cut a release: push tag `vX.Y.Z` on `lhc`, or Actions → **Release** →
-workflow_dispatch. CI **builds** (Blacksmith) → **Linux smoke** (Daytona on
-the same artifacts) → **publishes** the Release only if smoke passes.
+Maintainers cut releases through three manual stages: **Grok LHC candidate**
+builds one immutable Linux bundle, **Grok LHC Linux smoke** qualifies those
+exact bytes in Daytona, and **Promote Grok LHC release** republishes them
+without rebuilding after protected Lee/CTO approval. A source tag alone does
+not publish anything.
 
 ## 4. Build from source
 

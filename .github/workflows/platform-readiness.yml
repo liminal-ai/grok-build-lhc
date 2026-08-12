@@ -1,0 +1,40 @@
+name: Grok LHC source compatibility
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 1 * *"
+
+permissions:
+  contents: read
+
+jobs:
+  readiness:
+    name: Source check ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: windows-x86_64
+            runner: windows-latest
+            kind: windows
+          - label: macos-aarch64
+            runner: blacksmith-12vcpu-macos-15
+            kind: unix
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
+        with:
+          toolchain: "1.94.0"
+      - uses: facebook/install-dotslash@1e4e7b3e07eaca387acb98f1d4720e0bee8dbb6a # v2
+      - name: Install Windows protoc
+        if: matrix.kind == 'windows'
+        shell: pwsh
+        run: choco install protoc --no-progress -y
+      - name: Check product and LHC adapter
+        run: cargo check --locked -p xai-grok-pager-bin -p grok-lhc-host

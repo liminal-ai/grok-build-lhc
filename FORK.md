@@ -400,15 +400,28 @@ Chunk 1 means the first real upstream sync already has a proven fallback.)
 
 ## Releases
 
-- Workflow: [`.github/workflows/release.yml`](.github/workflows/release.yml)
-- **Pipeline:** build-linux → **Daytona Linux smoke** (gate) → publish same
-  artifacts; build-windows required for publish; build-macos best-effort
-  (does not block smoke/publish if mac runner is starved)
-- Trigger: push tag `vX.Y.Z` or workflow_dispatch (`dry_run` = build+smoke only)
-- Assets: `grok-{ver}-linux-x86_64`, `grok-{ver}-macos-aarch64` (if built),
-  `grok-{ver}-windows-x86_64.exe` (+ SHA256SUMS)
-- Runners: Blacksmith (linux/windows); GitHub `macos-14` for arm64;
-  smoke needs secret `DAYTONA_API_KEY`
+- Candidate: [`.github/workflows/release.yml`](.github/workflows/release.yml)
+- Linux smoke: [`.github/workflows/release-smoke.yml`](.github/workflows/release-smoke.yml)
+- Protected promotion: [`.github/workflows/release-promote.yml`](.github/workflows/release-promote.yml)
+- **Pipeline:** validate `CANDIDATE_HANDOFF` → build one immutable Linux
+  x86-64 candidate → generate manifest/checksums → Daytona install/default
+  capture/uninstall proof → Lee/CTO approval → publish those exact bytes.
+- Candidate handoff fields: product/version, exact source SHA, xAI monorepo
+  `SOURCE_REV`, public-git/recovery `patches/BASE`, certified LHC SDK pin,
+  thread schema, clean fork/vendor, successful fork tripwire evidence,
+  user-visible changes, and known limitations.
+- The candidate workflow requires the full handoff source SHA and tripwire
+  evidence and checks out that exact SHA. `SOURCE_REV` and `patches/BASE` are
+  recorded separately because they identify the xAI monorepo source and the
+  public-git recovery base, respectively.
+- Current prebuilt asset: `grok-{ver}-linux-x86_64`, plus the checksummed
+  installer, manifest, and `SHA256SUMS`.
+- Windows x86-64 and Apple Silicon macOS remain maintained source-compatibility
+  targets under `platform-readiness.yml`; they are not current prebuilt assets.
+- Candidate, smoke, and promotion are manual. Pushing a source tag does not
+  build or publish a release. Promotion refuses an existing tag/release.
+- Smoke needs secret `DAYTONA_API_KEY`; promotion uses the protected
+  `production` environment.
 - Updater: `GH_RELEASE_REPO = liminal-ai/grok-build-lhc`; UI says
   **grok-build-lhc**. Auto-update defaults **off** until the user opts in.
 

@@ -5,26 +5,25 @@ Requires:
   DAYTONA_API_KEY
 
 Inputs (env):
-  GROK_ARTIFACT_PATH  — local path to grok-*-linux-x86_64 binary
-  or GROK_ARTIFACT_URL — https URL to download the binary
+  GROK_CANDIDATE_DIR — immutable candidate directory
+  GROK_LHC_VERSION — candidate version
 
-Checks (phase 1 basics):
+Checks:
   1. Create ephemeral Linux sandbox (daytona-medium)
-  2. Upload binary as ~/grok, chmod +x
+  2. Upload and install the exact checksummed candidate
   3. Dynamic linker / shared libs resolve (ldd)
   4. `grok --version` exits 0 and prints a version
   5. `grok --help` exits 0
-  6. Optional: GROK_LHC=0 still runs --version (gate doesn't crash binary)
-
-Does not yet: full TUI, /lhc interactive, long-horizon session e2e.
+  6. Run a deterministic headless turn and verify prompt, assistant response,
+     schema v6, and completed turn durability after process exit
+  7. Uninstall managed files while preserving user/LHC data
 """
 
 from __future__ import annotations
 
 import os
+import re
 import sys
-import tempfile
-import urllib.request
 from pathlib import Path
 
 from daytona import CreateSandboxFromSnapshotParams, Daytona, FileUpload
@@ -39,21 +38,11 @@ def ok(msg: str) -> None:
     print(f"OK: {msg}")
 
 
-def resolve_artifact() -> Path:
-    path = os.environ.get("GROK_ARTIFACT_PATH")
-    url = os.environ.get("GROK_ARTIFACT_URL")
-    if path:
-        p = Path(path)
-        if not p.is_file():
-            fail(f"GROK_ARTIFACT_PATH not a file: {p}")
-        return p
-    if url:
-        dest = Path(tempfile.gettempdir()) / "grok-linux-smoke-artifact"
-        print(f"Downloading {url} -> {dest}")
-        urllib.request.urlretrieve(url, dest)
-        dest.chmod(0o755)
-        return dest
-    fail("Set GROK_ARTIFACT_PATH or GROK_ARTIFACT_URL")
+def candidate_dir() -> Path:
+    candidate = Path(os.environ.get("GROK_CANDIDATE_DIR", ""))
+    if not candidate.is_dir():
+        fail(f"GROK_CANDIDATE_DIR not a directory: {candidate}")
+    return candidate
 
 
 def require_key() -> None:
@@ -63,7 +52,13 @@ def require_key() -> None:
 
 def main() -> None:
     require_key()
-    artifact = resolve_artifact()
+    candidate = candidate_dir()
+    version = os.environ.get("GROK_LHC_VERSION", "")
+    if not version:
+        fail("GROK_LHC_VERSION is not set")
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[.-][0-9A-Za-z.-]+)?", version):
+        fail(f"invalid GROK_LHC_VERSION: {version}")
+    artifact = candidate / f"grok-{version}-linux-x86_64"
     size = artifact.stat().st_size
     if size < 1_000_000:
         fail(f"artifact looks too small ({size} bytes): {artifact}")
@@ -85,12 +80,29 @@ def main() -> None:
     )
     ok(f"sandbox {sb.id} state={sb.state}")
 
-    remote = "/home/daytona/grok"
+    remote_candidate = "/home/daytona/candidate"
+    remote_installer = f"{remote_candidate}/install.sh"
+    remote_lifecycle = "/home/daytona/grok_lhc_lifecycle.py"
+    remote = "/home/daytona/prefix/bin/grok-lhc-smoke"
     try:
-        sb.fs.upload_files(
-            [FileUpload(source=str(artifact), destination=remote)]
+        mkdir = sb.process.exec(f"mkdir -p {remote_candidate}")
+        if mkdir.exit_code != 0:
+            fail(f"could not create candidate directory: {mkdir.result}")
+        uploads = [
+            FileUpload(source=str(path), destination=f"{remote_candidate}/{path.name}")
+            for path in candidate.iterdir() if path.is_file()
+        ]
+        lifecycle = Path(__file__).with_name("grok_lhc_lifecycle.py")
+        uploads.append(FileUpload(source=str(lifecycle), destination=remote_lifecycle))
+        sb.fs.upload_files(uploads)
+        ok(f"uploaded immutable candidate -> {remote_candidate}")
+
+        install = sb.process.exec(
+            f"HOME=/home/daytona/home sh {remote_installer} --version {version} --name grok-lhc-smoke --prefix /home/daytona/prefix --install-root /home/daytona/packages --asset-dir {remote_candidate}",
+            timeout=60,
         )
-        ok(f"uploaded -> {remote}")
+        if install.exit_code != 0:
+            fail(f"install failed: {install.result}")
 
         r = sb.process.exec(f"chmod +x {remote} && file {remote} && ldd {remote} 2>&1 | head -30")
         print(r.result or "")
@@ -131,6 +143,29 @@ def main() -> None:
         if r.exit_code != 0:
             fail(f"version with GROK_LHC=0 failed: {r.exit_code}")
         ok("version with GROK_LHC=0 ok")
+
+        persistence = sb.process.exec(
+            f"python3 {remote_lifecycle} {remote} /home/daytona/home /home/daytona/lhc-data {remote_candidate}/release-manifest.json",
+            timeout=90,
+        )
+        print(persistence.result or "")
+        if persistence.exit_code != 0 or "LHC_PERSISTENCE_PASS" not in (persistence.result or ""):
+            fail(f"default-on LHC persistence failed: {persistence.exit_code}")
+        ok("default-on LHC prompt/assistant/turn persistence")
+
+        uninstall = sb.process.exec(
+            f"HOME=/home/daytona/home sh {remote_installer} --name grok-lhc-smoke --prefix /home/daytona/prefix --install-root /home/daytona/packages --uninstall && test ! -e {remote}",
+            timeout=60,
+        )
+        if uninstall.exit_code != 0:
+            fail(f"uninstall/data preservation failed: {uninstall.result}")
+        preserved = sb.process.exec(
+            f"python3 {remote_lifecycle} --verify-only /home/daytona/lhc-data {remote_candidate}/release-manifest.json",
+            timeout=60,
+        )
+        if preserved.exit_code != 0 or "LHC_PERSISTENCE_PASS" not in (preserved.result or ""):
+            fail(f"uninstall did not preserve captured LHC data: {preserved.result}")
+        ok("uninstall preserved captured LHC data")
 
         print("SMOKE_PASS linux")
     finally:
