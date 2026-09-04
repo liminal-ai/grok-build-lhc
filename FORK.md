@@ -204,6 +204,89 @@ bands under real budgets for that kill test to be meaningful.
 
 ## Sync record
 
+### 2026-09-04 — `be713136..72a61251` (15 monorepo squashes, ~432k insertions)
+
+Merged `upstream/main` into `lhc` (merge commit `8acc2fba`); FF `main` to
+`72a61251`. Ancestry intact, ordinary merge. 18 conflicts, all in
+fork-touched files; ten of eleven touchpoint files changed upstream.
+`patches/BASE` → `72a61251…`; `0001-lhc-touchpoints.patch` regenerated
+(44 paths, derived list). README banner: intact after merge, no re-apply
+needed. Root `Cargo.toml`: auto-merged, `crates/lhc/grok-lhc-host` retained.
+Vendor pin unchanged at `dd251ec` (slice 3 bumps it). No new LHC-HOOK
+markers (still 10).
+
+Tripwire: ALL GREEN (sentinel 10/10, workspace member, compile, fmt ×2,
+unit 177, golden 5, certification 110, chunk3b 10, pin on certified line).
+`cargo test -p grok-lhc-host`: 177 + 5 green. Extra evidence:
+`xai-grok-shell --lib` filtered to lhc / rewind_cross_compaction /
+record_response_token_usage / rate_limit_backoff / frozen_attempt /
+reinstall_hint → 32 passed, 2 ignored (live-cert only); `xai-chat-state`
+366 green; `xai-grok-update` 132 green.
+
+**Per-hook placement (what moved around it; why it still fires at the same moment):**
+
+| Hook | Upstream movement | Placement / why the moment is unchanged |
+|---|---|---|
+| 1 `xai-grok-shell/Cargo.toml` | Upstream added `xai-compaction-transcript` dep and a `xai-grok-bundle` test-support dev-dep at the same lines. | Both kept side by side. Dependency edge only; no timing. |
+| 2 `spawn.rs` | Upstream folded `update_resource(task_wake_suppressed)` into an earlier `update_resources_with` block and gated `harness_metrics` on `!is_subagent`. | Tee wrap (marker) auto-merged untouched. The Wave B retrieval-tool registration block stays right after resource setup and before `harness_metrics`; it still runs once the session's tool bridge exists and before the first turn. Dropped the pre-refactor `update_resource` line upstream removed. |
+| 3 `model_switch.rs` | Upstream added `is_family_switch` at the top and a `config_notice` → `notify_config_options` arm right where the hook sits. | Hook 3 stays immediately after `notify_model_changed`, before the upstream config-options notice and before `ModelSwitched` telemetry, so the LHC model-change event is recorded at the same point relative to `handle.reasoning_effort = applied_effort`. `previous_reasoning_effort` capture kept at the top. |
+| 4 `turn.rs` | `turn.rs` grew ~1k lines (length salvage, transient retry, rate-limit budget). `build_request` call and the sampler submit are unchanged in order. | Auto-merged. Still: `build_request` → `prepare_sampler_for_turn` (freeze) → **hook 4 serve** → header stamps → `run_turn_via_sampler`. See sampler_turn note below. |
+| 5 `compaction.rs` | Upstream moved transcript rendering to `xai-compaction-transcript`; `run_compact_only` gained `lossy_input: bool`; doc comments reflowed. | Marker unchanged in `check_auto_compact_needed`; the writer chokes (`lhc_compact_drive_native_writer`) stay first in both `run_compact` (manual) and `run_compact_only` (auto / model-switch), before `compaction.cancel.enter()`. Mid-turn: the auto-compact check still runs in the sampling loop before each model call. |
+| 6 `session/mod.rs` | No conflict. | `mod lhc_inference` declaration unchanged. |
+| 7 `actor/state.rs` | No conflict. | Pending usage + identity fields unchanged. |
+| 8 `actor/mutations.rs` | Upstream split `push_message` into `persist_and_push_message` + `push_model_output` + `push_unreported_model_output` (usage-reported vs unreported model output). | Stash site (marker) unchanged. The consume moved into `persist_and_push_message`, the single persist choke all three entry points feed, so pending usage is still taken exactly once on the `Assistant` persist and identity still clones onto preceding `Reasoning`. |
+| 9 `persistence.rs` | Upstream added `replace_history_for_strip_and_ack` (backup-gated image-strip rewrite) and `StripOutcome`. | Marker unchanged. Adapter tee implements the new method as inner-only delegation (see design note). |
+| 10 `turn.rs` | After-turn fan-out unchanged. | Single post-match site after `report_turn_end`; barrier on `get_conversation_len` kept. |
+
+**sampler_turn.rs (hook-4 support, not a marker):** upstream now has
+`run_turn_via_sampler` push config itself and loop on 429s with re-pushes
+(`submit_turn_request` split). Kept the fork contract: the caller freezes the
+attempt (`prepare_sampler_for_turn` → `SamplerAttemptIdentity`) before hook 4;
+the redundant in-method first push was removed (a second push could race a
+concurrent `SetSessionModel` past the frozen identity — the race the Wave B
+test `frozen_attempt_identity_survives_config_switch_before_stamp` pins).
+**Known residual:** the re-push after a 429 backoff (subagent pacing path)
+freezes a new attempt whose identity is not propagated to the caller; a model
+switch during that backoff would stamp the response with the pre-backoff
+identity. Fix candidates (steward call): have `run_turn_via_sampler` take
+`&mut SamplerAttemptIdentity`, or record the last frozen identity on the actor.
+
+**tool_calls.rs (Wave B R2 final-output fidelity):** upstream extracted
+`render_non_replaced_tool_body`; the `get_turns` / `get_messages` byte-exact
+exemption is now an early return inside it (no extraction, no PathRewriter,
+tool-layer images discarded). Test
+`lhc_retrieval_final_output_tests` updated to `BridgeToolSuccess`.
+
+**Design note — image strip vs LHC serving (open, steward):** upstream's new
+`replace_history_for_strip_and_ack` rewrites native history with poisoned
+images removed. Item keys are content digests, so mirroring the stripped
+copies into LHC would record them as novel events beside the originals; the
+tee therefore delegates to inner only. Consequence under LHC serving: hook 4
+serves the LHC view, which still carries the original image blocks, so a
+strip does not take effect on the served context. Not fixed here; belongs
+with the content-blocks work (slice 2/3).
+
+**SyntheticReason drift:** `LengthContinue` (mid-turn continue reminder,
+`starts_prompt_turn = false`) and `AgentMessage` (turn start) added upstream;
+`Unknown` flipped to `starts_prompt_turn = true` (fail-safe boundary).
+`mapping.rs` follows the predicate exhaustively; `golden_every_synthetic_reason`
+now expects 24 events / 7 turn_ends and `synthetic_reasons.json` was
+regenerated under `UPDATE_GOLDENS=1` — classified as (2) input coverage
+change (two new reasons shift indices), not a calibration regen.
+
+**Non-LHC fork fixes carried (not in the touchpoint table):** `a0cadea9`
+(headless cold-attach servicing) and `6ae0d201` (defer stale-task completion
+drain past cold `LoadSessionResponse`). Upstream still awaits reconcile
+receivers on the load critical path, so both were kept and merged with
+upstream's `sessionKind=headless` meta. Recorded here so the next sync does
+not mistake them for stale drift.
+
+**Upstream-as-published test bugs worked around:** `upload/memory_tests.rs`
+imports two nonexistent, unused helpers (trimmed);
+`xai-grok-pager/tests/registered_features_are_documented.rs` includes
+`docs/internal/*.md` files that are not in the public repo (left alone; not a
+fork target).
+
 ### 2026-08-12 — LIM-40: `8a14c91..be713136` (3 monorepo squashes)
 
 - Merged `upstream/main` into `lhc`; FF `main` to `be713136`.
