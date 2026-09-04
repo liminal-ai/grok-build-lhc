@@ -1598,8 +1598,13 @@ impl SessionActor {
     ///
     /// Caller must have already called [`Self::prepare_sampler_for_turn`]
     /// for this attempt (so hook-4 signature gating and response identity
-    /// stamping share the same frozen attempt config). This method only
-    /// submits via `SamplerHandle::submit_and_collect` and returns:
+    /// stamping share the same frozen attempt config) and passes that frozen
+    /// identity in as `frozen`. The only config re-push inside this method
+    /// (after a paced 429 backoff, where a token can expire) writes the
+    /// newly frozen identity back into `frozen`, so the caller always stamps
+    /// the response with the identity of the submission that produced it.
+    /// This method otherwise only submits via
+    /// `SamplerHandle::submit_and_collect` and returns:
     /// * `Ok(SamplerTurnOutcome::Response(_))` - model responded.
     /// * `Ok(SamplerTurnOutcome::CompactAndResubmit)` - compaction
     ///    ran, the outer turn loop should `continue`.
@@ -1613,8 +1618,9 @@ impl SessionActor {
         budget: &mut RateLimitWaitBudget,
         transient: TransientRetryState,
         mid_salvage_continuation: bool,
+        frozen: &mut SamplerAttemptIdentity,
     ) -> Result<SamplerTurnOutcome, acp::Error> {
-        // Caller froze this attempt via `prepare_sampler_for_turn` (hook-4 gate +
+        // Caller froze `frozen` via `prepare_sampler_for_turn` (hook-4 gate +
         // response identity). Do not re-push config here: a second push could
         // race a concurrent `SetSessionModel` past the frozen identity.
         if !budget.can_wait() {
@@ -1656,11 +1662,10 @@ impl SessionActor {
                     // Esc cancels a turn by aborting its task, so this await point is itself the cancellation point; no select needed
                     sleep(backoff).await;
                     // A token can expire across minutes of accumulated waits.
-                    // Fork note: this re-push freezes a new attempt whose identity
-                    // is not propagated to the caller's `attempt_identity`; a model
-                    // switch inside a 429 backoff is a known residual (FORK.md sync
-                    // record 2026-09-04).
-                    let _ = self.prepare_sampler_for_turn().await;
+                    // The re-push freezes a new attempt; hand it back so a model
+                    // switch during the backoff is what the response is stamped
+                    // with (FIFO UpdateConfig → Submit still holds).
+                    *frozen = self.prepare_sampler_for_turn().await;
                 }
             }
         }

@@ -2644,7 +2644,7 @@ impl SessionActor {
             // signature admission and response stamping share the exact
             // config this attempt will use (FIFO UpdateConfig → Submit).
             // Auth-retry / compact-resubmit re-enter this loop and freeze again.
-            let attempt_identity = self.prepare_sampler_for_turn().await;
+            let mut attempt_identity = self.prepare_sampler_for_turn().await;
             // LHC-HOOK 4/10: substitute LHC request context after build_request
             // (+ live identity for signature gate). Cheap atomic first, then
             // per-session registry — no mutex when off. Instrumented-redundant
@@ -2750,6 +2750,7 @@ impl SessionActor {
                         enabled: transient_retry_enabled,
                     },
                     salvage.awaiting_continuation(),
+                    &mut attempt_identity,
                 )
                 .await
             {

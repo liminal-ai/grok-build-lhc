@@ -173,11 +173,18 @@ async fn subagent_429_wait_is_owned_and_capped_by_the_pacer() {
             let request = conversation_request(&actor).await;
             let requests_before = server.request_count();
             let mut budget = actor.rate_limit_wait_budget();
+            let mut attempt = actor.prepare_sampler_for_turn().await;
 
             let started = tokio::time::Instant::now();
             let outcome = tokio::time::timeout(
                 Duration::from_secs(300),
-                actor.run_turn_via_sampler(request, &mut budget, transient_state(0, true), false),
+                actor.run_turn_via_sampler(
+                    request,
+                    &mut budget,
+                    transient_state(0, true),
+                    false,
+                    &mut attempt,
+                ),
             )
             .await
             .expect("turn must finish within timeout");
@@ -222,10 +229,17 @@ async fn paced_wait_notifies_the_client_with_a_retrying_state() {
                     .await;
             let request = conversation_request(&actor).await;
             let mut budget = actor.rate_limit_wait_budget();
+            let mut attempt = actor.prepare_sampler_for_turn().await;
 
             let outcome = tokio::time::timeout(
                 Duration::from_secs(30),
-                actor.run_turn_via_sampler(request, &mut budget, transient_state(0, true), false),
+                actor.run_turn_via_sampler(
+                    request,
+                    &mut budget,
+                    transient_state(0, true),
+                    false,
+                    &mut attempt,
+                ),
             )
             .await
             .expect("turn must finish within timeout");
@@ -279,10 +293,17 @@ async fn exhausted_subagent_budget_notifies_exhausted_with_the_attempts_taken() 
                     .await;
             let request = conversation_request(&actor).await;
             let mut budget = actor.rate_limit_wait_budget();
+            let mut attempt = actor.prepare_sampler_for_turn().await;
 
             let outcome = tokio::time::timeout(
                 Duration::from_secs(60),
-                actor.run_turn_via_sampler(request, &mut budget, transient_state(0, true), false),
+                actor.run_turn_via_sampler(
+                    request,
+                    &mut budget,
+                    transient_state(0, true),
+                    false,
+                    &mut attempt,
+                ),
             )
             .await
             .expect("turn must finish within timeout");
@@ -342,6 +363,7 @@ async fn main_session_429_is_owned_by_the_sampler_never_the_pacer() {
                 let request = conversation_request(&actor).await;
                 let requests_before = server.request_count();
                 let mut budget = actor.rate_limit_wait_budget();
+                let mut attempt = actor.prepare_sampler_for_turn().await;
 
                 let outcome = tokio::time::timeout(
                     Duration::from_secs(30),
@@ -350,6 +372,7 @@ async fn main_session_429_is_owned_by_the_sampler_never_the_pacer() {
                         &mut budget,
                         transient_state(0, true),
                         false,
+                        &mut attempt,
                     ),
                 )
                 .await
@@ -412,6 +435,7 @@ async fn run_burst(n: usize, cap: usize) -> BurstMetrics {
         .map(|(actor, request)| {
             tokio::task::spawn_local(async move {
                 let mut budget = actor.rate_limit_wait_budget();
+                let mut attempt = actor.prepare_sampler_for_turn().await;
                 tokio::time::timeout(
                     Duration::from_secs(60),
                     actor.run_turn_via_sampler(
@@ -419,6 +443,7 @@ async fn run_burst(n: usize, cap: usize) -> BurstMetrics {
                         &mut budget,
                         transient_state(0, true),
                         false,
+                        &mut attempt,
                     ),
                 )
                 .await
@@ -460,6 +485,91 @@ async fn subagents_over_cap_all_complete_under_paced_time() {
                 metrics.failed, 0,
                 "no turn may fail terminally under the cap"
             );
+        })
+        .await;
+}
+
+/// Wave B race, backoff variant: a model switch that lands while the pacer
+/// sleeps on a 429 must be what the response is stamped with. The in-loop
+/// config re-push after the backoff hands its newly frozen identity back to
+/// the caller through `&mut attempt`; the resubmit goes out under the
+/// switched backend, and the stamp input agrees with it.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn frozen_attempt_identity_follows_repush_after_429_backoff() {
+    use xai_grok_sampling_types::ApiBackend;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let server = MockInferenceServer::start_with_models(vec![MockModelEntry::new("test")])
+                .await
+                .expect("mock inference server");
+            server.set_keep_requests(true);
+            server.enqueue_response("/v1/responses", rate_limited_reply(30));
+
+            let (actor, _retries) =
+                actor_under_test(&server, SessionKind::Subagent, sampler_surfaces_429(), true)
+                    .await;
+            let request = conversation_request(&actor).await;
+
+            // Exact prepare point the turn loop uses before hook 4.
+            let mut attempt = actor.prepare_sampler_for_turn().await;
+            assert_eq!(attempt.api_backend, ApiBackend::Responses);
+            assert_eq!(attempt.model, "test");
+
+            // Concurrent SetSessionModel while the pacer is asleep on the 429.
+            let switcher = actor.clone();
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let mut cfg = switcher
+                    .chat_state_handle
+                    .get_sampling_config()
+                    .await
+                    .expect("config");
+                cfg.api_backend = ApiBackend::ChatCompletions;
+                cfg.model = "test-b".to_string();
+                switcher.chat_state_handle.update_sampling_config(cfg);
+            });
+
+            let mut budget = actor.rate_limit_wait_budget();
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(120),
+                actor.run_turn_via_sampler(
+                    request,
+                    &mut budget,
+                    transient_state(0, true),
+                    false,
+                    &mut attempt,
+                ),
+            )
+            .await
+            .expect("turn must finish within timeout");
+            let response = match outcome {
+                Ok(SamplerTurnOutcome::Response(r, _)) => r,
+                Ok(_) => panic!("expected a Response after the paced resubmit"),
+                Err(err) => panic!("paced turn must survive the 429: {err:?}"),
+            };
+            assert_eq!(budget.attempts_used(), 1, "exactly one paced 429");
+
+            // The resubmit went out under the switched config (FIFO UpdateConfig → Submit).
+            assert!(
+                server.has_chat_completion_request(),
+                "post-backoff resubmit must use the switched backend: {}",
+                server.request_log_summary()
+            );
+            // …and the identity the caller stamps with is that submission's, not the pre-backoff freeze.
+            assert_eq!(
+                attempt.api_backend,
+                ApiBackend::ChatCompletions,
+                "re-push must hand the post-backoff identity back to the caller"
+            );
+            assert_eq!(attempt.model, "test-b");
+
+            // Stamp input at the production call site: the frozen attempt API.
+            actor.record_response_token_usage(&response, None, attempt.api_backend.clone());
+            let _ = actor.chat_state_handle.get_conversation().await;
+            // Stamped pending identity is proven end-to-end in xai-chat-state
+            // `response_identity_uses_frozen_attempt_api_despite_config_switch`.
         })
         .await;
 }

@@ -245,11 +245,16 @@ attempt (`prepare_sampler_for_turn` → `SamplerAttemptIdentity`) before hook 4;
 the redundant in-method first push was removed (a second push could race a
 concurrent `SetSessionModel` past the frozen identity — the race the Wave B
 test `frozen_attempt_identity_survives_config_switch_before_stamp` pins).
-**Known residual:** the re-push after a 429 backoff (subagent pacing path)
-freezes a new attempt whose identity is not propagated to the caller; a model
-switch during that backoff would stamp the response with the pre-backoff
-identity. Fix candidates (steward call): have `run_turn_via_sampler` take
-`&mut SamplerAttemptIdentity`, or record the last frozen identity on the actor.
+**Residual, fixed same day (steward: option A):** the re-push after a 429
+backoff (subagent pacing path) used to freeze a new attempt whose identity
+never reached the caller. `run_turn_via_sampler` now takes
+`frozen: &mut SamplerAttemptIdentity` and the in-loop re-push writes back into
+it, so the caller stamps with the identity of the submission that produced
+the response. Pinned by
+`rate_limit_backoff_tests::frozen_attempt_identity_follows_repush_after_429_backoff`
+(model + backend switch lands during the paced sleep; resubmit goes out under
+the switched backend and the stamp input agrees). No new hook, markers
+unchanged (10/10).
 
 **tool_calls.rs (Wave B R2 final-output fidelity):** upstream extracted
 `render_non_replaced_tool_body`; the `get_turns` / `get_messages` byte-exact

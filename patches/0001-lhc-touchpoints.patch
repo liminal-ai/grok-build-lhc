@@ -1971,7 +1971,7 @@ index dde7e38f..6696d173 100644
              old_handle.abort();
          }
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs
-index 94b4f388..6baef622 100644
+index 94b4f388..c99651b5 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs
 @@ -979,15 +979,20 @@ impl SessionActor {
@@ -2017,15 +2017,20 @@ index 94b4f388..6baef622 100644
      }
  
      /// Fold an auth remedy into a turn failure: its advice becomes the tail of the message.
-@@ -1585,6 +1595,18 @@ impl SessionActor {
+@@ -1585,17 +1595,34 @@ impl SessionActor {
      }
  
      /// Drive one turn through the sampler, pacing a subagent's 429s via `budget`.
 +    ///
 +    /// Caller must have already called [`Self::prepare_sampler_for_turn`]
 +    /// for this attempt (so hook-4 signature gating and response identity
-+    /// stamping share the same frozen attempt config). This method only
-+    /// submits via `SamplerHandle::submit_and_collect` and returns:
++    /// stamping share the same frozen attempt config) and passes that frozen
++    /// identity in as `frozen`. The only config re-push inside this method
++    /// (after a paced 429 backoff, where a token can expire) writes the
++    /// newly frozen identity back into `frozen`, so the caller always stamps
++    /// the response with the identity of the submission that produced it.
++    /// This method otherwise only submits via
++    /// `SamplerHandle::submit_and_collect` and returns:
 +    /// * `Ok(SamplerTurnOutcome::Response(_))` - model responded.
 +    /// * `Ok(SamplerTurnOutcome::CompactAndResubmit)` - compaction
 +    ///    ran, the outer turn loop should `continue`.
@@ -2036,34 +2041,34 @@ index 94b4f388..6baef622 100644
      pub(crate) async fn run_turn_via_sampler(
          self: &Arc<Self>,
          request: ConversationRequest,
-@@ -1592,10 +1614,9 @@ impl SessionActor {
+         budget: &mut RateLimitWaitBudget,
          transient: TransientRetryState,
          mid_salvage_continuation: bool,
++        frozen: &mut SamplerAttemptIdentity,
      ) -> Result<SamplerTurnOutcome, acp::Error> {
 -        // Per-turn auth refresh and sampler config push
 -        // Mirrors `prepare_chat_completion(false)` from the legacy path
 -        self.prepare_sampler_for_turn().await;
 -
-+        // Caller froze this attempt via `prepare_sampler_for_turn` (hook-4 gate +
++        // Caller froze `frozen` via `prepare_sampler_for_turn` (hook-4 gate +
 +        // response identity). Do not re-push config here: a second push could
 +        // race a concurrent `SetSessionModel` past the frozen identity.
          if !budget.can_wait() {
              // Nothing will send this request a second time, so move it into the sampler instead of deep-cloning the whole message history on every main-session turn
              return match self.submit_turn_request(request).await {
-@@ -1635,7 +1656,11 @@ impl SessionActor {
+@@ -1635,7 +1662,10 @@ impl SessionActor {
                      // Esc cancels a turn by aborting its task, so this await point is itself the cancellation point; no select needed
                      sleep(backoff).await;
                      // A token can expire across minutes of accumulated waits.
 -                    self.prepare_sampler_for_turn().await;
-+                    // Fork note: this re-push freezes a new attempt whose identity
-+                    // is not propagated to the caller's `attempt_identity`; a model
-+                    // switch inside a 429 backoff is a known residual (FORK.md sync
-+                    // record 2026-09-04).
-+                    let _ = self.prepare_sampler_for_turn().await;
++                    // The re-push freezes a new attempt; hand it back so a model
++                    // switch during the backoff is what the response is stamped
++                    // with (FIFO UpdateConfig → Submit still holds).
++                    *frozen = self.prepare_sampler_for_turn().await;
                  }
              }
          }
-@@ -2068,15 +2093,32 @@ impl SessionActor {
+@@ -2068,15 +2098,32 @@ impl SessionActor {
  
      /// Propagate the model-reported token usage from a turn response into chat state, the per-prompt usage ledger, and per-turn signals.
      ///
@@ -2423,7 +2428,7 @@ index 46f83774..836b8579 100644
          let mut inline_images: Vec<ContentPart> = Vec::new();
          let extraction = if !self.is_cursor_harness()
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
-index 7d091d1a..4a8aaf88 100644
+index 7d091d1a..1830f75e 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
 @@ -1462,6 +1462,40 @@ impl SessionActor {
@@ -2475,7 +2480,7 @@ index 7d091d1a..4a8aaf88 100644
 +            // signature admission and response stamping share the exact
 +            // config this attempt will use (FIFO UpdateConfig → Submit).
 +            // Auth-retry / compact-resubmit re-enter this loop and freeze again.
-+            let attempt_identity = self.prepare_sampler_for_turn().await;
++            let mut attempt_identity = self.prepare_sampler_for_turn().await;
 +            // LHC-HOOK 4/10: substitute LHC request context after build_request
 +            // (+ live identity for signature gate). Cheap atomic first, then
 +            // per-session registry — no mutex when off. Instrumented-redundant
@@ -2531,7 +2536,15 @@ index 7d091d1a..4a8aaf88 100644
              request.x_grok_turn_idx =
                  Some(self.chat_state_handle.get_prompt_index().await.to_string());
              request.x_grok_agent_id = Some(xai_grok_telemetry::id::agent_id());
-@@ -2983,7 +3073,11 @@ impl SessionActor {
+@@ -2660,6 +2750,7 @@ impl SessionActor {
+                         enabled: transient_retry_enabled,
+                     },
+                     salvage.awaiting_continuation(),
++                    &mut attempt_identity,
+                 )
+                 .await
+             {
+@@ -2983,7 +3074,11 @@ impl SessionActor {
                      },
                  );
              }
@@ -4433,6 +4446,189 @@ index 63c41fc0..339907fc 100644
      use image::{ImageBuffer, Rgba};
      let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
          ImageBuffer::from_pixel(32, 32, Rgba([128, 64, 32, 255]));
+diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/turn/rate_limit_backoff_tests.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/turn/rate_limit_backoff_tests.rs
+index a241e5b0..7aa7f6e6 100644
+--- a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/turn/rate_limit_backoff_tests.rs
++++ b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/turn/rate_limit_backoff_tests.rs
+@@ -173,11 +173,18 @@ async fn subagent_429_wait_is_owned_and_capped_by_the_pacer() {
+             let request = conversation_request(&actor).await;
+             let requests_before = server.request_count();
+             let mut budget = actor.rate_limit_wait_budget();
++            let mut attempt = actor.prepare_sampler_for_turn().await;
+ 
+             let started = tokio::time::Instant::now();
+             let outcome = tokio::time::timeout(
+                 Duration::from_secs(300),
+-                actor.run_turn_via_sampler(request, &mut budget, transient_state(0, true), false),
++                actor.run_turn_via_sampler(
++                    request,
++                    &mut budget,
++                    transient_state(0, true),
++                    false,
++                    &mut attempt,
++                ),
+             )
+             .await
+             .expect("turn must finish within timeout");
+@@ -222,10 +229,17 @@ async fn paced_wait_notifies_the_client_with_a_retrying_state() {
+                     .await;
+             let request = conversation_request(&actor).await;
+             let mut budget = actor.rate_limit_wait_budget();
++            let mut attempt = actor.prepare_sampler_for_turn().await;
+ 
+             let outcome = tokio::time::timeout(
+                 Duration::from_secs(30),
+-                actor.run_turn_via_sampler(request, &mut budget, transient_state(0, true), false),
++                actor.run_turn_via_sampler(
++                    request,
++                    &mut budget,
++                    transient_state(0, true),
++                    false,
++                    &mut attempt,
++                ),
+             )
+             .await
+             .expect("turn must finish within timeout");
+@@ -279,10 +293,17 @@ async fn exhausted_subagent_budget_notifies_exhausted_with_the_attempts_taken()
+                     .await;
+             let request = conversation_request(&actor).await;
+             let mut budget = actor.rate_limit_wait_budget();
++            let mut attempt = actor.prepare_sampler_for_turn().await;
+ 
+             let outcome = tokio::time::timeout(
+                 Duration::from_secs(60),
+-                actor.run_turn_via_sampler(request, &mut budget, transient_state(0, true), false),
++                actor.run_turn_via_sampler(
++                    request,
++                    &mut budget,
++                    transient_state(0, true),
++                    false,
++                    &mut attempt,
++                ),
+             )
+             .await
+             .expect("turn must finish within timeout");
+@@ -342,6 +363,7 @@ async fn main_session_429_is_owned_by_the_sampler_never_the_pacer() {
+                 let request = conversation_request(&actor).await;
+                 let requests_before = server.request_count();
+                 let mut budget = actor.rate_limit_wait_budget();
++                let mut attempt = actor.prepare_sampler_for_turn().await;
+ 
+                 let outcome = tokio::time::timeout(
+                     Duration::from_secs(30),
+@@ -350,6 +372,7 @@ async fn main_session_429_is_owned_by_the_sampler_never_the_pacer() {
+                         &mut budget,
+                         transient_state(0, true),
+                         false,
++                        &mut attempt,
+                     ),
+                 )
+                 .await
+@@ -412,6 +435,7 @@ async fn run_burst(n: usize, cap: usize) -> BurstMetrics {
+         .map(|(actor, request)| {
+             tokio::task::spawn_local(async move {
+                 let mut budget = actor.rate_limit_wait_budget();
++                let mut attempt = actor.prepare_sampler_for_turn().await;
+                 tokio::time::timeout(
+                     Duration::from_secs(60),
+                     actor.run_turn_via_sampler(
+@@ -419,6 +443,7 @@ async fn run_burst(n: usize, cap: usize) -> BurstMetrics {
+                         &mut budget,
+                         transient_state(0, true),
+                         false,
++                        &mut attempt,
+                     ),
+                 )
+                 .await
+@@ -463,3 +488,88 @@ async fn subagents_over_cap_all_complete_under_paced_time() {
+         })
+         .await;
+ }
++
++/// Wave B race, backoff variant: a model switch that lands while the pacer
++/// sleeps on a 429 must be what the response is stamped with. The in-loop
++/// config re-push after the backoff hands its newly frozen identity back to
++/// the caller through `&mut attempt`; the resubmit goes out under the
++/// switched backend, and the stamp input agrees with it.
++#[tokio::test(flavor = "current_thread", start_paused = true)]
++async fn frozen_attempt_identity_follows_repush_after_429_backoff() {
++    use xai_grok_sampling_types::ApiBackend;
++
++    let local = tokio::task::LocalSet::new();
++    local
++        .run_until(async {
++            let server = MockInferenceServer::start_with_models(vec![MockModelEntry::new("test")])
++                .await
++                .expect("mock inference server");
++            server.set_keep_requests(true);
++            server.enqueue_response("/v1/responses", rate_limited_reply(30));
++
++            let (actor, _retries) =
++                actor_under_test(&server, SessionKind::Subagent, sampler_surfaces_429(), true)
++                    .await;
++            let request = conversation_request(&actor).await;
++
++            // Exact prepare point the turn loop uses before hook 4.
++            let mut attempt = actor.prepare_sampler_for_turn().await;
++            assert_eq!(attempt.api_backend, ApiBackend::Responses);
++            assert_eq!(attempt.model, "test");
++
++            // Concurrent SetSessionModel while the pacer is asleep on the 429.
++            let switcher = actor.clone();
++            tokio::task::spawn_local(async move {
++                tokio::time::sleep(Duration::from_secs(1)).await;
++                let mut cfg = switcher
++                    .chat_state_handle
++                    .get_sampling_config()
++                    .await
++                    .expect("config");
++                cfg.api_backend = ApiBackend::ChatCompletions;
++                cfg.model = "test-b".to_string();
++                switcher.chat_state_handle.update_sampling_config(cfg);
++            });
++
++            let mut budget = actor.rate_limit_wait_budget();
++            let outcome = tokio::time::timeout(
++                Duration::from_secs(120),
++                actor.run_turn_via_sampler(
++                    request,
++                    &mut budget,
++                    transient_state(0, true),
++                    false,
++                    &mut attempt,
++                ),
++            )
++            .await
++            .expect("turn must finish within timeout");
++            let response = match outcome {
++                Ok(SamplerTurnOutcome::Response(r, _)) => r,
++                Ok(_) => panic!("expected a Response after the paced resubmit"),
++                Err(err) => panic!("paced turn must survive the 429: {err:?}"),
++            };
++            assert_eq!(budget.attempts_used(), 1, "exactly one paced 429");
++
++            // The resubmit went out under the switched config (FIFO UpdateConfig → Submit).
++            assert!(
++                server.has_chat_completion_request(),
++                "post-backoff resubmit must use the switched backend: {}",
++                server.request_log_summary()
++            );
++            // …and the identity the caller stamps with is that submission's, not the pre-backoff freeze.
++            assert_eq!(
++                attempt.api_backend,
++                ApiBackend::ChatCompletions,
++                "re-push must hand the post-backoff identity back to the caller"
++            );
++            assert_eq!(attempt.model, "test-b");
++
++            // Stamp input at the production call site: the frozen attempt API.
++            actor.record_response_token_usage(&response, None, attempt.api_backend.clone());
++            let _ = actor.chat_state_handle.get_conversation().await;
++            // Stamped pending identity is proven end-to-end in xai-chat-state
++            // `response_identity_uses_frozen_attempt_api_despite_config_switch`.
++        })
++        .await;
++}
 diff --git a/crates/codegen/xai-grok-shell/src/session/compaction.rs b/crates/codegen/xai-grok-shell/src/session/compaction.rs
 index 5ce113f0..b085a65a 100644
 --- a/crates/codegen/xai-grok-shell/src/session/compaction.rs
