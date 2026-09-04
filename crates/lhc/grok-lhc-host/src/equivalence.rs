@@ -920,6 +920,7 @@ mod tests {
                 SessionThreadViewEntry::Message(SessionThreadViewMessage::User(
                     SessionUserMessage {
                         content: "run".into(),
+                        blocks: None,
                         source_messages: vec![SessionThreadViewEntrySource {
                             message_id: "u".into(),
                             idempotency_key: Some("u".into()),
@@ -936,6 +937,7 @@ mod tests {
                             tool_call_id: Some("c1".into()),
                             tool_name: Some(tool_name.into()),
                             arguments: Some(args),
+                            block: None,
                         }],
                         source_messages: vec![SessionThreadViewEntrySource {
                             message_id: "a".into(),

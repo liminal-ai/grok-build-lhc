@@ -37,11 +37,12 @@ certification) remains.
   commits of the SDK repo's `main` only (Phase 2 acceptance `358c8d1` or
   later; the historical `lhc-rs-port` working branch was retired into `main`
   2026-08-08). Never copy the port in; bump the pin and record it here.
-  Current pin: `dd251ec` (certified Wave B code tip — R1–R6 retrieval +
-  thinking-signature/provenance schema + clean-tail windows; gate 584).
-  Later LHC `main` commit `7493f36` is bookkeeping only and is **not** the
-  pin. Wave B Slice 1 advances the pin and host schema compatibility only;
-  retrieval tools and host identity/provenance wiring are later slices.
+  Current pin: `e9456a6e` (LHC `origin/main` 2026-09-04 — turn parts
+  (schema 12 step index), content blocks (schema 13 blob table), bounded
+  metadata-first compact, compact-continuation runtime; lhc-rs gate 846).
+  Thread schema **13**. Previous pin `dd251ec` (Wave B code tip, schema 6,
+  gate 584) — see the 2026-09-04 slice 3 sync record for the adapter drift
+  repaired across 6 → 13.
 - `patches/` — every core touchpoint as a re-appliable `format-patch` file
   (see `patches/README.md`). The history-reset recovery path.
 - `scripts/check-lhc-hooks.sh` — the three-layer tripwire (sentinel count,
@@ -203,6 +204,55 @@ The production choke still uses `params: None`; live Replace must produce
 bands under real budgets for that kill test to be meaningful.
 
 ## Sync record
+
+### 2026-09-04 — slice 3: vendor pin `dd251ec` → `e9456a6e` (thread schema 6 → 13)
+
+Submodule-only certified code tip advance on `heron/sync` (no upstream
+merge; `main` stays `72a61251`). 273 LHC commits in the range (57 lhc-rs
+files, +19k lines): turn parts (schema 12, host step index, steer
+membership, newest-closed protection, bounded metadata-first compact),
+content blocks (schema 13, blob table, block payloads, blob-inlined
+serving), compact-continuation runtime, bounded/read-mostly opens.
+
+Adapter drift repaired (`crates/lhc/grok-lhc-host`, no new LHC-HOOK marker):
+- `CompactOpts.compact_point_upper_bound` (None — protected-pair pinning is
+  a cc-lhc host concern) and `ViewCompactParams.newest_closed_protection`
+  (None — profile default 0.6) at every literal, incl. the shell test
+  `lhc_derivation_quality_timing.rs`.
+- Session-view shapes: `SessionUserMessage.blocks`,
+  `SessionToolResultMessage.blocks`, `SessionAssistantPart.block`, and 15
+  new API-typed `SessionAssistantPartType`s (served as their placeholder
+  line; Grok's AssistantItem is text + tool calls).
+- `EventRecord::text_payload()` is runtime_note-only at v13; adapter tests
+  read prompts through `prompt_or_note_text()`; goldens decode `user_prompt`
+  as `UserPromptPayload`.
+- Content blocks, adapter half of slice 2: `ContentPart::Image` in a prompt
+  or `ToolResultItem.images` map to Messages API `image` blocks (base64
+  source for `data:` URLs — bytes go to the blob table — url source
+  otherwise) beside `text` blocks; `text`/`content` stay text-only. Serving
+  restores `ContentPart::Image` / `images` from the inlined blocks ahead of
+  the boundary; bands carry the `[image · media · size]` placeholder. The
+  legacy `[image:{url-preview}]` text form is gone from new records
+  (`golden full_turn.json` refreshed under `UPDATE_GOLDENS=1`, one entry).
+- Prune gate (`writeback_gates.rs`, test-util): the tail sample no longer
+  re-adds the system prefix — at this pin a 12-turn thread under the
+  harness's tight params compacts to `[system, one band]`, and the second
+  system occurrence was a genuinely new event.
+
+Migration 6 → 13 on copies of all 61 `~/.grok-lhc` threads: 60 opened and
+migrated (59 × schema 6, 1 × schema 5 with 1920 events / 33 turns), counts
+and last message unchanged on every file; the zero-byte schema-0 file is
+refused (`ThreadNotFound`, "not an lhc thread file") and left at 0 bytes.
+Report: heron `slice3/migration-report.md`.
+
+Tripwire: ALL GREEN (sentinel 10/10, workspace member, compile, fmt ×2,
+unit 177, golden 5, certification 110, chunk3b **11** (+ b9 image blocks:
+blob row, band placeholder, tail image restored), pin on `origin/main`,
+0 behind). Extra: `xai-grok-shell --lib` lhc-filtered 33 passed / 2
+ignored; `xai-chat-state` 366; `xai-grok-update` lib 132 (its
+`test_install_sh` binary fails on this box for lack of
+`frontend/apps/grok-desktop/scripts/install.sh` — not in this checkout,
+unrelated to LHC).
 
 ### 2026-09-04 — `be713136..72a61251` (15 monorepo squashes, ~432k insertions)
 

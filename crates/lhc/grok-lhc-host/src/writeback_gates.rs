@@ -134,7 +134,17 @@ pub fn run_five_gates_on_body(
             .filter(|i| matches!(i, ConversationItem::System(_)))
             .cloned()
             .collect();
-        pruned.extend(body.iter().rev().take(2).cloned());
+        // The tail sample skips the system prefix already copied above: at the
+        // v13 pin a small thread under tight params can compact to
+        // [system, one band], and re-adding the system item would be a second
+        // occurrence — a genuinely new event, not a prune.
+        pruned.extend(
+            body.iter()
+                .filter(|i| !matches!(i, ConversationItem::System(_)))
+                .rev()
+                .take(2)
+                .cloned(),
+        );
         assert!(pruned.len() < body.len() || body.len() <= 3);
         for _ in 0..3 {
             handle.replace_history(&pruned);
@@ -175,8 +185,8 @@ pub fn run_five_gates_on_body(
             let hits = after
                 .iter()
                 .filter(|e| {
-                    e.text_payload()
-                        .is_some_and(|p| p.text.contains(needle.as_str()))
+                    e.prompt_or_note_text()
+                        .is_some_and(|t| t.contains(needle.as_str()))
                 })
                 .count();
             assert_eq!(hits, 1, "gate summary ({label}): needle count {hits}");
@@ -248,8 +258,8 @@ pub fn run_five_gates_on_body(
             let count = after_retry
                 .iter()
                 .filter(|e| {
-                    e.text_payload()
-                        .is_some_and(|p| p.text.contains(needle.as_str()))
+                    e.prompt_or_note_text()
+                        .is_some_and(|t| t.contains(needle.as_str()))
                 })
                 .count();
             assert_eq!(
@@ -315,7 +325,17 @@ pub async fn run_five_gates_on_body_async(
             .filter(|i| matches!(i, ConversationItem::System(_)))
             .cloned()
             .collect();
-        pruned.extend(body.iter().rev().take(2).cloned());
+        // The tail sample skips the system prefix already copied above: at the
+        // v13 pin a small thread under tight params can compact to
+        // [system, one band], and re-adding the system item would be a second
+        // occurrence — a genuinely new event, not a prune.
+        pruned.extend(
+            body.iter()
+                .filter(|i| !matches!(i, ConversationItem::System(_)))
+                .rev()
+                .take(2)
+                .cloned(),
+        );
         assert!(pruned.len() < body.len() || body.len() <= 3);
         for _ in 0..3 {
             handle.replace_history(&pruned);
@@ -356,8 +376,8 @@ pub async fn run_five_gates_on_body_async(
             let hits = after
                 .iter()
                 .filter(|e| {
-                    e.text_payload()
-                        .is_some_and(|p| p.text.contains(needle.as_str()))
+                    e.prompt_or_note_text()
+                        .is_some_and(|t| t.contains(needle.as_str()))
                 })
                 .count();
             assert_eq!(hits, 1, "gate summary ({label}): needle count {hits}");
@@ -429,8 +449,8 @@ pub async fn run_five_gates_on_body_async(
             let count = after_retry
                 .iter()
                 .filter(|e| {
-                    e.text_payload()
-                        .is_some_and(|p| p.text.contains(needle.as_str()))
+                    e.prompt_or_note_text()
+                        .is_some_and(|t| t.contains(needle.as_str()))
                 })
                 .count();
             assert_eq!(

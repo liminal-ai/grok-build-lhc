@@ -204,15 +204,9 @@ pub fn map_item(
         }
         ConversationItem::User(user) => match &user.synthetic_reason {
             None => {
-                let text = content_parts_text(&user.content);
-                vec![text_event(
-                    session_id,
-                    generation,
-                    &digest,
-                    occ,
-                    "user_prompt",
-                    &text,
-                    None,
+                let (text, blocks) = content_parts_blocks(&user.content);
+                vec![user_prompt_event(
+                    session_id, generation, &digest, occ, &text, blocks,
                 )]
             }
             Some(reason) => map_synthetic_user(
@@ -374,6 +368,119 @@ pub fn map_history(
         ));
     }
     (out, tracker)
+}
+
+/// Messages API content blocks for a Grok content list (schema v13 content
+/// blocks). Returns the text of the text parts (what text-only readers see)
+/// and, only when an image is present, the full ordered block array: text
+/// parts as `text` blocks, images as `image` blocks. A `data:<media>;base64,`
+/// URL becomes a base64 source (intake moves the bytes to the blob table);
+/// any other URL becomes a `url` source. Text-only content returns `None`
+/// so the recorded payload is byte-identical to the pre-v13 shape.
+fn content_parts_blocks(parts: &[ContentPart]) -> (String, Option<Vec<Map<String, Value>>>) {
+    let has_image = parts.iter().any(|p| matches!(p, ContentPart::Image { .. }));
+    let text = parts
+        .iter()
+        .filter_map(|p| match p {
+            ContentPart::Text { text } => Some(text.as_ref().to_string()),
+            ContentPart::Image { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !has_image {
+        return (text, None);
+    }
+    let blocks = parts
+        .iter()
+        .map(|p| match p {
+            ContentPart::Text { text } => {
+                let mut b = Map::new();
+                b.insert("type".into(), json!("text"));
+                b.insert("text".into(), json!(text.as_ref()));
+                b
+            }
+            ContentPart::Image { url } => image_block(url.as_ref()),
+        })
+        .collect();
+    (text, Some(blocks))
+}
+
+/// `{type:"image", source:{...}}` for one Grok image URL. Key order is the
+/// Messages API order (type, media_type, data) — it is part of the persisted
+/// bytes once the block is stored.
+pub fn image_block(url: &str) -> Map<String, Value> {
+    let mut source = Map::new();
+    match parse_data_url(url) {
+        Some((media_type, data)) => {
+            source.insert("type".into(), json!("base64"));
+            source.insert("media_type".into(), json!(media_type));
+            source.insert("data".into(), json!(data));
+        }
+        None => {
+            source.insert("type".into(), json!("url"));
+            source.insert("url".into(), json!(url));
+        }
+    }
+    let mut b = Map::new();
+    b.insert("type".into(), json!("image"));
+    b.insert("source".into(), Value::Object(source));
+    b
+}
+
+/// `data:<media_type>;base64,<data>` → (media_type, data). Anything else
+/// (plain URL, non-base64 data URL, empty media type) is `None`.
+pub fn parse_data_url(url: &str) -> Option<(&str, &str)> {
+    let rest = url.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    let media_type = meta.strip_suffix(";base64")?;
+    if media_type.is_empty() {
+        return None;
+    }
+    Some((media_type, data))
+}
+
+/// Grok image URL for one served `image` block: base64 sources come back as
+/// the `data:` URL they arrived as; url sources as their URL. Inverse of
+/// [`image_block`] for well-formed blocks.
+pub fn image_block_url(block: &Map<String, Value>) -> Option<String> {
+    let source = block.get("source")?.as_object()?;
+    match source.get("type")?.as_str()? {
+        "base64" => {
+            let media_type = source.get("media_type")?.as_str()?;
+            let data = source.get("data")?.as_str()?;
+            Some(format!("data:{media_type};base64,{data}"))
+        }
+        "url" => Some(source.get("url")?.as_str()?.to_string()),
+        _ => None,
+    }
+}
+
+fn user_prompt_event(
+    session_id: &str,
+    generation: u64,
+    digest: &str,
+    occ: u64,
+    text: &str,
+    blocks: Option<Vec<Map<String, Value>>>,
+) -> MappedEvent {
+    let key = item_event_key(session_id, generation, digest, occ, "user_prompt", None);
+    let mut payload = text_payload(text);
+    if let Some(blocks) = blocks {
+        payload.insert(
+            "blocks".into(),
+            Value::Array(blocks.into_iter().map(Value::Object).collect()),
+        );
+    }
+    MappedEvent {
+        input: MessageEventInput {
+            event_kind: "user_prompt".to_string(),
+            idempotency_key: Some(key),
+            actor: ACTOR.to_string(),
+            harness: HARNESS.to_string(),
+            payload,
+            extra: Map::new(),
+        },
+    }
 }
 
 fn content_parts_text(parts: &[ContentPart]) -> String {
@@ -588,19 +695,35 @@ fn tool_result_event(
         "tool_result",
         Some(result.tool_call_id.as_str()),
     );
-    let mut content = result.content.as_ref().to_string();
-    if !result.images.is_empty() {
-        let images = content_parts_text(&result.images);
-        if content.is_empty() {
-            content = images;
-        } else {
-            content = format!("{content}\n{images}");
-        }
-    }
+    let content = result.content.as_ref().to_string();
     // Host ToolResultItem has no is_error field — omit rather than invent.
     let mut payload = Map::new();
     payload.insert("toolCallId".into(), json!(result.tool_call_id));
     payload.insert("content".into(), json!(content));
+    // Inline images (read_file on an image/PDF) ride as content blocks after
+    // the text: the text block first, then one image block per image, so the
+    // served result restores `ToolResultItem.images` in order.
+    if !result.images.is_empty() {
+        let mut blocks: Vec<Value> = Vec::with_capacity(result.images.len() + 1);
+        if !content.is_empty() {
+            let mut b = Map::new();
+            b.insert("type".into(), json!("text"));
+            b.insert("text".into(), json!(content));
+            blocks.push(Value::Object(b));
+        }
+        for part in &result.images {
+            match part {
+                ContentPart::Image { url } => blocks.push(Value::Object(image_block(url.as_ref()))),
+                ContentPart::Text { text } => {
+                    let mut b = Map::new();
+                    b.insert("type".into(), json!("text"));
+                    b.insert("text".into(), json!(text.as_ref()));
+                    blocks.push(Value::Object(b));
+                }
+            }
+        }
+        payload.insert("blocks".into(), Value::Array(blocks));
+    }
     MappedEvent {
         input: MessageEventInput {
             event_kind: "tool_result".to_string(),

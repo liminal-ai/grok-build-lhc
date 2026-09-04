@@ -113,6 +113,7 @@ fn tight_compact_params() -> ViewCompactParams {
             detailed: Some(25.0),
             brief: Some(25.0),
         }),
+        newest_closed_protection: None,
     }
 }
 
@@ -151,6 +152,7 @@ fn view_src(id: &str) -> SessionThreadViewEntrySource {
 fn view_band(text: &str) -> SessionThreadViewEntry {
     SessionThreadViewEntry::Message(SessionThreadViewMessage::User(SessionUserMessage {
         content: text.into(),
+        blocks: None,
         source_messages: Vec::new(),
     }))
 }
@@ -158,6 +160,7 @@ fn view_band(text: &str) -> SessionThreadViewEntry {
 fn view_user(text: &str, id: &str) -> SessionThreadViewEntry {
     SessionThreadViewEntry::Message(SessionThreadViewMessage::User(SessionUserMessage {
         content: text.into(),
+        blocks: None,
         source_messages: vec![view_src(id)],
     }))
 }
@@ -173,6 +176,7 @@ fn view_assistant_text(text: &str, id: &str) -> SessionThreadViewEntry {
                 tool_call_id: None,
                 tool_name: None,
                 arguments: None,
+                block: None,
             }],
             source_messages: vec![view_src(id)],
 
@@ -196,6 +200,7 @@ fn view_assistant_tool(name: &str, args: &str, id: &str) -> SessionThreadViewEnt
                 tool_call_id: Some("c1".into()),
                 tool_name: Some(name.into()),
                 arguments: Some(arguments),
+                block: None,
             }],
             source_messages: vec![view_src(id)],
 
@@ -212,6 +217,7 @@ fn view_tool_result(name: &str, content: &str, id: &str) -> SessionThreadViewEnt
             tool_call_id: "c1".into(),
             tool_name: Some(name.into()),
             content: content.into(),
+            blocks: None,
             is_error: None,
             source_messages: vec![view_src(id)],
         },
@@ -411,7 +417,11 @@ impl HarnessSession {
     }
 
     fn run_replace_writeback(&self) -> Vec<ConversationItem> {
-        set_compact_params_override_for_test(Some(tight_compact_params()));
+        self.run_replace_writeback_with(tight_compact_params())
+    }
+
+    fn run_replace_writeback_with(&self, params: ViewCompactParams) -> Vec<ConversationItem> {
+        set_compact_params_override_for_test(Some(params));
         reset_compact_call_counters();
         let sid = self.sid.clone();
         let actor = self.actor.clone();
@@ -421,6 +431,7 @@ impl HarnessSession {
                 .await
                 .expect("replace_compact_for_writeback");
             assert_eq!(replace_call_count(), 1);
+            *last_view_slot() = Some(wb.view.clone());
             let bands = band_count(&wb.view);
             eprintln!(
                 "3B harness: view entries={} bands={bands} receipt={}",
@@ -457,6 +468,12 @@ impl HarnessSession {
         wait_registry_gone(&sid);
         drop(self.root);
     }
+}
+
+/// The view of the most recent write-back, for tests that inspect bands.
+fn last_view_slot() -> std::sync::MutexGuard<'static, Option<SessionThreadView>> {
+    static SLOT: OnceLock<Mutex<Option<SessionThreadView>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None)).lock().unwrap()
 }
 
 // ── B1 / G2 ─────────────────────────────────────────────────────────────
@@ -706,7 +723,7 @@ fn b4_lhc_ahead_of_native_replace_is_transient_on_harness_body() {
     assert_eq!(keys(&again), once_keys, "retry must not re-key");
     let hits = again
         .iter()
-        .filter(|e| e.text_payload().is_some_and(|p| p.text.contains(&needle)))
+        .filter(|e| e.prompt_or_note_text().is_some_and(|t| t.contains(&needle)))
         .count();
     assert_eq!(hits, 1, "band/summary must not double-record");
 
@@ -968,4 +985,210 @@ fn b8_carryable_status_early_return_asymmetry_document() {
          exceed 'no I/O when off' when another session is capturing. Scope: claim is \
          'no I/O when process-wide off', not 'no I/O when this session off'."
     );
+}
+
+// ── B9 image content blocks (schema v13) ───────────────────────────────
+
+/// A 1×1 PNG. Distinct bytes for the two images so the blob rows differ.
+fn png_data_url(tag: u8) -> String {
+    let mut bytes = vec![
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+    bytes.push(tag);
+    format!(
+        "data:image/png;base64,{}",
+        lhc::shared_tech::content_blocks::base64_encode(&bytes)
+    )
+}
+
+fn user_with_image(text: &str, url: &str, prompt_index: usize) -> ConversationItem {
+    use xai_grok_sampling_types::{ContentPart, UserItem};
+    let mut item = ConversationItem::User(UserItem {
+        content: vec![
+            ContentPart::Text { text: text.into() },
+            ContentPart::Image { url: url.into() },
+        ],
+        ..Default::default()
+    });
+    item.set_prompt_index(prompt_index);
+    item
+}
+
+/// An image in a Grok prompt records as a blob row (never base64 inside the
+/// event JSON), shows as a placeholder line once its turn is banded, and comes
+/// back as the same Grok image part when its turn is served verbatim after a
+/// compact.
+#[test]
+fn b9_image_records_as_blob_shows_as_band_placeholder_and_returns_after_compact() {
+    let _g = env_lock();
+    let prev = std::env::var_os("GROK_LHC");
+    let prev_root = std::env::var_os("GROK_LHC_ROOT");
+    let prev_c = std::env::var_os("GROK_LHC_COMPACT");
+    let prev_e = std::env::var_os("GROK_LHC_COMPACT_EXPERIMENTAL");
+
+    let sid = "harness-b9-image-blocks";
+    let old_image = png_data_url(1);
+    let new_image = png_data_url(2);
+    let blob = "word ".repeat(200);
+    // Nine filler turns, then the old-image turn (banded just behind the
+    // tail, where the smooth band renders it in full), one more filler turn,
+    // then the new-image turn that stays in the verbatim tail.
+    let mut native = vec![ConversationItem::system("sys")];
+    for t in 0..9 {
+        let mut u = ConversationItem::user(format!("turn {t} {blob}"));
+        u.set_prompt_index(t);
+        native.push(u);
+        native.push(ConversationItem::assistant(format!("answer {t} {blob}")));
+    }
+    native.push(user_with_image("look at this old one", &old_image, 9));
+    native.push(ConversationItem::assistant(format!(
+        "noted the old image {blob}"
+    )));
+    let mut u = ConversationItem::user(format!("turn 10 {blob}"));
+    u.set_prompt_index(10);
+    native.push(u);
+    native.push(ConversationItem::assistant(format!("answer 10 {blob}")));
+    native.push(user_with_image("and this new one", &new_image, 11));
+    native.push(ConversationItem::assistant("noted the new image"));
+
+    let h = HarnessSession::open_replace(sid, native.clone());
+
+    // 1. Recorded: the user_prompt events carry blocks whose image data is a
+    //    blob reference; the base64 never sits inside the event JSON; the
+    //    blob table holds one row per distinct image.
+    let events = h.rt.block_on(wait_events_async(&h.capture, 10));
+    let image_prompts: Vec<_> = events
+        .iter()
+        .filter_map(|e| e.user_prompt_payload())
+        .filter(|p| p.blocks.is_some())
+        .collect();
+    assert_eq!(image_prompts.len(), 2, "two prompts carried an image");
+    for p in &image_prompts {
+        let json = serde_json::to_string(&p.blocks).unwrap();
+        assert!(
+            json.contains("\"$blob\":\"sha256:"),
+            "image data must be a blob ref: {json}"
+        );
+        assert!(
+            !json.contains("iVBOR"),
+            "base64 must not sit inside the event JSON"
+        );
+    }
+    let thread_path = thread_file_path(h.root.path(), sid);
+    let db = match lhc::shared_tech::storage::open_database(thread_path.to_str().unwrap()) {
+        lhc::shared_tech::errors::OpResult::Ok { value } => value,
+        lhc::shared_tech::errors::OpResult::Err { error } => panic!("open: {}", error.reason),
+    };
+    let blob_rows = db
+        .prepare("SELECT sha256, media_type, byte_length FROM blob ORDER BY sha256")
+        .all(&[]);
+    assert_eq!(
+        blob_rows.len(),
+        2,
+        "one blob row per distinct image: {blob_rows:?}"
+    );
+    for row in &blob_rows {
+        assert_eq!(
+            row.get("media_type").and_then(|v| v.as_str()),
+            Some("image/png")
+        );
+        assert_eq!(row.get("byte_length").and_then(|v| v.as_i64()), Some(68));
+    }
+    // The stored text-shaped content (block 0, what every text reader and
+    // every band derivation sees) carries the placeholder, never the bytes.
+    let shaped: Vec<String> = db
+        .prepare(
+            "SELECT mb.content AS content FROM message_block mb \
+             JOIN message m ON m.message_id = mb.message_id \
+             WHERE m.kind = 'user_prompt' AND mb.block_type = 'text' \
+             AND mb.content LIKE '%image/png%' ORDER BY m.source_event_order",
+        )
+        .all(&[])
+        .iter()
+        .filter_map(|r| {
+            r.get("content")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    assert_eq!(
+        shaped,
+        vec![
+            "{\"text\":\"look at this old one\\n[image · image/png · 68 B]\"}".to_string(),
+            "{\"text\":\"and this new one\\n[image · image/png · 68 B]\"}".to_string(),
+        ],
+        "text-shaped content is the text plus the placeholder line"
+    );
+    db.close();
+
+    // 2. Compact with a bound the newest closed turn (image ≈ 1600 tokens)
+    //    fits under, so the old turn is banded and the new one is served.
+    let body = h.run_replace_writeback_with(ViewCompactParams {
+        lower_bound: Some(4000.0),
+        percentages: Some(PartialViewProfilePercentages {
+            full: Some(25.0),
+            smooth: Some(25.0),
+            detailed: Some(25.0),
+            brief: Some(25.0),
+        }),
+        newest_closed_protection: None,
+    });
+    let view = last_view_slot().clone().expect("view of the write-back");
+    let band_text: String = view
+        .entries
+        .iter()
+        .filter_map(|e| match e {
+            SessionThreadViewEntry::Message(SessionThreadViewMessage::User(u))
+                if u.source_messages.is_empty() =>
+            {
+                Some(u.content.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    // The deterministic smoother keeps a 40-char prefix of its input, so the
+    // band carries the placeholder line as far as that prefix reaches
+    // ("look at this old one\n[image · image/png "); the full line is asserted
+    // on the stored text-shaped content above.
+    assert!(
+        band_text.contains("look at this old one\n[image · image/png"),
+        "the banded turn shows the image as a placeholder line:\n{band_text}"
+    );
+    assert!(!band_text.contains("iVBOR"), "bands never carry base64");
+
+    // 3. Served: the tail user item is a Grok image part again, bytes equal.
+    let served_images: Vec<String> = body
+        .iter()
+        .filter_map(|i| match i {
+            ConversationItem::User(u) => Some(u),
+            _ => None,
+        })
+        .flat_map(|u| u.content.iter())
+        .filter_map(|p| match p {
+            xai_grok_sampling_types::ContentPart::Image { url } => Some(url.to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        served_images,
+        vec![new_image.clone()],
+        "only the tail turn's image comes back, as the same data URL"
+    );
+    assert!(
+        !body.iter().any(|i| i.text_content().contains(&old_image)),
+        "the banded image is never re-inlined"
+    );
+    eprintln!(
+        "B9: blob rows={} band placeholder present, tail image restored ({} body items)",
+        blob_rows.len(),
+        body.len()
+    );
+
+    h.shutdown();
+    restore_env(prev, prev_root, prev_c, prev_e);
 }

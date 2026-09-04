@@ -458,6 +458,7 @@ async fn s1_s2_grok45_derivation_quality_and_timing() {
             detailed: Some(20.0),
             brief: Some(25.0),
         }),
+        newest_closed_protection: None,
     }));
     let compact_t0 = Instant::now();
     let wb = replace_compact_for_writeback(&sid).await.expect("compact");

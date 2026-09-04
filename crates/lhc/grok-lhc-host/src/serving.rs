@@ -13,7 +13,9 @@
 
 use std::collections::HashMap;
 
+use crate::mapping::image_block_url;
 use lhc::messages::{MessageKind, MessageRecord};
+use lhc::shared_tech::content_blocks::placeholder_text;
 use lhc::shared_tech::view::{
     SessionAssistantPartType, SessionThreadView, SessionThreadViewEntry,
     SessionThreadViewEntrySource, SessionThreadViewMessage, SessionThreadViewRuntimeEntry,
@@ -21,7 +23,9 @@ use lhc::shared_tech::view::{
 };
 use tracing::{debug, warn};
 use xai_chat_state::HostAssistantIdentity;
-use xai_grok_sampling_types::{ConversationItem, ToolCall, synthesized_reasoning_item};
+use xai_grok_sampling_types::{
+    ContentPart, ConversationItem, ToolCall, synthesized_reasoning_item,
+};
 
 /// Live request identity for safe opaque-reasoning replay (Wave B).
 ///
@@ -304,7 +308,18 @@ pub fn session_view_to_items(
                 }
                 flush_bands(&mut out, &mut band_chunks);
                 if kinds.is_recorded_user_prompt(&u.source_messages) {
-                    out.push(ConversationItem::user(u.content.clone()));
+                    out.push(match &u.blocks {
+                        // The tail serves the real content blocks: images
+                        // come back as the Grok image parts they arrived as.
+                        Some(blocks) => {
+                            let mut item = ConversationItem::user(String::new());
+                            if let ConversationItem::User(user) = &mut item {
+                                user.content = content_parts_from_blocks(blocks);
+                            }
+                            item
+                        }
+                        None => ConversationItem::user(u.content.clone()),
+                    });
                 } else {
                     // RuntimeNote, unknown message_id, or non-prompt kind.
                     out.push(ConversationItem::user_meta(u.content.clone()));
@@ -316,11 +331,22 @@ pub fn session_view_to_items(
             }
             SessionThreadViewEntry::Message(SessionThreadViewMessage::ToolResult(tr)) => {
                 flush_bands(&mut out, &mut band_chunks);
-                // Live tail: conserve ToolResult (call id + content).
-                out.push(ConversationItem::tool_result(
-                    tr.tool_call_id.clone(),
-                    tr.content.clone(),
-                ));
+                // Live tail: conserve ToolResult (call id + content). Ahead of
+                // the boundary the result carries its blocks: text blocks are
+                // the content, image blocks are `ToolResultItem.images`.
+                out.push(match &tr.blocks {
+                    Some(blocks) => {
+                        let (content, images) = tool_result_parts_from_blocks(blocks);
+                        ConversationItem::tool_result_with_images(
+                            tr.tool_call_id.clone(),
+                            content,
+                            images,
+                        )
+                    }
+                    None => {
+                        ConversationItem::tool_result(tr.tool_call_id.clone(), tr.content.clone())
+                    }
+                });
             }
             SessionThreadViewEntry::Runtime(SessionThreadViewRuntimeEntry::ModelChange(m)) => {
                 flush_bands(&mut out, &mut band_chunks);
@@ -419,6 +445,20 @@ fn emit_assistant_conserved(
                     arguments: std::sync::Arc::<str>::from(args),
                 });
             }
+            // API-typed parts (image, document, server tool blocks, …) are
+            // never recorded by this adapter; another host's thread may carry
+            // them. Grok's AssistantItem is text + tool calls, so conserve
+            // the block as its placeholder line rather than drop it.
+            _ => {
+                let line = match (&p.text, &p.block) {
+                    (Some(t), _) if !t.is_empty() => t.clone(),
+                    (_, Some(block)) => placeholder_text(&serde_json::Value::Object(block.clone())),
+                    _ => String::new(),
+                };
+                if !line.is_empty() {
+                    text_parts.push(line);
+                }
+            }
         }
     }
     let content = text_parts.join("\n");
@@ -436,6 +476,62 @@ fn emit_assistant_conserved(
             reasoning_effort: None,
         },
     ));
+}
+
+/// Grok content parts for a served block array (blob payloads already
+/// inlined by LHC): `text` → `Text`, `image` → `Image` with the original
+/// `data:` or plain URL, anything else → its placeholder line as text.
+pub fn content_parts_from_blocks(
+    blocks: &[serde_json::Map<String, serde_json::Value>],
+) -> Vec<ContentPart> {
+    let mut parts = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        match block.get("type").and_then(|t| t.as_str()) {
+            Some("text") => {
+                let text = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                parts.push(ContentPart::Text {
+                    text: std::sync::Arc::<str>::from(text),
+                });
+            }
+            Some("image") => match image_block_url(block) {
+                Some(url) => parts.push(ContentPart::Image {
+                    url: std::sync::Arc::<str>::from(url),
+                }),
+                None => {
+                    let line = placeholder_text(&serde_json::Value::Object(block.clone()));
+                    parts.push(ContentPart::Text {
+                        text: std::sync::Arc::<str>::from(line),
+                    });
+                }
+            },
+            _ => {
+                let line = placeholder_text(&serde_json::Value::Object(block.clone()));
+                if !line.is_empty() {
+                    parts.push(ContentPart::Text {
+                        text: std::sync::Arc::<str>::from(line),
+                    });
+                }
+            }
+        }
+    }
+    parts
+}
+
+/// `ToolResultItem` halves for a served tool_result block array: the text
+/// blocks (and placeholder lines of non-image blocks) joined as content,
+/// the image blocks as inline images — the inverse of the intake mapping.
+pub fn tool_result_parts_from_blocks(
+    blocks: &[serde_json::Map<String, serde_json::Value>],
+) -> (String, Vec<ContentPart>) {
+    let mut text_lines = Vec::new();
+    let mut images = Vec::new();
+    for part in content_parts_from_blocks(blocks) {
+        match part {
+            ContentPart::Text { text } => text_lines.push(text.as_ref().to_string()),
+            image @ ContentPart::Image { .. } => images.push(image),
+        }
+    }
+    (text_lines.join("\n"), images)
 }
 
 /// Build the host conversation for Replace-mode write-back.
@@ -558,6 +654,7 @@ mod tests {
     fn band(text: &str) -> SessionThreadViewEntry {
         SessionThreadViewEntry::Message(SessionThreadViewMessage::User(SessionUserMessage {
             content: text.into(),
+            blocks: None,
             source_messages: Vec::new(),
         }))
     }
@@ -565,6 +662,7 @@ mod tests {
     fn user_prompt(text: &str, id: &str) -> SessionThreadViewEntry {
         SessionThreadViewEntry::Message(SessionThreadViewMessage::User(SessionUserMessage {
             content: text.into(),
+            blocks: None,
             source_messages: vec![src(id)],
         }))
     }
@@ -581,6 +679,7 @@ mod tests {
                     tool_call_id: None,
                     tool_name: None,
                     arguments: None,
+                    block: None,
                 }],
                 source_messages: vec![src(id)],
 
@@ -605,6 +704,7 @@ mod tests {
                     tool_call_id: Some("c1".into()),
                     tool_name: Some(name.into()),
                     arguments: Some(args),
+                    block: None,
                 }],
                 source_messages: vec![src(id)],
 
@@ -622,6 +722,7 @@ mod tests {
                 tool_call_id: "c1".into(),
                 tool_name: Some(name.into()),
                 content: content.into(),
+                blocks: None,
                 is_error: None,
                 source_messages: vec![src(id)],
             },
@@ -1061,6 +1162,7 @@ mod tests {
                         tool_call_id: None,
                         tool_name: None,
                         arguments: None,
+                        block: None,
                     },
                     SessionAssistantPart {
                         type_: SessionAssistantPartType::Text,
@@ -1070,6 +1172,7 @@ mod tests {
                         tool_call_id: None,
                         tool_name: None,
                         arguments: None,
+                        block: None,
                     },
                 ],
                 source_messages: vec![src("a")],
@@ -1116,6 +1219,7 @@ mod tests {
                         tool_call_id: None,
                         tool_name: None,
                         arguments: None,
+                        block: None,
                     },
                     SessionAssistantPart {
                         type_: SessionAssistantPartType::Text,
@@ -1125,6 +1229,7 @@ mod tests {
                         tool_call_id: None,
                         tool_name: None,
                         arguments: None,
+                        block: None,
                     },
                 ],
                 source_messages: vec![src("a")],
@@ -1172,6 +1277,7 @@ mod tests {
                         tool_call_id: None,
                         tool_name: None,
                         arguments: None,
+                        block: None,
                     },
                     SessionAssistantPart {
                         type_: SessionAssistantPartType::Text,
@@ -1181,6 +1287,7 @@ mod tests {
                         tool_call_id: None,
                         tool_name: None,
                         arguments: None,
+                        block: None,
                     },
                 ],
                 source_messages: vec![src("a")],
@@ -1228,6 +1335,7 @@ mod tests {
                     tool_call_id: None,
                     tool_name: None,
                     arguments: None,
+                    block: None,
                 }],
                 source_messages: vec![src("a")],
                 provider: Some("xai".into()),
@@ -1267,6 +1375,7 @@ mod tests {
                     tool_call_id: None,
                     tool_name: None,
                     arguments: None,
+                    block: None,
                 }],
                 source_messages: vec![src("a")],
                 provider: Some("xai".into()),

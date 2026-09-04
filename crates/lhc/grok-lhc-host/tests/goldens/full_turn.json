@@ -23,7 +23,20 @@
     "actor": "grok",
     "harness": "grok-build",
     "payload": {
-      "text": "see attached\n[image:https://example.com/a.png]"
+      "text": "see attached",
+      "blocks": [
+        {
+          "type": "text",
+          "text": "see attached"
+        },
+        {
+          "type": "image",
+          "source": {
+            "type": "url",
+            "url": "https://example.com/a.png"
+          }
+        }
+      ]
     }
   },
   {

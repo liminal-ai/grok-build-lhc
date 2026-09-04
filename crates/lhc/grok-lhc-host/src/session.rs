@@ -393,6 +393,9 @@ impl LhcSession {
             profile: None,
             params: None,
             signal: None,
+            // Protected-pair tail preservation is a cc-lhc host concern
+            // (turn parts); Grok's compact bridge never pins the point.
+            compact_point_upper_bound: None,
         };
         match self
             .lhc
@@ -453,6 +456,7 @@ impl LhcSession {
             } else {
                 Some(signal.clone())
             },
+            compact_point_upper_bound: None,
         };
         // Race cancel against the async compact future only — not a drain
         // budget. Sync compute inside still depends on CompactAbortSignal.

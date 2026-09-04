@@ -11,6 +11,7 @@ use grok_lhc_host::{TurnEndFacts, map_history, map_model_change};
 use lhc::intake_stream::{
     AssistantTextPayload, AssistantThinkingPayload, ModelChangePayload, TextPayload,
     ThinkingLevelChangePayload, ToolCallPayload, ToolResultPayload, TurnEndPayload,
+    UserPromptPayload,
 };
 use serde_json::{Map, Value, json};
 use xai_grok_sampling_types::{
@@ -78,10 +79,15 @@ fn assert_lhc_payload_shapes(events: &[grok_lhc_host::MappedEvent]) {
                     panic!("assistant_thinking payload decode failed: {err}")
                 });
             }
-            "user_prompt" | "runtime_note" => {
-                let _: TextPayload = serde_json::from_value(v).unwrap_or_else(|err| {
-                    panic!("{} payload decode failed: {err}", e.input.event_kind)
-                });
+            // user_prompt is schema-v13 `UserPromptPayload` (text + optional
+            // steer + optional content blocks); runtime_note stays TextPayload.
+            "user_prompt" => {
+                let _: UserPromptPayload = serde_json::from_value(v)
+                    .unwrap_or_else(|err| panic!("user_prompt payload decode failed: {err}"));
+            }
+            "runtime_note" => {
+                let _: TextPayload = serde_json::from_value(v)
+                    .unwrap_or_else(|err| panic!("runtime_note payload decode failed: {err}"));
             }
             "model_change" => {
                 let _: ModelChangePayload = serde_json::from_value(v)
@@ -239,16 +245,25 @@ fn golden_covers_every_event_kind_and_mapping_row() {
     .collect();
     assert_eq!(kinds, expected_kinds, "goldens must cover all EVENT_KINDS");
 
+    // Schema v13: an image rides as a Messages API `image` block beside the
+    // text block; `text` stays the text of the message.
     assert!(
         mapped.iter().any(|e| {
             e.input.event_kind == "user_prompt"
+                && e.input.payload.get("text").and_then(|t| t.as_str()) == Some("see attached")
                 && e.input
                     .payload
-                    .get("text")
-                    .and_then(|t| t.as_str())
-                    .is_some_and(|t| t.contains("[image:"))
+                    .get("blocks")
+                    .and_then(|b| b.as_array())
+                    .is_some_and(|blocks| {
+                        blocks.iter().any(|b| {
+                            b.get("type").and_then(|t| t.as_str()) == Some("image")
+                                && b.pointer("/source/url").and_then(|u| u.as_str())
+                                    == Some("https://example.com/a.png")
+                        })
+                    })
         }),
-        "must cover ContentPart::Image"
+        "must cover ContentPart::Image as an image block"
     );
     for name in ["web_search", "x_search", "code_interpreter"] {
         assert!(
@@ -398,6 +413,7 @@ fn golden_serving_substitute_preserves_system_prefix() {
         entries: vec![
             SessionThreadViewEntry::Message(SessionThreadViewMessage::User(SessionUserMessage {
                 content: "lhc-user".into(),
+                blocks: None,
                 source_messages: vec![src("u")],
             })),
             SessionThreadViewEntry::Message(SessionThreadViewMessage::Assistant(
@@ -410,6 +426,7 @@ fn golden_serving_substitute_preserves_system_prefix() {
                         tool_call_id: None,
                         tool_name: None,
                         arguments: None,
+                        block: None,
                     }],
                     source_messages: vec![src("a")],
 

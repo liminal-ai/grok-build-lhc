@@ -298,8 +298,8 @@ fn replace_history_records_injected_system_reminder_only() {
     assert_eq!(new_keys.len(), 1);
     assert!(after.iter().any(|e| {
         e.event_kind().as_str() == "runtime_note"
-            && e.text_payload()
-                .is_some_and(|p| p.text.contains("memory reminder"))
+            && e.prompt_or_note_text()
+                .is_some_and(|t| t.contains("memory reminder"))
     }));
     handle.shutdown_blocking();
 }
@@ -337,8 +337,8 @@ fn replace_history_records_compaction_meta_only() {
     assert_eq!(summary_ev.event_kind().as_str(), "runtime_note");
     assert!(
         summary_ev
-            .text_payload()
-            .is_some_and(|p| p.text.contains("compacted summary")),
+            .prompt_or_note_text()
+            .is_some_and(|t| t.contains("compacted summary")),
         "summary text missing"
     );
     // Survivor a2 must not have been re-keyed under a new key.
@@ -369,8 +369,8 @@ fn identical_content_summary_dedup_is_inert() {
     let summary_keys: Vec<_> = after_first
         .iter()
         .filter(|e| {
-            e.text_payload()
-                .is_some_and(|p| p.text.contains("byte-identical summary text"))
+            e.prompt_or_note_text()
+                .is_some_and(|t| t.contains("byte-identical summary text"))
         })
         .map(|e| e.idempotency_key().to_string())
         .collect();
@@ -388,8 +388,8 @@ fn identical_content_summary_dedup_is_inert() {
     let summary_hits = after_second
         .iter()
         .filter(|e| {
-            e.text_payload()
-                .is_some_and(|p| p.text.contains("byte-identical summary text"))
+            e.prompt_or_note_text()
+                .is_some_and(|t| t.contains("byte-identical summary text"))
         })
         .count();
     assert_eq!(
@@ -411,8 +411,8 @@ fn identical_content_summary_dedup_is_inert() {
     );
     assert!(
         after_second.iter().any(|e| {
-            e.text_payload()
-                .is_some_and(|p| p.text.contains("live-after-dedup"))
+            e.prompt_or_note_text()
+                .is_some_and(|t| t.contains("live-after-dedup"))
         }),
         "live user text missing"
     );
@@ -1245,11 +1245,11 @@ async fn tee_chat_persistence_methods_reach_inner_and_lhc() {
                 wait_events(&handle2, 1)
             });
             assert!(
-                ev.iter().any(
-                    |e| e.text_payload().is_some_and(|p| p.text.contains("via-tee"))
-                        || e.text_payload()
-                            .is_some_and(|p| p.text.contains("replaced"))
-                ),
+                ev.iter().any(|e| e
+                    .prompt_or_note_text()
+                    .is_some_and(|t| t.contains("via-tee"))
+                    || e.prompt_or_note_text()
+                        .is_some_and(|t| t.contains("replaced"))),
                 "LHC should see tee-driven events"
             );
 
@@ -1300,6 +1300,7 @@ fn view_src(id: &str) -> SessionThreadViewEntrySource {
 fn view_band(text: &str) -> SessionThreadViewEntry {
     SessionThreadViewEntry::Message(SessionThreadViewMessage::User(SessionUserMessage {
         content: text.into(),
+        blocks: None,
         source_messages: Vec::new(),
     }))
 }
@@ -1307,6 +1308,7 @@ fn view_band(text: &str) -> SessionThreadViewEntry {
 fn view_user(text: &str, id: &str) -> SessionThreadViewEntry {
     SessionThreadViewEntry::Message(SessionThreadViewMessage::User(SessionUserMessage {
         content: text.into(),
+        blocks: None,
         source_messages: vec![view_src(id)],
     }))
 }
@@ -1322,6 +1324,7 @@ fn view_assistant_text(text: &str, id: &str) -> SessionThreadViewEntry {
                 tool_call_id: None,
                 tool_name: None,
                 arguments: None,
+                block: None,
             }],
             source_messages: vec![view_src(id)],
 
@@ -1345,6 +1348,7 @@ fn view_assistant_tool(name: &str, args: &str, id: &str) -> SessionThreadViewEnt
                 tool_call_id: Some("c1".into()),
                 tool_name: Some(name.into()),
                 arguments: Some(arguments),
+                block: None,
             }],
             source_messages: vec![view_src(id)],
 
@@ -1361,6 +1365,7 @@ fn view_tool_result(name: &str, content: &str, id: &str) -> SessionThreadViewEnt
             tool_call_id: "c1".into(),
             tool_name: Some(name.into()),
             content: content.into(),
+            blocks: None,
             is_error: None,
             source_messages: vec![view_src(id)],
         },
@@ -1573,8 +1578,8 @@ fn writeback_genuine_compact_summary_records_exactly_once() {
     let summary_hits: Vec<_> = after
         .iter()
         .filter(|e| {
-            e.text_payload()
-                .is_some_and(|p| p.text.contains(WB_BAND_SUMMARY_NEEDLE))
+            e.prompt_or_note_text()
+                .is_some_and(|t| t.contains(WB_BAND_SUMMARY_NEEDLE))
         })
         .collect();
     assert_eq!(
@@ -1645,8 +1650,8 @@ fn writeback_crash_mid_replace_no_double_on_retry() {
     let summary_count = |ev: &[EventRecord]| {
         ev.iter()
             .filter(|e| {
-                e.text_payload()
-                    .is_some_and(|p| p.text.contains(WB_BAND_SUMMARY_NEEDLE))
+                e.prompt_or_note_text()
+                    .is_some_and(|t| t.contains(WB_BAND_SUMMARY_NEEDLE))
             })
             .count()
     };
@@ -1779,7 +1784,7 @@ fn writeback_live_tail_kinds_round_trip() {
     let after = handle.list_events_blocking().unwrap();
     let note_as_prompt = after.iter().any(|e| {
         e.event_kind().as_str() == "user_prompt"
-            && e.text_payload().is_some_and(|p| p.text.contains(NOTE))
+            && e.prompt_or_note_text().is_some_and(|t| t.contains(NOTE))
     });
     assert!(
         !note_as_prompt,
@@ -2090,6 +2095,7 @@ fn r3_abort_installs_no_compact_snapshot_derivation_may_continue() {
                 detailed: Some(20.0),
                 brief: Some(25.0),
             }),
+            newest_closed_protection: None,
         }
     }
 
@@ -2212,6 +2218,7 @@ fn r1_cancel_at_snapshot_write_leaves_view_unchanged() {
                 detailed: Some(20.0),
                 brief: Some(25.0),
             }),
+            newest_closed_protection: None,
         }
     }
 
@@ -2409,6 +2416,7 @@ fn t1_successful_compact_leaves_no_abort_bridge_threads() {
             detailed: Some(20.0),
             brief: Some(25.0),
         }),
+        newest_closed_protection: None,
     }));
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -2427,6 +2435,7 @@ fn t1_successful_compact_leaves_no_abort_bridge_threads() {
                 detailed: Some(20.0),
                 brief: Some(25.0),
             }),
+            newest_closed_protection: None,
         }));
         let wb = rt
             .block_on(replace_compact_for_writeback(sid))
@@ -2631,6 +2640,7 @@ fn drain_architecture_background_mode_cert_measurements() {
             detailed: Some(20.0),
             brief: Some(25.0),
         }),
+        newest_closed_protection: None,
     }));
     let t0 = Instant::now();
     let wb = rt
@@ -2763,6 +2773,7 @@ async fn n3_deterministic_callbacks_with_tight_params_can_emit_typed_bands() {
                 profile: None,
                 params: None,
                 signal: None,
+                compact_point_upper_bound: None,
             },
         )
         .await;
@@ -2783,6 +2794,7 @@ async fn n3_deterministic_callbacks_with_tight_params_can_emit_typed_bands() {
             detailed: Some(25.0),
             brief: Some(25.0),
         }),
+        newest_closed_protection: None,
     };
     let c = sdk
         .thread_view
@@ -2792,6 +2804,7 @@ async fn n3_deterministic_callbacks_with_tight_params_can_emit_typed_bands() {
                 profile: None,
                 params: Some(params),
                 signal: None,
+                compact_point_upper_bound: None,
             },
         )
         .await;
@@ -2919,6 +2932,7 @@ async fn m1_production_params_none_requires_seed_above_full_budget() {
                     profile: None,
                     params: None,
                     signal: None,
+                    compact_point_upper_bound: None,
                 },
             )
             .await;
@@ -3075,6 +3089,7 @@ fn writeback_crash_between_lhc_compact_and_native_replace_is_transient() {
                     detailed: Some(25.0),
                     brief: Some(25.0),
                 }),
+                newest_closed_protection: None,
             };
             let compact = sdk
                 .thread_view
@@ -3084,6 +3099,7 @@ fn writeback_crash_between_lhc_compact_and_native_replace_is_transient() {
                         profile: None,
                         params: Some(params),
                         signal: None,
+                        compact_point_upper_bound: None,
                     },
                 )
                 .await;
@@ -3159,8 +3175,8 @@ fn writeback_crash_between_lhc_compact_and_native_replace_is_transient() {
     let summary_hits = |ev: &[EventRecord]| {
         ev.iter()
             .filter(|e| {
-                e.text_payload()
-                    .is_some_and(|p| band_texts.iter().any(|b| p.text.contains(b)))
+                e.prompt_or_note_text()
+                    .is_some_and(|t| band_texts.iter().any(|b| t.contains(b)))
             })
             .count()
     };
@@ -4967,6 +4983,7 @@ fn wave_b_serve_signature_gate_and_model_restore() {
                         tool_call_id: None,
                         tool_name: None,
                         arguments: None,
+                        block: None,
                     },
                     SessionAssistantPart {
                         type_: SessionAssistantPartType::Text,
@@ -4976,6 +4993,7 @@ fn wave_b_serve_signature_gate_and_model_restore() {
                         tool_call_id: None,
                         tool_name: None,
                         arguments: None,
+                        block: None,
                     },
                 ],
                 source_messages: vec![SessionThreadViewEntrySource {
@@ -5070,6 +5088,7 @@ fn wave_b_hook4_signature_uses_frozen_attempt_backend_despite_config_switch() {
                         tool_call_id: None,
                         tool_name: None,
                         arguments: None,
+                        block: None,
                     },
                     SessionAssistantPart {
                         type_: SessionAssistantPartType::Text,
@@ -5079,6 +5098,7 @@ fn wave_b_hook4_signature_uses_frozen_attempt_backend_despite_config_switch() {
                         tool_call_id: None,
                         tool_name: None,
                         arguments: None,
+                        block: None,
                     },
                 ],
                 source_messages: vec![SessionThreadViewEntrySource {
@@ -5533,8 +5553,8 @@ fn wave_b_retrieval_serialized_with_capture() {
     let ev = wait_events(&handle, 1);
     let has_blocked_user = ev.iter().any(|e| {
         e.event_kind().as_str() == "user_prompt"
-            && e.text_payload()
-                .is_some_and(|p| p.text.contains("while-blocked"))
+            && e.prompt_or_note_text()
+                .is_some_and(|t| t.contains("while-blocked"))
     });
     assert!(
         has_blocked_user,

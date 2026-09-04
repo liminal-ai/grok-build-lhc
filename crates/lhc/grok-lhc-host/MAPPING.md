@@ -14,7 +14,7 @@ Actor / harness stamped on every event: `actor = "grok"`, `harness = "grok-build
 | `User` with `synthetic_reason: None` | `user_prompt` | Real user input. `text` from typed `ContentPart`s (see below). |
 | `User` with `SyntheticReason` | see table below | Driven by `SyntheticReason::starts_prompt_turn()`. |
 | `Assistant` | `assistant_text` (if content non-empty, or no tool calls); one `tool_call` per `ToolCall`; `turn_end` when `tool_calls` is empty | Client-executed tool calls only on this item. |
-| `ToolResult` | `tool_result` | `tool_call_id` + `content` (+ image parts folded into text). `is_error` omitted (`None`) — host `ToolResultItem` does not persist an error flag. |
+| `ToolResult` | `tool_result` | `tool_call_id` + `content` (text only); `images` become `blocks` (schema 13, see below). `is_error` omitted (`None`) — host `ToolResultItem` does not persist an error flag. |
 | `BackendToolCall` | `tool_call` **and** paired `tool_result` | Server-side tools are recorded as a call plus an immediate result carrying status/outputs (see below). |
 | `Reasoning` | `assistant_thinking` | `text` from `reasoning_item_text` (summary + content parts). Optional `signature` = `encrypted_content` when non-empty (SDK R2). Live path attaches host-observed `provider`/`model`/`api` via the side channel (Wave B); bootstrap/replace re-map leaves them absent. |
 
@@ -45,12 +45,21 @@ Mapping is exhaustive and driven by the host classifier
 `turns::create` opens a new turn on either `turn_end` or `user_prompt`, while
 these items are explicitly *not* real user input.
 
-## `ContentPart` (user / tool-result images)
+## `ContentPart` (user / tool-result images) — schema 13 content blocks
 
-| Variant | Encoding into `text` |
-|---|---|
-| `Text { text }` | Appended as-is (joined with `\n` when multiple parts). |
-| `Image { url }` | Appended as `[image:{preview}]` where `preview` is the URL truncated to 128 chars, with a `…({nbytes}B)` suffix when truncated. Full base64 data URLs must not inflate LHC text payloads. |
+| Variant | `text` / `content` | `blocks` (only when an image is present) |
+|---|---|---|
+| `Text { text }` | Appended as-is (joined with `\n` when multiple parts). | `{type:"text", text}` in order. |
+| `Image { url }` | Nothing — the text stays text. | `{type:"image", source}`: a `data:<media>;base64,<data>` URL becomes a `base64` source (intake moves the bytes to the blob table, keyed by sha256; the event JSON holds a `{$blob, bytes}` ref), any other URL a `url` source. |
+
+Text-only content records exactly as before (no `blocks` key). LHC's
+text-shaped projection puts a `[image · media/type · N B]` placeholder line
+where each image sits; that is what bands and every text reader see. Serving
+(`serving.rs`): a user or tool-result entry ahead of the boundary carries
+`blocks` with the blob payload inlined, and the adapter rebuilds
+`ContentPart::Image { url }` (the same `data:` URL) / `ToolResultItem.images`
+from them (`content_parts_from_blocks`, `tool_result_parts_from_blocks`).
+Bands and abridged results stay text. Harness: `harness_chunk3b::b9_*`.
 
 ## `BackendToolKind` → `tool_call` + `tool_result`
 

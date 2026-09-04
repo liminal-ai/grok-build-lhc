@@ -2614,10 +2614,10 @@ index 8d842c38..baced08b 100644
  pub(crate) enum SamplerTurnOutcome {
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/lhc_derivation_quality_timing.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/lhc_derivation_quality_timing.rs
 new file mode 100644
-index 00000000..b7305481
+index 00000000..0a827a69
 --- /dev/null
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/lhc_derivation_quality_timing.rs
-@@ -0,0 +1,653 @@
+@@ -0,0 +1,654 @@
 +//! Chunk 3B / unit 19 — grok-4.5 derivation **quality** (S1) and **timing** (S2).
 +//!
 +//! Measurement only — no prompt/threshold/model tuning.
@@ -3078,6 +3078,7 @@ index 00000000..b7305481
 +            detailed: Some(20.0),
 +            brief: Some(25.0),
 +        }),
++        newest_closed_protection: None,
 +    }));
 +    let compact_t0 = Instant::now();
 +    let wb = replace_compact_for_writeback(&sid).await.expect("compact");
