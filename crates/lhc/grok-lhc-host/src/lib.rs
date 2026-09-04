@@ -65,11 +65,12 @@ pub use runtime_config::{
     clear_config_parse_error, config_parse_error, note_config_parse_error, resolve_lhc_config,
 };
 pub use serving::{
-    LastServeOutcome, LiveRequestIdentity, ServeDecision, SourceKindIndex, ViewTranslateMode,
-    apply_serve_decision, assign_prompt_indices_from_tail, body_has_tool_cycle,
-    build_writeback_conversation, clear_last_serve_outcome, decide_substitution, is_band_user,
-    last_serve_outcome, native_prompt_indices, note_last_serve, session_view_to_items,
-    session_view_to_serve_items, session_view_to_writeback_items, split_system_prefix,
+    LastServeOutcome, LiveRequestIdentity, RUNTIME_NOTE_PREFIX, ServeDecision, SourceKindIndex,
+    ViewTranslateMode, align_runtime_notes_with_native, apply_serve_decision,
+    assign_prompt_indices_from_tail, body_has_tool_cycle, build_writeback_conversation,
+    clear_last_serve_outcome, decide_substitution, is_band_user, last_serve_outcome,
+    native_prompt_indices, note_last_serve, session_view_to_items, session_view_to_serve_items,
+    session_view_to_writeback_items, split_system_prefix,
 };
 // Re-export identity type so shell can stamp without depending on chat-state layout.
 #[cfg(any(test, feature = "test-util"))]

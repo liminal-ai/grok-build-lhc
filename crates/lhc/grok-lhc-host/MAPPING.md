@@ -441,7 +441,7 @@ counts bands/tools as real turns.
 | Live-tail `Assistant` text / toolCall | `Assistant` (+ real `tool_calls`) | Conserved |
 | Live-tail `Assistant` thinking | `Reasoning` sibling | Conserved via `synthesized_reasoning_item` |
 | Live-tail `User` all `UserPrompt` | `User` + tail `prompt_index` | |
-| Live-tail `User` RuntimeNote / unknown | `user_meta` (`CompactionMeta`) | Kind via `SourceKindIndex` |
+| Live-tail `User` RuntimeNote / unknown | `user_meta` (`CompactionMeta`) | Kind via `SourceKindIndex`. Then **aligned to the host's own items** (`align_runtime_notes_with_native`, L5 ruling 2026-09-04): a note equal to a host `System` prefix item is dropped (the prefix is served natively); a note equal to a native synthetic user item (the injected `<system-reminder>`) is served as that native item at its native position (after `<user_info>`, not hoisted). The record keeps both copies as recorded |
 | `Runtime(ModelChange\|ThinkingLevelChange)` | `user_meta` (`CompactionMeta`) | **SDK/host boundary:** no `ConversationItem` variant; view lacks `previous` |
 | Host system preamble | Preserved leading `System` | |
 
@@ -758,6 +758,7 @@ together), or one `out.push_str(kind)` site. Three dispositions:
 | Test | Expect |
 |---|---|
 | `equiv_text_only_window_both_silent` | substituted: structural = 0, informational = 0, compared += 1 |
+| `l5_runtime_notes_aligned_to_host_items_no_divergence` | first live turn (System echo + hoisted reminder in the record): served == native item for item, both counters 0; post-compact shape and write-back fixpoint |
 | `equiv_tool_window_structural_only` | substituted: structural ≠ 0, informational = 0 when projection matches |
 | `equiv_tool_arg_cosmetic_formatting_silent_different_paths` | native pretty vs `decide_substitution` translator: both silent |
 | `equiv_tool_arg_real_change_informational_different_paths` | native vs translator real arg change: informational ≠ 0 |

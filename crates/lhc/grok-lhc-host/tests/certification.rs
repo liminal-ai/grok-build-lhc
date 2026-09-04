@@ -8,19 +8,19 @@ use std::time::Duration;
 use grok_lhc_host::{
     CaptureHandle, CaptureOpenState, CaptureOpenWaitError, CompactEventBridge, CompactMode,
     ContextEngine, CountingLhcInferenceSampler, LhcFileConfig, LhcInferenceRequest,
-    MockLhcInferenceSampler, ServeDecision, SourceKindIndex, apply_resolved_config,
-    apply_serve_decision, body_has_tool_cycle, build_writeback_conversation, capture_active,
-    capture_archive_ready, capture_model_or_thinking_change, clear_last_serve_outcome,
-    clear_open_hold_for_test, compare_serve_equivalence, decide_substitution,
-    encode_session_id_for_path, equivalence_snapshot, execute_repair, format_status_report,
-    health_check, inference_sampler_registered, informational_hit_count, is_enabled,
-    last_serve_outcome, lookup_session, native_prompt_indices, observe_serve_equivalence,
-    paths_disagree, plan_repair, project_conversation_canonical, replace_call_count,
-    reset_compact_call_counters, reset_equivalence_counters, resolve_compact_mode,
-    resolve_lhc_config, serve_compared_turns, serve_fallback_turns, serve_request_context,
-    set_compact_mode_for_test, set_force_classify_list_failure, set_open_hold_for_test,
-    shutdown_session, spawn_capture, status_report, structural_hit_count, tee_chat_persistence,
-    thread_file_path, wait_capture_archive_ready,
+    MockLhcInferenceSampler, RUNTIME_NOTE_PREFIX, ServeDecision, SourceKindIndex,
+    apply_resolved_config, apply_serve_decision, body_has_tool_cycle, build_writeback_conversation,
+    capture_active, capture_archive_ready, capture_model_or_thinking_change,
+    clear_last_serve_outcome, clear_open_hold_for_test, compare_serve_equivalence,
+    decide_substitution, encode_session_id_for_path, equivalence_snapshot, execute_repair,
+    format_status_report, health_check, inference_sampler_registered, informational_hit_count,
+    is_enabled, last_serve_outcome, lookup_session, native_prompt_indices,
+    observe_serve_equivalence, paths_disagree, plan_repair, project_conversation_canonical,
+    replace_call_count, reset_compact_call_counters, reset_equivalence_counters,
+    resolve_compact_mode, resolve_lhc_config, serve_compared_turns, serve_fallback_turns,
+    serve_request_context, set_compact_mode_for_test, set_force_classify_list_failure,
+    set_open_hold_for_test, shutdown_session, spawn_capture, status_report, structural_hit_count,
+    tee_chat_persistence, thread_file_path, wait_capture_archive_ready,
 };
 use lhc::intake_stream::{BatchEventOutcome, BatchSkipReason, EventRecord};
 use lhc::shared_tech::view::{
@@ -5726,4 +5726,100 @@ fn wave_b_spawn_becomes_archive_ready() {
         Some(v) => unsafe { std::env::set_var("GROK_LHC_ROOT", v) },
         None => unsafe { std::env::remove_var("GROK_LHC_ROOT") },
     }
+}
+
+/// L5 live-cert finding (2026-09-04) pinned: the first live turn's record holds
+/// the host System prompt and the injected `<system-reminder>` as runtime notes
+/// ahead of `<user_info>`; the native body has the prompt only in its System
+/// prefix and the reminder after `<user_info>`. Serving must produce the native
+/// body item for item: equal counts, no structural and no informational
+/// divergence on hook 4. Also holds after a compact (bands ahead of the tail)
+/// and through the write-back fixpoint.
+#[test]
+fn l5_runtime_notes_aligned_to_host_items_no_divergence() {
+    let _g = env_lock();
+    reset_equivalence_counters();
+    const SYS: &str = "You are Grok. Long system prompt.";
+    const REMINDER: &str = "<system-reminder>\nskills: browse\n</system-reminder>";
+    let mut query = ConversationItem::user("<user_query>\nhi\n</user_query>");
+    query.set_prompt_index(0);
+    let native = vec![
+        ConversationItem::system(SYS),
+        ConversationItem::user("<user_info>\ncwd: /w\n</user_info>"),
+        ConversationItem::system_reminder(REMINDER),
+        query,
+    ];
+    let view = SessionThreadView {
+        thread_id: "t".into(),
+        entries: vec![
+            view_user(&format!("{RUNTIME_NOTE_PREFIX}{SYS}"), "rn-sys"),
+            view_user(&format!("{RUNTIME_NOTE_PREFIX}{REMINDER}"), "rn-rem"),
+            view_user("<user_info>\ncwd: /w\n</user_info>", "u-info"),
+            view_user("<user_query>\nhi\n</user_query>", "u-q"),
+        ],
+    };
+    let kinds = SourceKindIndex::assume_sourced_users_are_prompts(&view)
+        .with("rn-sys", lhc::messages::MessageKind::RuntimeNote)
+        .with("rn-rem", lhc::messages::MessageKind::RuntimeNote);
+    let served = match decide_substitution(&native, &view, &kinds, None) {
+        ServeDecision::Substitute { items } => items,
+        ServeDecision::Native { reason } => panic!("expected substitute, got {reason}"),
+    };
+    assert_eq!(served.len(), native.len(), "served: {served:#?}");
+    for (s, n) in served.iter().zip(native.iter()) {
+        assert_eq!(
+            serde_json::to_value(s).unwrap(),
+            serde_json::to_value(n).unwrap()
+        );
+    }
+    let report = compare_serve_equivalence(&native, &served);
+    assert!(!report.structural_divergence, "{report:?}");
+    assert!(!report.informational_divergence, "{report:?}");
+    let obs = observe_serve_equivalence("l5-first-turn", Some(0), false, true, &native, &served);
+    assert!(obs.compared && !obs.fallback);
+    assert_eq!(structural_hit_count(), 0);
+    assert_eq!(informational_hit_count(), 0);
+
+    // Post-compact: bands ahead of the same tail; the reminder still lands after
+    // `<user_info>`, the System echo is still dropped, and write-back is a fixpoint.
+    let mut live = ConversationItem::user("live");
+    live.set_prompt_index(1);
+    let native_after = vec![
+        ConversationItem::system(SYS),
+        ConversationItem::user_meta("[context · smooth]\nbridge"),
+        ConversationItem::user("<user_info>\ncwd: /w\n</user_info>"),
+        ConversationItem::system_reminder(REMINDER),
+        live,
+    ];
+    let view_after = SessionThreadView {
+        thread_id: "t".into(),
+        entries: vec![
+            view_band("[context · smooth]\nbridge"),
+            view_user(&format!("{RUNTIME_NOTE_PREFIX}{SYS}"), "rn-sys"),
+            view_user(&format!("{RUNTIME_NOTE_PREFIX}{REMINDER}"), "rn-rem"),
+            view_user("<user_info>\ncwd: /w\n</user_info>", "u-info"),
+            view_user("live", "u-live"),
+        ],
+    };
+    let kinds_after = SourceKindIndex::assume_sourced_users_are_prompts(&view_after)
+        .with("rn-sys", lhc::messages::MessageKind::RuntimeNote)
+        .with("rn-rem", lhc::messages::MessageKind::RuntimeNote);
+    let served_after = match decide_substitution(&native_after, &view_after, &kinds_after, None) {
+        ServeDecision::Substitute { items } => items,
+        ServeDecision::Native { reason } => panic!("expected substitute, got {reason}"),
+    };
+    assert_eq!(
+        served_after.len(),
+        native_after.len(),
+        "served: {served_after:#?}"
+    );
+    let report = compare_serve_equivalence(&native_after, &served_after);
+    assert!(!report.informational_divergence, "{report:?}");
+    let wb1 = build_writeback_conversation(&native_after, &view_after, &kinds_after).unwrap();
+    let wb2 = build_writeback_conversation(&wb1, &view_after, &kinds_after).unwrap();
+    assert_eq!(
+        serde_json::to_value(&wb1).unwrap(),
+        serde_json::to_value(&wb2).unwrap()
+    );
+    assert_eq!(wb1.len(), native_after.len());
 }

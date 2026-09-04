@@ -16,8 +16,8 @@ branch: `lhc`. `main` tracks upstream, untouched.
 
 Status: **Chunk 3B live certification run 2026-09-04** on the installed v0.3.0
 (L1–L4, L6 PASS; L2 kill/recovery PASS; mid-turn, image and t3code drills PASS;
-**L5 open** — informational divergence on every served turn, Lee's ruling
-required; evidence table:
+L5 finding (informational divergence on every served turn) ruled a bug and
+**fixed in v0.3.1** (slice 5b); evidence table:
 [`crates/lhc/grok-lhc-host/LIVE_CERT_2026-09-04.md`](crates/lhc/grok-lhc-host/LIVE_CERT_2026-09-04.md)).
 3A accepted; product wiring — config, `/lhc` status/repair, rollout
 safety) of the 3-chunk integration
@@ -33,7 +33,7 @@ generation-cached binding
 Steady state: one generation atomic compare; mutex only when registration
 actually changes. No I/O, no spawn, no SQLite on that path. Chunk 3B live
 certification ran 2026-09-04 (see Status above and
-`crates/lhc/grok-lhc-host/LIVE_CERT_2026-09-04.md`); L5 awaits Lee's ruling.
+`crates/lhc/grok-lhc-host/LIVE_CERT_2026-09-04.md`); the L5 finding is fixed in v0.3.1.
 
 ## Layout
 
@@ -596,7 +596,8 @@ Chunk 1 means the first real upstream sync already has a proven fallback.)
 | Version | Source SHA | LHC pin / schema | Candidate run | Linux smoke | Promotion |
 |---|---|---|---|---|---|
 | v0.2.1 | `c30cadb8` | `dd251ec` / 6 | 31627906621 | 31628937277 | published 2026-08-12 |
-| v0.3.0 | `8227f87c` | `e9456a6e` / 13 | 33859291549 | 33860222861 | **pending Lee's approval** (candidate bytes installed locally 2026-09-04; handoff: heron `slice4/CANDIDATE_HANDOFF.md`) |
+| v0.3.0 | `8227f87c` | `e9456a6e` / 13 | 33859291549 | 33860222861 | published 2026-09-04 (promotion run 33865457927) |
+| v0.3.1 | _slice 5b_ | `e9456a6e` / 13 | _pending_ | _pending_ | not promoted (L5 serving fix; handoff: heron `slice5b/CANDIDATE_HANDOFF.md`) |
 
 ## Known limitations (live cert 2026-09-04, follow-ups — not blockers)
 
@@ -609,15 +610,19 @@ Chunk 1 means the first real upstream sync already has a proven fallback.)
   one 8-read turn at a 150k debug window; each re-records the turn's tool
   calls). The turn still completes and the record stays one turn; the first
   call after the turn closes compacts normally.
-- **Served body carries the system prompt twice (L5 finding, 2026-09-04).**
-  Native `System` is captured as `runtime_note` and served back as a
-  `[runtime note]` synthetic user item on top of the native system prefix
-  (plus the `<system-reminder>` note ahead of `<user_info>`), so hook 4 reports
-  a structural + informational divergence on every substituted turn
-  (`LIVE_CERT_2026-09-04.md`, L5). Rule unchanged since v0.2.1; cost ≈ one
-  system prompt of extra input tokens per turn. Awaiting Lee's ruling
-  (MAPPING G1) — fix is a serving-side dedupe of runtime notes that match the
-  native system prefix, or a mapping change; neither made here.
+- **Served body carried the system prompt twice — FIXED in v0.3.1 (L5
+  finding, 2026-09-04; Lee's ruling: bug).** Native `System` is captured as
+  `runtime_note` and was served back as a `[runtime note]` synthetic user
+  item on top of the native system prefix, with the injected
+  `<system-reminder>` hoisted ahead of `<user_info>` (persistence order in the
+  record). Hook 4 reported a structural + informational divergence on every
+  substituted turn. Fix (slice 5b, serving only, record unchanged):
+  `align_runtime_notes_with_native` in `decide_substitution` and
+  `build_writeback_conversation` drops a note equal to a host-owned `System`
+  prefix item and serves a note equal to a native synthetic user item as that
+  item at its native position. Pinned by certification
+  `l5_runtime_notes_aligned_to_host_items_no_divergence`; live re-check in
+  `LIVE_CERT_2026-09-04.md` (L5 addendum).
 - **LHC lower bound above the native trigger loops compaction.** The
   continuation profile's `lower_bound` is 120,000 tokens. If the native
   auto-compact trigger (85% of the model's context window) is below that —

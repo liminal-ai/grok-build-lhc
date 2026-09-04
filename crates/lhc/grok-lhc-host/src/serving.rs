@@ -238,6 +238,134 @@ pub fn assign_prompt_indices_from_tail(body: &mut [ConversationItem], indices: &
     }
 }
 
+/// Vendored view rendering of a `runtime_note` event: `"[runtime note] " +
+/// text` (`session_view.rs` `LITERAL_RUNTIME_NOTE_PREFIX`). Mirrored here only
+/// for the serve-time alignment with the host's own items below; kind
+/// classification never depends on it.
+pub const RUNTIME_NOTE_PREFIX: &str = "[runtime note] ";
+
+/// Text of a translated live-tail runtime note (`user_meta` whose single text
+/// part carries the view's runtime-note prefix), without the prefix.
+fn runtime_note_text(item: &ConversationItem) -> Option<&str> {
+    let ConversationItem::User(u) = item else {
+        return None;
+    };
+    if u.synthetic_reason.is_none() {
+        return None;
+    }
+    match u.content.as_slice() {
+        [ContentPart::Text { text }] => text.strip_prefix(RUNTIME_NOTE_PREFIX),
+        _ => None,
+    }
+}
+
+/// Joined text parts of a user item (images as their projection placeholder).
+fn user_item_text(u: &xai_grok_sampling_types::UserItem) -> String {
+    u.content
+        .iter()
+        .map(|p| match p {
+            ContentPart::Text { text } => text.as_ref(),
+            ContentPart::Image { .. } => "[image]",
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Same host item, by identity the host itself uses (not byte equality of the
+/// whole struct): user text + synthetic flag, assistant text + tool-call ids,
+/// tool result call id. System / reasoning never anchor.
+fn same_host_item(a: &ConversationItem, b: &ConversationItem) -> bool {
+    match (a, b) {
+        (ConversationItem::User(x), ConversationItem::User(y)) => {
+            x.synthetic_reason.is_some() == y.synthetic_reason.is_some()
+                && user_item_text(x) == user_item_text(y)
+        }
+        (ConversationItem::Assistant(x), ConversationItem::Assistant(y)) => {
+            x.content == y.content
+                && x.tool_calls.len() == y.tool_calls.len()
+                && x.tool_calls
+                    .iter()
+                    .zip(y.tool_calls.iter())
+                    .all(|(p, q)| p.id == q.id)
+        }
+        (ConversationItem::ToolResult(x), ConversationItem::ToolResult(y)) => {
+            x.tool_call_id == y.tool_call_id
+        }
+        _ => false,
+    }
+}
+
+/// Align translated live-tail runtime notes with the host's own items (L5
+/// ruling, 2026-09-04). The host owns its `System` prefix and the synthetic
+/// user items it injects; the recorded `runtime_note` copies are for the
+/// record only.
+///
+/// 1. A note whose text equals a host-owned `System` prefix item is dropped —
+///    the prefix is served natively, so the copy would put the system prompt
+///    into the body a second time.
+/// 2. A note whose text equals a native synthetic user item (e.g. the
+///    injected `<system-reminder>`) is served as **that native item** at its
+///    native position: the record persists it in persistence order (ahead of
+///    the `<user_info>` prompt the host inserts at slot 1), which hoisted it
+///    ahead of that prompt when served. The note is moved only when it
+///    currently precedes its native anchor (the item before it in the native
+///    body); an anchor that is not found in `body` leaves the note in place.
+///
+/// Bands, tool cycles and notes with no native counterpart are untouched.
+/// Idempotent on an already-aligned body (write-back fixpoint holds).
+pub fn align_runtime_notes_with_native(
+    body: &mut Vec<ConversationItem>,
+    native: &[ConversationItem],
+) {
+    let (system_prefix, rest) = split_system_prefix(native);
+    body.retain(|item| match runtime_note_text(item) {
+        Some(text) => !system_prefix
+            .iter()
+            .any(|sys| matches!(sys, ConversationItem::System(s) if s.content.as_ref() == text)),
+        None => true,
+    });
+    let mut i = 0;
+    while i < body.len() {
+        let Some(text) = runtime_note_text(&body[i]) else {
+            i += 1;
+            continue;
+        };
+        let Some(j) = rest.iter().position(|n| {
+            matches!(n, ConversationItem::User(u)
+                if u.synthetic_reason.is_some() && user_item_text(u) == text)
+        }) else {
+            i += 1;
+            continue;
+        };
+        let native_item = rest[j].clone();
+        let target = if j == 0 {
+            Some(0)
+        } else {
+            body.iter()
+                .position(|b| same_host_item(b, &rest[j - 1]))
+                .map(|k| k + 1)
+        };
+        match target {
+            // Note is ahead of its native anchor: move it to the native slot.
+            Some(t) if t > i => {
+                body.remove(i);
+                body.insert(t - 1, native_item);
+                // `t - 1 >= i`; nothing before `i` changed, continue after the moved item.
+                i = t;
+            }
+            Some(0) if i != 0 => {
+                body.remove(i);
+                body.insert(0, native_item);
+                i += 1;
+            }
+            _ => {
+                body[i] = native_item;
+                i += 1;
+            }
+        }
+    }
+}
+
 /// True when `SessionUserMessage` is a band: empty `source_messages`.
 ///
 /// Verified at vendored `session_view.rs` (`band_user_message` vs UserPrompt).
@@ -550,6 +678,8 @@ pub fn build_writeback_conversation(
     if body.is_empty() {
         return Err("empty_lhc_context".into());
     }
+    // Same alignment as serving so the written body is what serving produces.
+    align_runtime_notes_with_native(&mut body, native_before);
     // Live-tail ToolResult / assistant tool_calls are conserved — not an error.
     let indices = native_prompt_indices(native_before);
     assign_prompt_indices_from_tail(&mut body, &indices);
@@ -615,6 +745,9 @@ pub fn decide_substitution(
             reason: "empty_lhc_context",
         };
     }
+    // Host-owned System prefix and injected synthetic items: the record's
+    // runtime_note copies are aligned to the live native body (L5 ruling).
+    align_runtime_notes_with_native(&mut body, native_items);
     // Live-tail tool cycles are conserved — substitution may carry them.
     let indices = native_prompt_indices(native_items);
     assign_prompt_indices_from_tail(&mut body, &indices);
@@ -1733,6 +1866,145 @@ mod tests {
                 .iter()
                 .any(|i| matches!(i, ConversationItem::ToolResult(_))),
             "live-tail ToolResult must be conserved as ToolResult"
+        );
+    }
+
+    // ---- L5 alignment (2026-09-04 ruling): host owns System prefix + injected items ----
+
+    fn rn_kinds(view: &SessionThreadView, note_ids: &[&str]) -> SourceKindIndex {
+        let mut k = SourceKindIndex::assume_sourced_users_are_prompts(view);
+        for id in note_ids {
+            k.insert(*id, lhc::messages::MessageKind::RuntimeNote);
+        }
+        k
+    }
+
+    /// First live turn as captured on 2026-09-04: the record holds the system
+    /// prompt and the skill reminder as runtime notes ahead of `<user_info>`;
+    /// the native body has the prompt only in the System prefix and the
+    /// reminder after `<user_info>`. Served must equal native, item for item.
+    #[test]
+    fn l5_first_turn_served_equals_native() {
+        let mut q = ConversationItem::user("<user_query>hi</user_query>");
+        q.set_prompt_index(0);
+        let native = vec![
+            ConversationItem::system("SYSTEM PROMPT"),
+            ConversationItem::user("<user_info>cwd</user_info>"),
+            ConversationItem::system_reminder("<system-reminder>skills</system-reminder>"),
+            q,
+        ];
+        let v = view(vec![
+            user_prompt("[runtime note] SYSTEM PROMPT", "rn0"),
+            user_prompt(
+                "[runtime note] <system-reminder>skills</system-reminder>",
+                "rn1",
+            ),
+            user_prompt("<user_info>cwd</user_info>", "u0"),
+            user_prompt("<user_query>hi</user_query>", "u1"),
+        ]);
+        let kinds = rn_kinds(&v, &["rn0", "rn1"]);
+        let served = match decide_substitution(&native, &v, &kinds, None) {
+            ServeDecision::Substitute { items } => items,
+            ServeDecision::Native { reason } => panic!("expected substitute: {reason}"),
+        };
+        assert_eq!(served.len(), native.len(), "{served:#?}");
+        for (s, n) in served.iter().zip(native.iter()) {
+            assert_eq!(
+                serde_json::to_value(s).unwrap(),
+                serde_json::to_value(n).unwrap()
+            );
+        }
+        // The reminder is the host's own item (its synthetic reason, not CompactionMeta).
+        assert!(matches!(
+            &served[2],
+            ConversationItem::User(u)
+                if u.synthetic_reason == Some(xai_grok_sampling_types::SyntheticReason::SystemReminder)
+        ));
+    }
+
+    /// A note with no native counterpart stays where the record has it, with
+    /// its view text; a note already after its anchor is not moved.
+    #[test]
+    fn l5_alignment_leaves_unmatched_and_ordered_notes_alone() {
+        let native = vec![
+            ConversationItem::system("SYS"),
+            ConversationItem::user("a"),
+            ConversationItem::system_reminder("R"),
+            ConversationItem::assistant("ok"),
+        ];
+        let mut body = vec![
+            ConversationItem::user_meta("[runtime note] cwd switched"),
+            ConversationItem::user("a"),
+            ConversationItem::user_meta("[runtime note] R"),
+            ConversationItem::assistant("ok"),
+        ];
+        let before = body.clone();
+        align_runtime_notes_with_native(&mut body, &native);
+        assert_eq!(body.len(), before.len());
+        assert!(matches!(&body[0], ConversationItem::User(u)
+            if user_item_text(u) == "[runtime note] cwd switched"));
+        assert!(matches!(&body[2], ConversationItem::User(u)
+            if u.synthetic_reason == Some(xai_grok_sampling_types::SyntheticReason::SystemReminder)
+                && user_item_text(u) == "R"));
+    }
+
+    /// Bands and tool cycles are untouched; the system-prompt echo is dropped
+    /// even behind bands; idempotent (write-back fixpoint).
+    #[test]
+    fn l5_alignment_post_compact_idempotent() {
+        use xai_grok_sampling_types::ToolCall;
+        let native = vec![
+            ConversationItem::system("SYS"),
+            ConversationItem::user_meta("[context · smooth]\nbridge"),
+            ConversationItem::user("<user_info>x</user_info>"),
+            ConversationItem::system_reminder("R"),
+            ConversationItem::user("live"),
+            ConversationItem::assistant_tool_calls(vec![ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            }]),
+            ConversationItem::tool_result("c1", "out"),
+        ];
+        let mut body = vec![
+            ConversationItem::user_meta("[context · smooth]\nbridge"),
+            ConversationItem::user_meta("[runtime note] SYS"),
+            ConversationItem::user_meta("[runtime note] R"),
+            ConversationItem::user("<user_info>x</user_info>"),
+            ConversationItem::user("live"),
+            ConversationItem::assistant_tool_calls(vec![ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            }]),
+            ConversationItem::tool_result("c1", "out"),
+        ];
+        align_runtime_notes_with_native(&mut body, &native);
+        let shape: Vec<String> = body
+            .iter()
+            .map(|i| match i {
+                ConversationItem::User(u) => format!("u:{}", user_item_text(u)),
+                ConversationItem::Assistant(_) => "a".into(),
+                ConversationItem::ToolResult(t) => format!("t:{}", t.tool_call_id),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                "u:[context · smooth]\nbridge",
+                "u:<user_info>x</user_info>",
+                "u:R",
+                "u:live",
+                "a",
+                "t:c1"
+            ]
+        );
+        let once = body.clone();
+        align_runtime_notes_with_native(&mut body, &native);
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::to_value(&once).unwrap()
         );
     }
 }
