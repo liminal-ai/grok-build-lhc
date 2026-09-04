@@ -597,7 +597,7 @@ Chunk 1 means the first real upstream sync already has a proven fallback.)
 |---|---|---|---|---|---|
 | v0.2.1 | `c30cadb8` | `dd251ec` / 6 | 31627906621 | 31628937277 | published 2026-08-12 |
 | v0.3.0 | `8227f87c` | `e9456a6e` / 13 | 33859291549 | 33860222861 | published 2026-09-04 (promotion run 33865457927) |
-| v0.3.1 | _slice 5b_ | `e9456a6e` / 13 | _pending_ | _pending_ | not promoted (L5 serving fix; handoff: heron `slice5b/CANDIDATE_HANDOFF.md`) |
+| v0.3.1 | `66459b44` | `e9456a6e` / 13 | 33866966760 | 33867865171 | **not promoted** — Lee's call (L5 serving fix; handoff: heron `slice5b/CANDIDATE_HANDOFF.md`) |
 
 ## Known limitations (live cert 2026-09-04, follow-ups — not blockers)
 
