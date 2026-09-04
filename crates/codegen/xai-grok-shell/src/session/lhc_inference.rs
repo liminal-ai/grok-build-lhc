@@ -124,6 +124,7 @@ impl ShellLhcInferenceSampler {
             x_grok_req_id: Some(format!("xai-lhc-{}-{}", label, uuid::Uuid::new_v4())),
             x_grok_session_id: Some(self.session_id.clone()),
             x_grok_turn_idx: None,
+            x_grok_transient_retry: None,
             x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
             x_grok_deployment_id: None,
             x_grok_user_id: None,
@@ -131,6 +132,9 @@ impl ShellLhcInferenceSampler {
             prompt_cache_key: None,
             reasoning_effort: Some(self.thinking_level()),
             json_schema: None,
+            // Text-only derivation request: upstream default (tool calls would
+            // complete; text-only `Length` still fails, same as before).
+            length_policy: xai_grok_sampling_types::LengthPolicy::default(),
         }
     }
 

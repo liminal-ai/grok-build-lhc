@@ -293,10 +293,12 @@ fn golden_every_synthetic_reason() {
     let reasons = [
         SyntheticReason::CompactionMeta,
         SyntheticReason::SystemReminder,
+        SyntheticReason::LengthContinue,
         SyntheticReason::ProjectInstructions,
         SyntheticReason::AutoContinue,
         SyntheticReason::AutoRecovery,
         SyntheticReason::Interjection,
+        SyntheticReason::AgentMessage,
         SyntheticReason::TaskCompleted,
         SyntheticReason::SubagentCompleted,
         SyntheticReason::NotificationDrain,
@@ -316,13 +318,14 @@ fn golden_every_synthetic_reason() {
         items.push(item);
     }
     let (mapped, _) = map_history("synth-session", 0, &items, &TurnEndFacts::default());
-    // 5 turn-starters → turn_end+note; 10 plain notes → 20 events.
-    assert_eq!(mapped.len(), 20);
+    // 7 turn-starters (incl. AgentMessage + Unknown after the 2026-09 upstream
+    // sync) → turn_end+note; 10 plain notes → 24 events.
+    assert_eq!(mapped.len(), 24);
     let turn_ends = mapped
         .iter()
         .filter(|e| e.input.event_kind == "turn_end")
         .count();
-    assert_eq!(turn_ends, 5);
+    assert_eq!(turn_ends, 7);
     assert!(
         mapped
             .iter()

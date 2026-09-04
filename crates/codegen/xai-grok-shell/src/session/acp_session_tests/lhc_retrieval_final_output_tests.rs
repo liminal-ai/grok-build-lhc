@@ -82,16 +82,17 @@ async fn handle_bridge_tool_success_preserves_get_messages_sdk_bytes_exactly() {
             let sdk_text = historical_sdk_envelope(&real_cwd);
             let parsed_args = serde_json::json!({ "ids": ["m1"] });
             let followups = actor
-                .handle_bridge_tool_success(
-                    &acp::ToolCallId::new("tc-lhc-msg"),
-                    "tc-lhc-msg",
-                    grok_lhc_host::GET_MESSAGES_TOOL_NAME,
-                    grok_lhc_host::GET_MESSAGES_TOOL_NAME,
-                    DrainedToolSuccess::new(text_run_result(&sdk_text)),
-                    0,
-                    "test-model",
-                    &parsed_args,
-                )
+                .handle_bridge_tool_success(BridgeToolSuccess {
+                    tool_call_id: &acp::ToolCallId::new("tc-lhc-msg"),
+                    call_id: "tc-lhc-msg",
+                    requested_tool_name: grok_lhc_host::GET_MESSAGES_TOOL_NAME,
+                    effective_tool_name: grok_lhc_host::GET_MESSAGES_TOOL_NAME,
+                    drained: DrainedToolSuccess::new(text_run_result(&sdk_text)),
+                    concatenated_json_count: 0,
+                    model_id: "test-model",
+                    tool_parsed_args: &parsed_args,
+                    model_output_override: None,
+                })
                 .await
                 .expect("bridge success");
 
@@ -161,16 +162,17 @@ async fn handle_bridge_tool_success_preserves_get_turns_sdk_bytes_exactly() {
                 .expect("display_cwd");
             let sdk_text = historical_sdk_envelope(&real_cwd);
             let followups = actor
-                .handle_bridge_tool_success(
-                    &acp::ToolCallId::new("tc-lhc-turns"),
-                    "tc-lhc-turns",
-                    grok_lhc_host::GET_TURNS_TOOL_NAME,
-                    grok_lhc_host::GET_TURNS_TOOL_NAME,
-                    DrainedToolSuccess::new(text_run_result(&sdk_text)),
-                    0,
-                    "test-model",
-                    &serde_json::json!({ "ids": ["t1"] }),
-                )
+                .handle_bridge_tool_success(BridgeToolSuccess {
+                    tool_call_id: &acp::ToolCallId::new("tc-lhc-turns"),
+                    call_id: "tc-lhc-turns",
+                    requested_tool_name: grok_lhc_host::GET_TURNS_TOOL_NAME,
+                    effective_tool_name: grok_lhc_host::GET_TURNS_TOOL_NAME,
+                    drained: DrainedToolSuccess::new(text_run_result(&sdk_text)),
+                    concatenated_json_count: 0,
+                    model_id: "test-model",
+                    tool_parsed_args: &serde_json::json!({ "ids": ["t1"] }),
+                    model_output_override: None,
+                })
                 .await
                 .expect("bridge success");
             assert!(followups.is_empty(), "no live follow-ups: {followups:?}");
@@ -200,16 +202,17 @@ async fn handle_bridge_tool_success_still_rewrites_unrelated_tool_paths() {
             actor.display_cwd.set(display.clone()).expect("display_cwd");
             let body = format!("wrote file at {real_cwd}/out.txt");
             let _ = actor
-                .handle_bridge_tool_success(
-                    &acp::ToolCallId::new("tc-bash"),
-                    "tc-bash",
-                    "bash",
-                    "bash",
-                    DrainedToolSuccess::new(text_run_result(&body)),
-                    0,
-                    "test-model",
-                    &serde_json::json!({}),
-                )
+                .handle_bridge_tool_success(BridgeToolSuccess {
+                    tool_call_id: &acp::ToolCallId::new("tc-bash"),
+                    call_id: "tc-bash",
+                    requested_tool_name: "bash",
+                    effective_tool_name: "bash",
+                    drained: DrainedToolSuccess::new(text_run_result(&body)),
+                    concatenated_json_count: 0,
+                    model_id: "test-model",
+                    tool_parsed_args: &serde_json::json!({}),
+                    model_output_override: None,
+                })
                 .await
                 .expect("bridge success");
             let conv = actor.chat_state_handle.get_conversation().await;

@@ -103,7 +103,7 @@ impl LhcInferenceSampler for TimedShellSampler {
 }
 
 fn grok_home() -> PathBuf {
-    dirs::home_dir().expect("HOME").join(".grok")
+    xai_dirs::home_dir().expect("HOME").join(".grok")
 }
 
 fn restore_env(

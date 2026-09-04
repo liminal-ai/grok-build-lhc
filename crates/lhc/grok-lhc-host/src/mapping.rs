@@ -296,7 +296,13 @@ fn map_synthetic_user(
     let text = content_parts_text(&user.content);
     // Exhaustive on SyntheticReason — no `_ =>`.
     let starts_turn = match reason {
-        SyntheticReason::TaskCompleted
+        // Upstream 2026-09 sync: `AgentMessage` (model-authored input from
+        // another agent) is a turn start; `Unknown` flipped to a turn start
+        // (fail-safe boundary for future reasons); `LengthContinue` is the
+        // mid-turn continue reminder after a salvaged Length truncation.
+        SyntheticReason::AgentMessage
+        | SyntheticReason::Unknown
+        | SyntheticReason::TaskCompleted
         | SyntheticReason::SubagentCompleted
         | SyntheticReason::NotificationDrain
         | SyntheticReason::GoalClassifierNudge
@@ -306,14 +312,14 @@ fn map_synthetic_user(
         }
         SyntheticReason::CompactionMeta
         | SyntheticReason::SystemReminder
+        | SyntheticReason::LengthContinue
         | SyntheticReason::ProjectInstructions
         | SyntheticReason::AutoContinue
         | SyntheticReason::AutoRecovery
         | SyntheticReason::Interjection
         | SyntheticReason::GoalSummary
         | SyntheticReason::StopHookFeedback
-        | SyntheticReason::WorkingDirectorySwitch
-        | SyntheticReason::Unknown => {
+        | SyntheticReason::WorkingDirectorySwitch => {
             debug_assert!(!reason.starts_prompt_turn());
             false
         }

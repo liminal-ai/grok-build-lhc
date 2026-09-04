@@ -155,6 +155,21 @@ impl ChatPersistence for LhcTeePersistence {
         self.inner.replace_history(items);
     }
 
+    /// Upstream image-strip rewrite (2026-09 sync): native history is
+    /// rewritten with poisoned images removed and the disk outcome acked.
+    /// Deliberately **not** mirrored into LHC: item keys are content digests,
+    /// so re-mapping the stripped copies would record them as novel events
+    /// beside the originals. The LHC record keeps full fidelity; the strip is
+    /// a native-only remediation. Serving under LHC still carries the
+    /// original blocks — recorded as an open design question (FORK.md sync
+    /// record 2026-09-04), not resolved here.
+    fn replace_history_for_strip_and_ack(
+        &mut self,
+        items: &[ConversationItem],
+    ) -> oneshot::Receiver<std::io::Result<()>> {
+        self.inner.replace_history_for_strip_and_ack(items)
+    }
+
     fn flush(&mut self) {
         self.with_handle(|h| h.flush_async());
         self.inner.flush();

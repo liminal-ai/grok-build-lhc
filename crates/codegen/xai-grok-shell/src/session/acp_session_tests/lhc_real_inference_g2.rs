@@ -48,7 +48,7 @@ const SEED_WORDS_PER_MSG: usize = 5_000;
 const COMPACT_FAST_CEILING: Duration = Duration::from_secs(30);
 
 fn grok_home() -> PathBuf {
-    dirs::home_dir().expect("HOME").join(".grok")
+    xai_dirs::home_dir().expect("HOME").join(".grok")
 }
 
 fn body_fingerprint(items: &[ConversationItem]) -> String {
