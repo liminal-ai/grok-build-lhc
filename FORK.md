@@ -14,7 +14,12 @@ record, with banded compaction replacing native auto-compact — full history
 preserved and rebuildable at full fidelity. Working branch and default
 branch: `lhc`. `main` tracks upstream, untouched.
 
-Status: Chunk 3B harness track in progress (3A accepted); product wiring — config, `/lhc` status/repair, rollout
+Status: **Chunk 3B live certification run 2026-09-04** on the installed v0.3.0
+(L1–L4, L6 PASS; L2 kill/recovery PASS; mid-turn, image and t3code drills PASS;
+**L5 open** — informational divergence on every served turn, Lee's ruling
+required; evidence table:
+[`crates/lhc/grok-lhc-host/LIVE_CERT_2026-09-04.md`](crates/lhc/grok-lhc-host/LIVE_CERT_2026-09-04.md)).
+3A accepted; product wiring — config, `/lhc` status/repair, rollout
 safety) of the 3-chunk integration
 (`long-horizon-context/docs/lhc-rs-port/phase3-grok-build-integration-brief.md`).
 Wave B retrieval tools (`get_turns` / `get_messages`) and identity/signature
@@ -26,8 +31,9 @@ mutex** — even if other sessions are actively capturing — via a per-session
 generation-cached binding
 (`aa1_disabled_persist_takes_no_registry_lock_while_other_session_active`).
 Steady state: one generation atomic compare; mutex only when registration
-actually changes. No I/O, no spawn, no SQLite on that path. Chunk 3B (live
-certification) remains.
+actually changes. No I/O, no spawn, no SQLite on that path. Chunk 3B live
+certification ran 2026-09-04 (see Status above and
+`crates/lhc/grok-lhc-host/LIVE_CERT_2026-09-04.md`); L5 awaits Lee's ruling.
 
 ## Layout
 
@@ -591,6 +597,34 @@ Chunk 1 means the first real upstream sync already has a proven fallback.)
 |---|---|---|---|---|---|
 | v0.2.1 | `c30cadb8` | `dd251ec` / 6 | 31627906621 | 31628937277 | published 2026-08-12 |
 | v0.3.0 | `8227f87c` | `e9456a6e` / 13 | 33859291549 | 33860222861 | **pending Lee's approval** (candidate bytes installed locally 2026-09-04; handoff: heron `slice4/CANDIDATE_HANDOFF.md`) |
+
+## Known limitations (live cert 2026-09-04, follow-ups — not blockers)
+
+- **Turn parts are not wired in the adapter.** `CompactOpts.compact_point_upper_bound`
+  is `None` and no host step index is recorded, so a compact that fires
+  mid-turn (hook 5 in the sampling loop) cannot move the LHC compact point
+  into the open turn. The write-back body is bands + the whole open turn
+  verbatim; native does not shrink until the turn closes, and the native
+  trigger re-fires on every later model call in that turn (7 write-backs in
+  one 8-read turn at a 150k debug window; each re-records the turn's tool
+  calls). The turn still completes and the record stays one turn; the first
+  call after the turn closes compacts normally.
+- **Served body carries the system prompt twice (L5 finding, 2026-09-04).**
+  Native `System` is captured as `runtime_note` and served back as a
+  `[runtime note]` synthetic user item on top of the native system prefix
+  (plus the `<system-reminder>` note ahead of `<user_info>`), so hook 4 reports
+  a structural + informational divergence on every substituted turn
+  (`LIVE_CERT_2026-09-04.md`, L5). Rule unchanged since v0.2.1; cost ≈ one
+  system prompt of extra input tokens per turn. Awaiting Lee's ruling
+  (MAPPING G1) — fix is a serving-side dedupe of runtime notes that match the
+  native system prefix, or a mapping change; neither made here.
+- **LHC lower bound above the native trigger loops compaction.** The
+  continuation profile's `lower_bound` is 120,000 tokens. If the native
+  auto-compact trigger (85% of the model's context window) is below that —
+  any window under ~141k, or `GROK_DEBUG_CONTEXT_WINDOW` set low — LHC
+  cannot reduce the body and every model call after the threshold re-runs
+  compact (13 write-backs in one turn at a 60k window). Production grok-4.6
+  (256k → 217k trigger) is above the bound.
 
 ## Host obligations toward LHC (from the port's acceptance record)
 
