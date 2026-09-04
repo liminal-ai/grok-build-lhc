@@ -575,6 +575,22 @@ Chunk 1 means the first real upstream sync already has a proven fallback.)
   `production` environment.
 - Updater: `GH_RELEASE_REPO = liminal-ai/grok-build-lhc`; UI says
   **grok-build-lhc**. Auto-update defaults **off** until the user opts in.
+  Resolution needs `[cli] installer = "gh-release"` in `~/.grok/config.toml`
+  (stock writes `"internal"`, which would read xAI's channel pointer).
+- **Local install on Lee's box (2026-09-04, v0.3.0 candidate bytes):**
+  `~/.local/bin/grok` → `~/.local/share/grok-lhc/current/bin/grok` (the
+  release installer's managed store), and `~/.local/bin/grok-lhc` is a
+  symlink to that same file — `grok` and `grok-lhc` are **the same build**.
+  Stock Grok 1.0.13 is kept only as `~/.grok/bin/grok-stock` (not on PATH);
+  `~/.grok/downloads` is empty and the stock `agent` / `grok` symlinks in
+  `~/.grok/bin` are gone. `auto_update = false`, `installer = "gh-release"`.
+
+### Release record
+
+| Version | Source SHA | LHC pin / schema | Candidate run | Linux smoke | Promotion |
+|---|---|---|---|---|---|
+| v0.2.1 | `c30cadb8` | `dd251ec` / 6 | 31627906621 | 31628937277 | published 2026-08-12 |
+| v0.3.0 | `8227f87c` | `e9456a6e` / 13 | 33859291549 | 33860222861 | **pending Lee's approval** (candidate bytes installed locally 2026-09-04; handoff: heron `slice4/CANDIDATE_HANDOFF.md`) |
 
 ## Host obligations toward LHC (from the port's acceptance record)
 
