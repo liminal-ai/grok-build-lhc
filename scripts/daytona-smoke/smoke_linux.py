@@ -15,7 +15,8 @@ Checks:
   4. `grok --version` exits 0 and prints a version
   5. `grok --help` exits 0
   6. Run a deterministic headless turn and verify prompt, assistant response,
-     schema v6, and completed turn durability after process exit
+     the manifest's LHC thread schema, and completed turn durability after
+     process exit
   7. Uninstall managed files while preserving user/LHC data
 """
 

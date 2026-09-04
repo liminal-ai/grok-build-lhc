@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import re
 from pathlib import Path
 
 parser = argparse.ArgumentParser()
@@ -14,6 +15,21 @@ parser.add_argument("--lhc-sdk-commit", required=True)
 parser.add_argument("--tripwire-evidence", required=True)
 parser.add_argument("--run-id", required=True)
 args = parser.parse_args()
+
+def lhc_thread_schema() -> int:
+    """The vendored Rust SDK's CURRENT_THREAD_SCHEMA_VERSION — derived, never
+    hand-maintained, so the manifest (and the Daytona lifecycle check that
+    reads it) follows the submodule pin. A pin bump that changes the schema
+    cannot leave a stale number here."""
+    storage = (
+        Path(__file__).resolve().parents[2]
+        / "crates/lhc/vendor/long-horizon-context/packages/lhc-rs/src/shared_tech/storage.rs"
+    )
+    match = re.search(r"pub const CURRENT_THREAD_SCHEMA_VERSION: i64 = (\d+);", storage.read_text(encoding="utf-8"))
+    if not match:
+        raise SystemExit(f"CURRENT_THREAD_SCHEMA_VERSION not found in {storage}")
+    return int(match.group(1))
+
 
 asset = args.dist / f"grok-{args.version}-linux-x86_64"
 if not asset.is_file():
@@ -37,7 +53,7 @@ manifest = {
     "upstream_commit": args.upstream_commit,
     "lhc_sdk_commit": args.lhc_sdk_commit,
     "tripwire_evidence": args.tripwire_evidence,
-    "lhc_thread_schema": 6,
+    "lhc_thread_schema": lhc_thread_schema(),
     "candidate_run_id": args.run_id,
     "published_platforms": ["linux-x86_64"],
     "source_compatibility_targets": ["linux-x86_64", "windows-x86_64", "macos-aarch64"],

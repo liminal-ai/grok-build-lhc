@@ -115,6 +115,7 @@ jobs:
           CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
           SMOKE_RUN_ID: ${{ inputs.smoke_run_id }}
         run: |
+          schema="$(python3 -c 'import json; print(json.load(open("candidate/release-manifest.json"))["lhc_thread_schema"])')"
           cat > RELEASE_NOTES.md <<EOF
           ## Grok-LHC v${VERSION}
 
@@ -126,7 +127,7 @@ jobs:
 
           Candidate run: ${CANDIDATE_RUN_ID}
           Linux smoke run: ${SMOKE_RUN_ID}
-          LHC thread schema: v6
+          LHC thread schema: v${schema}
 
           This is not an official xAI release. Verify SHA256SUMS and
           release-manifest.json before installation.

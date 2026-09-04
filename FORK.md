@@ -563,6 +563,10 @@ Chunk 1 means the first real upstream sync already has a proven fallback.)
   public-git recovery base, respectively.
 - Current prebuilt asset: `grok-{ver}-linux-x86_64`, plus the checksummed
   installer, manifest, and `SHA256SUMS`.
+- `release-manifest.json`'s `lhc_thread_schema` is **derived** by
+  `make_manifest.py` from the vendored SDK's `CURRENT_THREAD_SCHEMA_VERSION`
+  (never hand-maintained; it was a literal `6` until v0.3.0). The Daytona
+  lifecycle check and the promotion notes read it from the manifest.
 - Windows x86-64 and Apple Silicon macOS remain maintained source-compatibility
   targets under `platform-readiness.yml`; they are not current prebuilt assets.
 - Candidate, smoke, and promotion are manual. Pushing a source tag does not
