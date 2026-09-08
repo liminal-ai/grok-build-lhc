@@ -2632,6 +2632,14 @@ async fn lhc_unmanaged_build_gets_guidance_not_a_stock_install() {
 #[cfg(unix)]
 mod lhc_decisions {
     use super::*;
+
+    /// The next fork revision of `release`, derived from its parsed tuple so the tests stay
+    /// valid after a normal release bump (`1.0.16` → `1.0.16-lhc.1`, `1.0.16-lhc.1` → `-lhc.2`).
+    fn next_fork_revision(release: &str) -> String {
+        let (major, minor, patch, revision) =
+            crate::lhc_release::parse_lhc_release(release).expect("embedded release parses");
+        format!("{major}.{minor}.{patch}-lhc.{}", revision + 1)
+    }
     use crate::lhc_release::{
         INSTALLER_ASSET, INSTALLER_LHC_MANAGED, LHC_RELEASE_BASE_ENV, LHC_TEST_EXE_ENV, sha256_hex,
     };
@@ -2795,7 +2803,7 @@ mod lhc_decisions {
         assert_eq!(status.error, None);
         drop(fx);
 
-        let later = format!("{base}-lhc.1");
+        let later = next_fork_revision(base);
         let fx = Fixture::new(base, &later).await;
         let status = check_update_status(&update_config()).await;
         assert_eq!(status.current_version, base);
@@ -2812,7 +2820,7 @@ mod lhc_decisions {
     #[serial_test::serial]
     async fn converge_uses_the_store_receipt_and_installs_only_a_later_revision() {
         let base = crate::lhc_release::LHC_RELEASE_VERSION;
-        let later = format!("{base}-lhc.1");
+        let later = next_fork_revision(base);
         let fx = Fixture::new(&later, &later).await;
         let outcome = ensure_latest_on_disk(&update_config()).await.unwrap();
         assert_eq!(
@@ -2850,7 +2858,7 @@ mod lhc_decisions {
     #[serial_test::serial]
     async fn explicit_update_at_the_same_fork_revision_reinstalls_nothing() {
         let base = crate::lhc_release::LHC_RELEASE_VERSION;
-        let later = format!("{base}-lhc.1");
+        let later = next_fork_revision(base);
         let fx = Fixture::new(&later, &later).await;
         let mut cfg = update_config();
         let result = run_update(false, None, None, &mut cfg, CliUpdateTrigger::UserCommand)
