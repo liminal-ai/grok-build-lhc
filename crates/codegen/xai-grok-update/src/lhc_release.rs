@@ -39,7 +39,7 @@ pub const LHC_INSTALLER_URL_WINDOWS: &str =
     "https://github.com/liminal-ai/grok-build-lhc/releases/latest/download/install.ps1";
 /// Install documentation.
 pub const LHC_INSTALL_DOCS_URL: &str =
-    "https://github.com/liminal-ai/grok-build-lhc/blob/lhc/lhc-docs/INSTALL.md";
+    "https://github.com/liminal-ai/grok-build-lhc/blob/main/lhc-docs/INSTALL.md";
 
 /// Loopback-only test transport: `<base>/latest` answers the latest-release
 /// JSON and `<base>/download/v<release>/<asset>` serves assets. The installer

@@ -10,7 +10,7 @@
 > something the thin view only sketches.
 >
 > Built on [**LHC** (Long Horizon Context)](https://github.com/liminal-ai/long-horizon-context).
-> Product branch **`lhc`** (`main` mirrors it); upstream base recorded in `patches/BASE`.
+> Product branch **`main`**; upstream base recorded in `patches/BASE`.
 >
 > - [**What this fork is**](lhc-docs/README.md) — more on the approach and fit
 > - [**Install & use**](lhc-docs/INSTALL.md) — build and run

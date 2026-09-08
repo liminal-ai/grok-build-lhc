@@ -1,7 +1,7 @@
 # LHC hook patch series
 
 Every core-file touchpoint (an `LHC-HOOK` marked insertion outside
-`crates/lhc/`) is maintained BOTH as normal commits on the `lhc` branch AND
+`crates/lhc/`) is maintained BOTH as normal commits on the `main` branch AND
 as a re-appliable patch here, regenerated after any hook change and after
 every upstream sync.
 
@@ -16,7 +16,7 @@ apply the patch -> `scripts/check-lhc-hooks.sh`. The full drill is in
 - `BASE` — the upstream commit the diff was generated against: the
   `upstream/main` tip taken in by the last sync. It is a recorded fact of
   the fork, not a branch; no local branch layout is consulted. (`origin/main`
-  and `origin/lhc` both carry the product tree — neither is the base.)
+  carries the product tree — it is not the base.)
 - `0001-lhc-touchpoints.patch` — `git diff` of every fork-owned core-file
   delta, path list derived (see below).
 

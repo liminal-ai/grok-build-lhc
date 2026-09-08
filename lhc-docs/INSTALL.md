@@ -13,7 +13,7 @@ see [`../FORK.md`](../FORK.md).
 ```bash
 git clone --recurse-submodules https://github.com/liminal-ai/grok-build-lhc.git
 cd grok-build-lhc
-git checkout lhc   # default branch; product lives here
+git checkout main  # default branch; product lives here
 ```
 
 If you already cloned without submodules:

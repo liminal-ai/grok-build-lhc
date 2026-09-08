@@ -58,8 +58,7 @@ Deeper design (bands, archive vs view, ethics of not erasing history): LHC
 
 | | |
 |---|---|
-| **`lhc`** (default) | Product: Grok + LHC |
-| **`main`** | Upstream mirror only |
+| **`main`** (default) | Product: Grok + LHC |
 | **Releases** | [GitHub Releases](https://github.com/liminal-ai/grok-build-lhc/releases) via tag `v*` / Actions: Linux x86-64, macOS Apple Silicon, Windows x86-64 executables plus `install.sh` and `install.ps1` (see [Install](INSTALL.md)). |
 
 ## Where to go next

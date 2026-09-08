@@ -12,9 +12,10 @@ Fork of [`xai-org/grok-build`](https://github.com/xai-org/grok-build) adding
 Context): event-sourced capture of every session into a per-thread SQLite
 record, with banded compaction replacing native auto-compact — full history
 preserved and rebuildable at full fidelity. Working branch and default
-branch: `lhc` (the product; `origin/main` is kept equal to it). The upstream
-base is the remote `upstream/main` and is recorded in `patches/BASE`; no
-local branch stands in for it.
+branch: `main` (the product; since 2026-09-08 — before that the product was
+`lhc` with `main` kept equal to it). The upstream base is the remote
+`upstream/main` and is recorded in `patches/BASE`; no local branch stands in
+for it.
 
 Status: **Chunk 3B live certification run 2026-09-04** on the installed v0.3.0
 (L1–L4, L6 PASS; L2 kill/recovery PASS; mid-turn, image and t3code drills PASS;
@@ -499,7 +500,7 @@ durable representation of the fork.
 
 ## Sync drill (weekly or on-need, not per upstream commit)
 
-1. `git fetch upstream && git checkout lhc && git merge upstream/main`
+1. `git fetch upstream && git checkout main && git merge upstream/main`
 2. Expected recurring conflict: root `Cargo.toml` is auto-generated and
    sorted; our `crates/lhc/grok-lhc-host` members entry will collide.
    Resolution rule: take upstream's list, re-add our single entry in sort
@@ -512,11 +513,11 @@ durable representation of the fork.
    preamble. Then links to `lhc-docs/` and
    `liminal-ai/long-horizon-context`, ending with `Everything below is
    upstream's README`. After a merge, if the banner is missing or mangled,
-   restore it from the previous `lhc` tip. `lhc-docs/**` and `FORK.md` are
+   restore it from the previous `main` tip. `lhc-docs/**` and `FORK.md` are
    fork-only; they should not conflict with upstream.
 4. `scripts/check-lhc-hooks.sh` — all layers green.
-5. (No local `main` step. `origin/main` is pushed equal to `lhc` in step 7;
-   it is not the upstream base and nothing derives from it.)
+5. (`origin/main` is the product branch, not the upstream base; nothing
+   derives from it. There is no mirror branch to keep equal.)
 6. **Advance the patch base.** `patches/BASE` names the upstream commit the
    state diff is generated from; a merge moves the tree past it. Write the
    merged upstream tip (`git rev-parse upstream/main`) into `patches/BASE`
@@ -525,7 +526,7 @@ durable representation of the fork.
    **part of the sync**, not cleanup after it — the codex-lhc fork learned
    this the hard way (its `patch-repro` gate failed at the first real sync
    for exactly this omission).
-7. Push `lhc` and `main` (both at the product tip).
+7. Push `main` (the product tip).
 8. Sync commit body records: upstream range, tripwire results, smoke verdict,
    and whether the README banner was re-applied. Append an entry to the Sync
    record section above.
@@ -535,7 +536,7 @@ durable representation of the fork.
 If `git merge upstream/main` reports unrelated histories or the diff is
 implausibly large, upstream reset. Do not merge. Instead:
 
-1. Fresh clone of new upstream; branch `lhc` from its tip.
+1. Fresh clone of new upstream; branch `main` from its tip.
 2. Copy `crates/lhc/` (or re-add the submodule + adapter), `patches/`,
    `scripts/` (tripwire, patch refresh, release), `lhc-release/` (fork
    release identity), `lhc-docs/`, `.github/workflows/`, `FORK.md` from the
