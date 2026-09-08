@@ -248,11 +248,10 @@ pub fn managed_installer_guidance() -> String {
     )
 }
 
-/// What to tell a user whose managed install's update did not complete: the store
-/// still runs the previous release, so retry or rerun the release installer.
+/// What to tell a user whose managed install's update did not complete.
 pub fn managed_update_failure_guidance() -> String {
     format!(
-        "The managed grok-build-lhc update did not complete; the installed release is unchanged.\n\
+        "The managed grok-build-lhc update did not complete.\n\
          Retry with `grok update`, or rerun the fork installer against this install (never the official x.ai install script):\n  \
          {}\n\
          See {LHC_INSTALL_DOCS_URL}",

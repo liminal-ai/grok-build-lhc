@@ -2538,14 +2538,14 @@ fn lhc_hints_and_helpers_never_route_to_stock_paths() {
         let hint = reinstall_hint(kind, "stable");
         assert!(hint.contains("install.sh --download"), "{hint}");
         // Only an unmanaged build is told it is unmanaged; a managed build whose
-        // update failed is told the installed release is unchanged.
+        // update failed gets failure advice without being reclassified as unmanaged.
         assert_eq!(
             hint.contains("not running from a managed store"),
             kind == INSTALLER_LHC_UNMANAGED,
             "{hint}"
         );
         assert_eq!(
-            hint.contains("installed release is unchanged"),
+            hint.contains("update did not complete"),
             kind == INSTALLER_LHC_MANAGED,
             "{hint}"
         );
