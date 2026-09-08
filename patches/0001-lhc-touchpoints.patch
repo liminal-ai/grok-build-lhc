@@ -6708,7 +6708,7 @@ index 7a391e7e..25f146a7 100644
              &install_target,
              &update_config.channel,
 diff --git a/crates/codegen/xai-grok-update/src/auto_update_tests.rs b/crates/codegen/xai-grok-update/src/auto_update_tests.rs
-index 8b7c58cf..6cd67861 100644
+index 8b7c58cf..1c1368f5 100644
 --- a/crates/codegen/xai-grok-update/src/auto_update_tests.rs
 +++ b/crates/codegen/xai-grok-update/src/auto_update_tests.rs
 @@ -934,76 +934,70 @@ fn test_reinstall_hint_gh_release_mentions_gh_command() {
@@ -6933,14 +6933,14 @@ index 8b7c58cf..6cd67861 100644
 +        let hint = reinstall_hint(kind, "stable");
 +        assert!(hint.contains("install.sh --download"), "{hint}");
 +        // Only an unmanaged build is told it is unmanaged; a managed build whose
-+        // update failed is told the installed release is unchanged.
++        // update failed gets failure advice without being reclassified as unmanaged.
 +        assert_eq!(
 +            hint.contains("not running from a managed store"),
 +            kind == INSTALLER_LHC_UNMANAGED,
 +            "{hint}"
 +        );
 +        assert_eq!(
-+            hint.contains("installed release is unchanged"),
++            hint.contains("update did not complete"),
 +            kind == INSTALLER_LHC_MANAGED,
 +            "{hint}"
 +        );
@@ -7303,10 +7303,10 @@ index 8b7c58cf..6cd67861 100644
 +}
 diff --git a/crates/codegen/xai-grok-update/src/lhc_release.rs b/crates/codegen/xai-grok-update/src/lhc_release.rs
 new file mode 100644
-index 00000000..515c1189
+index 00000000..a64c160f
 --- /dev/null
 +++ b/crates/codegen/xai-grok-update/src/lhc_release.rs
-@@ -0,0 +1,837 @@
+@@ -0,0 +1,836 @@
 +//! Fork release identity and managed-store ownership for the liminal-ai
 +//! **grok-build-lhc** build. Fork-owned file: upstream never touches it.
 +//!
@@ -7557,11 +7557,10 @@ index 00000000..515c1189
 +    )
 +}
 +
-+/// What to tell a user whose managed install's update did not complete: the store
-+/// still runs the previous release, so retry or rerun the release installer.
++/// What to tell a user whose managed install's update did not complete.
 +pub fn managed_update_failure_guidance() -> String {
 +    format!(
-+        "The managed grok-build-lhc update did not complete; the installed release is unchanged.\n\
++        "The managed grok-build-lhc update did not complete.\n\
 +         Retry with `grok update`, or rerun the fork installer against this install (never the official x.ai install script):\n  \
 +         {}\n\
 +         See {LHC_INSTALL_DOCS_URL}",
