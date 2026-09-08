@@ -2552,6 +2552,20 @@ fn lhc_hints_and_helpers_never_route_to_stock_paths() {
     assert_eq!(disk_version_for_installer(INSTALLER_LHC_UNMANAGED), None);
 }
 
+/// The fork compares its embedded release, never the shared native base.
+#[test]
+fn lhc_running_version_is_the_fork_release() {
+    use crate::lhc_release::{INSTALLER_LHC_MANAGED, INSTALLER_LHC_UNMANAGED, LHC_RELEASE_VERSION};
+    assert_eq!(running_version_for(INSTALLER_LHC_MANAGED), LHC_RELEASE_VERSION);
+    assert_eq!(running_version_for(INSTALLER_LHC_UNMANAGED), LHC_RELEASE_VERSION);
+    assert_eq!(running_version_for("internal"), get_installed_grok_version());
+    // A build at fork revision N must not see its own base as "newer".
+    assert_eq!(
+        needs_update_for(INSTALLER_LHC_MANAGED, "1.0.16-lhc.1", "1.0.16-lhc.1", "stable", false),
+        Some(false)
+    );
+}
+
 /// Restart resolves the store's activated binary, not `~/.grok/bin/grok`.
 #[test]
 fn lhc_managed_restart_uses_the_store_current_binary() {

@@ -216,7 +216,10 @@ pub fn print_update_status(status: &UpdateStatus, json: bool) -> anyhow::Result<
 
 pub async fn check_update_status(update_config: &UpdateConfig) -> UpdateStatus {
     let installer = get_installer().await.map(|value| value.to_string());
-    let current_version = get_installed_grok_version();
+    let current_version = installer
+        .as_deref()
+        .map(running_version_for)
+        .unwrap_or_else(get_installed_grok_version);
     let current_config = config::load_config().await;
     let auto_update = current_config.cli.auto_update;
     let channel = update_config.channel.clone();
@@ -344,7 +347,7 @@ async fn fetch_update_plan(
 /// Gates on the installer (via `installer_allows_downgrade`) so npm is never downgraded; the decision depends on the installer, never the caller.
 pub async fn auto_update_target(update_config: &UpdateConfig) -> Option<(&'static str, String)> {
     let installer = get_installer().await?;
-    let current = get_installed_grok_version();
+    let current = running_version_for(installer);
     let policy = config::VersionPolicy::resolve();
     let UpdatePlan::Install { target, .. } = fetch_update_plan(installer, update_config, &policy)
         .await
@@ -402,8 +405,8 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
         return Ok(outcome);
     };
 
-    let effective_current =
-        disk_version_for_installer(installer).unwrap_or_else(get_installed_grok_version);
+    let effective_current = disk_version_for_installer(installer)
+        .unwrap_or_else(|| running_version_for(installer));
     if needs_update_for(
         installer,
         &effective_current,
@@ -618,7 +621,7 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
         return BackgroundUpdateCheck::none();
     }
 
-    let current_version = get_installed_grok_version();
+    let current_version = running_version_for(installer);
     let policy = config::VersionPolicy::resolve();
     let target_version = match fetch_update_plan(installer, update_config, &policy).await {
         Ok(UpdatePlan::Install { target, .. }) => target,
@@ -728,7 +731,7 @@ pub async fn run_update_if_available(
         tracing::warn!("Failed to save auto-update setting: {}", e);
     }
 
-    let current_version = get_installed_grok_version();
+    let current_version = running_version_for(inst);
     let policy = config::VersionPolicy::resolve();
     // Don't write version.json here
     // Only cache after confirming no update is needed or after a successful install
@@ -939,8 +942,8 @@ pub async fn run_install_script(
     trigger: CliUpdateTrigger,
 ) -> Result<()> {
     // What's on disk is being replaced, not this (possibly stale) process's version; npm has no trustworthy disk version, so it falls back
-    let from_version =
-        disk_version_for_installer(installer).unwrap_or_else(get_installed_grok_version);
+    let from_version = disk_version_for_installer(installer)
+        .unwrap_or_else(|| running_version_for(installer));
     let started = Instant::now();
     // Internal reports the version it actually activated; npm/gh-release resolve their own artifact, so the requested target stands in
     let result: Result<Option<String>> = match installer {
@@ -994,6 +997,17 @@ pub async fn run_install_script(
 
 fn is_lhc_installer(installer: &str) -> bool {
     installer == INSTALLER_LHC_MANAGED || installer == INSTALLER_LHC_UNMANAGED
+}
+
+/// The version this running process compares against a release: the embedded fork
+/// release for the fork kinds (never the native upstream base, which every fork
+/// revision shares), upstream's compiled-in version otherwise.
+fn running_version_for(installer: &str) -> String {
+    if is_lhc_installer(installer) {
+        crate::lhc_release::LHC_RELEASE_VERSION.to_string()
+    } else {
+        get_installed_grok_version()
+    }
 }
 
 /// Background/automatic updates for the fork are opt-in: a managed LHC store runs them
@@ -2722,7 +2736,7 @@ pub async fn run_update(
 
     heal_managed_install(installer).await;
 
-    let current_version = get_installed_grok_version();
+    let current_version = running_version_for(installer);
     let policy = config::VersionPolicy::resolve();
 
     // When --version is given, skip the latest-version check and install directly
