@@ -76,13 +76,17 @@ hand-maintained (dropped five touchpoints after Chunk 2; dropped the root
 - Root `README.md` — only the fork banner differs; re-asserted by hand at
   every sync (FORK.md "Sync drill" step 3), not patched.
 
-**Known fork delta outside the scope, deliberately not covered (slice 2
-finding, 2026-09-08):** `crates/build/xai-proto-build/src/lib.rs` (+132/-35
-vs BASE) — Windows-safe protoc dependency handling from the 2026-08 sync
-line (`a4650096`, `18277e97`, `33385ce5`). It carries no `LHC-HOOK` marker
-and is not an LHC touchpoint; the recovery drill would not restore it.
-Left as-is for a later slice to decide (upstream it, or widen scope
-deliberately); do not add it to the pathspecs silently.
+**Fork-owned build code outside the patch scope (slice 2 finding, ruled in
+slice 5, 2026-09-08):** `crates/build/xai-proto-build/src/lib.rs` (+132/-35
+vs BASE) — Windows-safe protoc dependency handling from the 2026-08 sync line
+(`a4650096`, `18277e97`, `33385ce5`). It is fork-owned build code that the
+Windows release build depends on; it carries no `LHC-HOOK` marker, is not an
+LHC touchpoint, and stays outside the pathspecs (no patch-tooling widening).
+It survives ordinary upstream syncs as normal `lhc`-branch history. In a
+history-reset recovery it is **not** restored by the patch: re-apply it from
+the `lhc` branch (`git checkout <old lhc> -- crates/build/xai-proto-build/`)
+and confirm with a Windows candidate build. Listed here so the omission is
+deliberate, not forgotten.
 
 ## Upstream files added by slice 1A (2026-09-08)
 

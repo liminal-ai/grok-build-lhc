@@ -567,9 +567,21 @@ Chunk 1 means the first real upstream sync already has a proven fallback.)
 - Candidate: [`.github/workflows/release.yml`](.github/workflows/release.yml)
 - Linux smoke: [`.github/workflows/release-smoke.yml`](.github/workflows/release-smoke.yml)
 - Protected promotion: [`.github/workflows/release-promote.yml`](.github/workflows/release-promote.yml)
-- **Pipeline:** validate `CANDIDATE_HANDOFF` → build one immutable Linux
-  x86-64 candidate → generate manifest/checksums → Daytona install/default
-  capture/uninstall proof → Lee/CTO approval → publish those exact bytes.
+- **Pipeline (slice 5, 2026-09-08):** validate `CANDIDATE_HANDOFF` → build
+  the immutable candidate on three native runners (Linux x86-64 on Blacksmith
+  Ubuntu, darwin-aarch64 on `blacksmith-12vcpu-macos-15`, windows-x86_64 on
+  GitHub-hosted `windows-latest`), every platform required, each verifying its
+  own bytes (architecture, `--version`, `--lhc-version`, `--help`; macOS also
+  runs `install.sh --asset-dir` with the built asset; Windows runs
+  `test_install.ps1` and `candidate_check.ps1` — isolated installer lifecycle
+  with the real executable, launcher argument/exit forwarding, native
+  `grok update` against local release assets, uninstall with data preserved,
+  stock paths untouched) → assemble three executables + `install.sh` +
+  `install.ps1` → manifest/checksums (seven files) → Daytona Linux
+  install/default capture/uninstall proof → `production` environment →
+  publish those exact bytes. Windows protoc: `choco install protoc` (the
+  platform-readiness route, proven 2026-09-01), `PROTOC` unset. No
+  `continue-on-error`; the candidate job needs all three builds.
 - Candidate handoff fields: product/version, exact source SHA, xAI monorepo
   `SOURCE_REV`, public-git/recovery `patches/BASE`, certified LHC SDK pin,
   thread schema, clean fork/vendor, successful fork tripwire evidence,
@@ -594,14 +606,30 @@ Chunk 1 means the first real upstream sync already has a proven fallback.)
   `fork_revision`).
 - Assets: `grok-<release>-<os>-<arch>` with os `linux|darwin|windows`, arch
   `x86_64|aarch64` (C3 convention); one `SHA256SUMS` and one
-  `release-manifest.json` list every published asset, plus the installer.
-  Currently published: `linux-x86_64` only (three-platform lane is slice 5).
+  `release-manifest.json` list every published asset plus both installers.
+  Published set from 1.0.16: `linux-x86_64`, `darwin-aarch64`,
+  `windows-x86_64.exe`, `install.sh`, `install.ps1`, `release-manifest.json`,
+  `SHA256SUMS`; promotion asserts exactly that set.
 - `release-manifest.json`'s `lhc_thread_schema` is **derived** by
   `make_manifest.py` from the vendored SDK's `CURRENT_THREAD_SCHEMA_VERSION`
   (never hand-maintained; it was a literal `6` until v0.3.0). The Daytona
   lifecycle check and the promotion notes read it from the manifest.
-- Windows x86-64 and Apple Silicon macOS remain maintained source-compatibility
-  targets under `platform-readiness.yml`; they are not current prebuilt assets.
+- `platform-readiness.yml` (monthly `cargo check` on Windows and macOS) stays
+  as the between-releases early warning; the release lane does not dispatch it.
+- Windows layout (`install.ps1`): store `%LOCALAPPDATA%\grok-lhc`,
+  `versions\<release>\bin\grok.exe`, `current` is a **directory junction**
+  (no symlink privilege), launcher `<prefix>\bin\<name>.cmd` runs
+  `current\bin\grok.exe %*` and `exit /b %ERRORLEVEL%` (T3 and the updater read
+  the status); no PATH edit. `managed_install_for_exe` canonicalizes through
+  the junction, so the same detection serves all platforms. The Rust update
+  path picks `install.ps1` on Windows and runs
+  `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <staged>
+  -Download -Version <release> -InstallRoot <store>` (`installer_invocation`).
+  Reinstalling the running release fails on the locked image; a different
+  release installs beside it.
+- Executables are not code-signed or notarized (no signing program); the
+  installers download directly, so Gatekeeper/SmartScreen apply only to
+  browser downloads. Not built: Intel macOS, Windows ARM64.
 - Candidate, smoke, and promotion are manual. Pushing a source tag does not
   build or publish a release. Promotion refuses an existing tag/release.
 - Smoke needs secret `DAYTONA_API_KEY`; promotion uses the protected
@@ -626,8 +654,7 @@ Chunk 1 means the first real upstream sync already has a proven fallback.)
   `LHC_RELEASE_VERSION`, on disk = the store's `installed-version`.
   Unmanaged (source build, copied file): `grok update` prints installer
   guidance and does nothing; no stock npm/CDN/`~/.grok/bin` fallthrough.
-  Windows: managed detection works but the update path returns guidance until
-  the PowerShell installer exists (C2, slice 5). Stock's updater code is
+  Windows: same path through `install.ps1` since slice 5. Stock's updater code is
   retained untouched and unreachable from the fork binary; the fork never
   writes `[cli].installer`, `auto_update`, `~/.grok/version.json`,
   `~/.grok/bin`, or `~/.grok/downloads`. No environment variable
@@ -635,15 +662,21 @@ Chunk 1 means the first real upstream sync already has a proven fallback.)
   upstream's stock classification is compiled in only under the crate's
   `lhc-test-seams` feature (enabled by its own dev-dependency) so the retained
   upstream updater tests keep running through it.
-- **0.3.1 transition (documented, not automatic):** the installed 0.3.1 store
+- **0.3.1 transition (documented, not automatic; live rollout is a separate
+  step with Lee, not part of slice 5 source work):** the installed 0.3.1 store
   has `installed-name = grok` and no `installed-prefix`; its updater cannot see
-  aligned releases. Transition = one installer rerun against the existing store
-  with the actual prefix, which keeps the name and link and records the prefix:
+  aligned releases, and running `grok update` on the 0.3.1 binary would
+  install into `~/.grok/bin` rather than the store — do not run it. Transition
+  = one installer rerun against the existing store with the actual prefix,
+  which keeps the name and link and records the prefix:
   `sh install.sh --download --install-root ~/.local/share/grok-lhc --prefix ~/.local`.
   The shared `~/.grok/config.toml` still says `installer = "gh-release"` from
-  slice 4; correcting it for stock is a deliberate, documented step in a later
-  rollout, never written by LHC code. `~/.grok/bin/grok-stock` is a copied
-  file, not a stock-managed install.
+  slice 4 (original value `internal`, recorded in heron
+  `slice4/config.toml.before`); correcting it for stock is a deliberate,
+  documented step in that rollout, never written by LHC code.
+  `~/.grok/bin/grok-stock` is a copied file, not a stock-managed install.
+  t3code instance paths (stock `binaryPath` explicit, LHC instance on the
+  store command) are set in the same rollout.
 - **Local install on Lee's box (2026-09-04, v0.3.0 candidate bytes):**
   `~/.local/bin/grok` → `~/.local/share/grok-lhc/current/bin/grok` (the
   release installer's managed store), and `~/.local/bin/grok-lhc` is a
@@ -659,6 +692,7 @@ Chunk 1 means the first real upstream sync already has a proven fallback.)
 | v0.2.1 | `c30cadb8` | `dd251ec` / 6 | 31627906621 | 31628937277 | published 2026-08-12 |
 | v0.3.0 | `8227f87c` | `e9456a6e` / 13 | 33859291549 | 33860222861 | published 2026-09-04 (promotion run 33865457927) |
 | v0.3.1 | `66459b44` | `e9456a6e` / 13 | 33866966760 | 33867865171 | **not promoted** — Lee's call (L5 serving fix; handoff: heron `slice5b/CANDIDATE_HANDOFF.md`) |
+| v1.0.16 | _slice 5 head on `lhc`_ | `e9456a6e` / 13 | _pending_ | _pending_ | first three-platform release; run ids, durations and runner labels recorded by Alder at execution |
 
 ## Known limitations (live cert 2026-09-04, follow-ups — not blockers)
 

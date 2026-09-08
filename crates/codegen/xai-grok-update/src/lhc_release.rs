@@ -31,9 +31,12 @@ pub const LHC_RELEASE_DOWNLOAD_BASE: &str =
     "https://github.com/liminal-ai/grok-build-lhc/releases/download";
 /// Human-facing release page.
 pub const LHC_RELEASES_URL: &str = "https://github.com/liminal-ai/grok-build-lhc/releases/latest";
-/// Always-latest installer asset.
+/// Always-latest shell installer asset (Linux, macOS).
 pub const LHC_INSTALLER_URL: &str =
     "https://github.com/liminal-ai/grok-build-lhc/releases/latest/download/install.sh";
+/// Always-latest PowerShell installer asset (Windows).
+pub const LHC_INSTALLER_URL_WINDOWS: &str =
+    "https://github.com/liminal-ai/grok-build-lhc/releases/latest/download/install.ps1";
 /// Install documentation.
 pub const LHC_INSTALL_DOCS_URL: &str =
     "https://github.com/liminal-ai/grok-build-lhc/blob/lhc/lhc-docs/INSTALL.md";
@@ -49,9 +52,13 @@ pub const INSTALLER_LHC_MANAGED: &str = "lhc-managed";
 /// Installer kind for an LHC build that is not running from a managed store.
 pub const INSTALLER_LHC_UNMANAGED: &str = "lhc-unmanaged";
 
-/// Name of the installer asset every fork release publishes next to its binaries,
-/// listed in that release's `SHA256SUMS`.
-pub const INSTALLER_ASSET: &str = "install.sh";
+/// Name of this platform's installer asset, published next to every fork
+/// release's binaries and listed in that release's `SHA256SUMS`.
+pub const INSTALLER_ASSET: &str = if cfg!(windows) {
+    "install.ps1"
+} else {
+    "install.sh"
+};
 
 /// Parse `<major>.<minor>.<patch>[-lhc.<revision>]`; a bare base is revision 0.
 /// Anything else (stock pre-releases, garbage) is `None`.
@@ -235,16 +242,57 @@ pub fn managed_installer_guidance() -> String {
     format!(
         "This grok-build-lhc build is not running from a managed store, so it does not update itself.\n\
          Install or reinstall with the fork installer (never the official x.ai install script):\n  \
-         curl -fsSL {LHC_INSTALLER_URL} -o install.sh && sh install.sh --download\n\
-         See {LHC_INSTALL_DOCS_URL}"
+         {}\n\
+         See {LHC_INSTALL_DOCS_URL}",
+        manual_installer_command()
     )
 }
 
-/// Windows managed updates wait for the PowerShell installer (release slice).
-pub fn windows_update_guidance() -> String {
-    format!(
-        "Windows managed update arrives with the next release; reinstall from the release page:\n  {LHC_RELEASES_URL}"
-    )
+/// This platform's one-line bootstrap of the fork installer.
+pub fn manual_installer_command() -> String {
+    if cfg!(windows) {
+        format!(
+            "irm {LHC_INSTALLER_URL_WINDOWS} -OutFile install.ps1; powershell -ExecutionPolicy Bypass -File install.ps1 -Download"
+        )
+    } else {
+        format!("curl -fsSL {LHC_INSTALLER_URL} -o install.sh && sh install.sh --download")
+    }
+}
+
+/// How this platform runs a staged copy of the release installer against `store`
+/// in download mode: `(program, arguments)`. Unix: `sh <script> --download ...`;
+/// Windows: Windows PowerShell with the script's native parameters.
+pub fn installer_invocation(
+    windows: bool,
+    script: &Path,
+    release: &str,
+    store: &Path,
+) -> (String, Vec<std::ffi::OsString>) {
+    if windows {
+        let mut args: Vec<std::ffi::OsString> = [
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        args.push(script.as_os_str().to_os_string());
+        args.extend(["-Download", "-Version"].map(std::ffi::OsString::from));
+        args.push(release.into());
+        args.push("-InstallRoot".into());
+        args.push(store.as_os_str().to_os_string());
+        ("powershell".to_string(), args)
+    } else {
+        let mut args = vec![script.as_os_str().to_os_string()];
+        args.extend(["--download", "--version"].map(std::ffi::OsString::from));
+        args.push(release.into());
+        args.push("--install-root".into());
+        args.push(store.as_os_str().to_os_string());
+        ("sh".to_string(), args)
+    }
 }
 
 fn release_download_base(release: &str) -> String {
@@ -293,14 +341,12 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// Install `release` into `managed`'s store with **that release's own installer**:
-/// `install.sh` and `SHA256SUMS` are fetched from the release, the installer is
-/// verified against the sums (the same file it will verify the binary with), and it
-/// runs in download mode against the store. Name and prefix come from the store's
-/// receipts. The Codex shape: installer behavior ships with the release it installs.
+/// this platform's installer (`install.sh`, or `install.ps1` on Windows) and
+/// `SHA256SUMS` are fetched from the release, the installer is verified against the
+/// sums (the same file it will verify the binary with), and it runs in download mode
+/// against the store. Name and prefix come from the store's receipts. The Codex
+/// shape: installer behavior ships with the release it installs.
 pub async fn run_managed_installer(managed: &LhcManagedInstall, release: &str) -> Result<()> {
-    if cfg!(windows) {
-        anyhow::bail!("{}", windows_update_guidance());
-    }
     parse_lhc_release(release).with_context(|| format!("not a fork release: {release}"))?;
     let base = release_download_base(release);
     let client = release_client()?;
@@ -317,29 +363,26 @@ pub async fn run_managed_installer(managed: &LhcManagedInstall, release: &str) -
         );
     }
     let script = std::env::temp_dir().join(format!(
-        "grok-lhc-install-{}-{}.sh",
+        "grok-lhc-install-{}-{}.{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
-            .unwrap_or(0)
+            .unwrap_or(0),
+        if cfg!(windows) { "ps1" } else { "sh" }
     ));
     tokio::fs::write(&script, &installer)
         .await
         .with_context(|| format!("cannot stage installer at {}", script.display()))?;
-    let mut cmd = tokio::process::Command::new("sh");
-    cmd.arg(&script)
-        .arg("--download")
-        .arg("--version")
-        .arg(release)
-        .arg("--install-root")
-        .arg(&managed.store)
+    let (program, args) = installer_invocation(cfg!(windows), &script, release, &managed.store);
+    let mut cmd = tokio::process::Command::new(&program);
+    cmd.args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let output = cmd.output().await;
     let _ = tokio::fs::remove_file(&script).await;
-    let output = output.context("cannot run the fork installer with sh")?;
+    let output = output.with_context(|| format!("cannot run the fork installer with {program}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
@@ -664,10 +707,52 @@ mod tests {
 
     #[test]
     fn guidance_never_points_at_official_install() {
-        for text in [managed_installer_guidance(), windows_update_guidance()] {
+        for text in [managed_installer_guidance(), manual_installer_command()] {
             assert!(text.contains("liminal-ai/grok-build-lhc"), "{text}");
+            assert!(text.contains(INSTALLER_ASSET), "{text}");
             assert!(!text.contains("x.ai/cli/install"), "{text}");
             assert!(!text.contains("gh release"), "{text}");
         }
+    }
+
+    /// Both platforms run the staged installer in download mode against the store with
+    /// that installer's native arguments; only the interpreter and flag spelling differ.
+    #[test]
+    fn installer_invocation_per_platform() {
+        let script = Path::new("/tmp/grok-lhc-install-1-2.sh");
+        let store = Path::new("/home/u/.local/share/grok-lhc");
+        let (program, args) = installer_invocation(false, script, "1.0.16-lhc.1", store);
+        assert_eq!(program, "sh");
+        assert_eq!(
+            args,
+            [
+                script.as_os_str(),
+                "--download".as_ref(),
+                "--version".as_ref(),
+                "1.0.16-lhc.1".as_ref(),
+                "--install-root".as_ref(),
+                store.as_os_str(),
+            ]
+        );
+        let script = Path::new("C:\\Temp\\grok-lhc-install-1-2.ps1");
+        let store = Path::new("C:\\Users\\u\\AppData\\Local\\grok-lhc");
+        let (program, args) = installer_invocation(true, script, "1.0.16-lhc.1", store);
+        assert_eq!(program, "powershell");
+        assert_eq!(
+            args,
+            [
+                "-NoProfile".as_ref(),
+                "-NonInteractive".as_ref(),
+                "-ExecutionPolicy".as_ref(),
+                "Bypass".as_ref(),
+                "-File".as_ref(),
+                script.as_os_str(),
+                "-Download".as_ref(),
+                "-Version".as_ref(),
+                "1.0.16-lhc.1".as_ref(),
+                "-InstallRoot".as_ref(),
+                store.as_os_str(),
+            ]
+        );
     }
 }

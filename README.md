@@ -17,7 +17,12 @@
 > - [**LHC project**](https://github.com/liminal-ai/long-horizon-context) — the shared engine
 >
 > Releases: [GitHub Releases](https://github.com/liminal-ai/grok-build-lhc/releases)
-> (tag `v*`). Official `curl \| x.ai/cli` installers do **not** include LHC.
+> (tag `v*`): prebuilt Linux x86-64, macOS Apple Silicon, and Windows x86-64
+> executables with `install.sh` (Linux/macOS) and `install.ps1` (Windows), which
+> install a separate `grok-lhc` command beside any stock `grok`. Built from the
+> public upstream source (the version `grok --version` reports), not from xAI's
+> separately published binaries; not code-signed. Official `curl \| x.ai/cli`
+> installers do **not** include LHC and must not be run over a fork install.
 >
 > Everything below is upstream's README.
 

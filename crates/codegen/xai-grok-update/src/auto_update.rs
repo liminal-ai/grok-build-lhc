@@ -44,7 +44,7 @@ fn is_stable_channel(channel: &str) -> bool {
 fn manual_install_cmd(channel: &str) -> String {
     let _channel = channel; // fork install path does not use x.ai channel env
     if cfg!(windows) {
-        "gh release download --repo liminal-ai/grok-build-lhc --pattern 'grok-*' -D . && move grok-*.exe grok.exe".to_string()
+        crate::lhc_release::manual_installer_command()
     } else {
         "gh release download --repo liminal-ai/grok-build-lhc --pattern 'grok-*' --output grok && chmod +x grok".to_string()
     }

@@ -1,7 +1,7 @@
 # Install & use
 
-Build and run **this fork** from source: Grok Build with long-horizon context
-(LHC). Official `grok` installers and prebuilt binaries do **not** include it.
+Install or build **this fork**: Grok Build with long-horizon context (LHC).
+Official `grok` installers and xAI's prebuilt binaries do **not** include it.
 
 For *what* the fork is, see [`README.md`](README.md). For maintainer drills,
 see [`../FORK.md`](../FORK.md).
@@ -46,9 +46,16 @@ prints the upstream base (for example `grok 1.0.16`), `grok --lhc-version`
 prints the fork release (`1.0.16` for fork revision 0, `1.0.16-lhc.2` for a
 repair of the same base).
 
-The one installer owns download, checksums, the managed store, receipts, and
-activation. It never touches `~/.grok`, so a stock `grok` can stay installed
-side by side:
+The release is built from the public upstream **source** at that base, not
+from xAI's separately published binaries, so `grok --version` names the
+source it was built from while the fork release identifies the artifact.
+
+One installer per platform owns download, checksums, the managed store,
+receipts, and activation. Neither touches `~/.grok` (`%USERPROFILE%\.grok`),
+so a stock `grok` can stay installed side by side: stock keeps its own command
+and updater, the fork gets its own command (default **`grok-lhc`**).
+
+Linux and macOS:
 
 ```bash
 curl -fsSL https://github.com/liminal-ai/grok-build-lhc/releases/latest/download/install.sh -o install.sh
@@ -56,51 +63,87 @@ sh install.sh --download                 # latest release, host platform
 # sh install.sh --download --version 1.0.16-lhc.2
 ```
 
-Defaults: command **`grok-lhc`** at `~/.local/bin/grok-lhc`, managed store
-`~/.local/share/grok-lhc` (`versions/<release>/bin/grok`, `current`, receipts
-`installed-name`, `installed-version`, `installed-prefix`). Choose otherwise
-explicitly: `--name grok-memory`, `--prefix /opt/grok-lhc`,
-`--install-root DIR`. Re-running the installer against an existing store keeps
-its recorded name and prefix. `--uninstall` removes the command and the store
-and preserves configuration and LHC archives. A downloaded candidate directory
-works offline with `--asset-dir DIR` (release lane).
+Windows (PowerShell):
 
-| Platform | Asset | Status |
-|---|---|---|
-| Linux x86_64 | `grok-<release>-linux-x86_64` | published |
-| macOS Apple Silicon | `grok-<release>-darwin-aarch64` | installer selects it; first prebuilt asset is the release slice |
-| Windows x86_64 | `grok-<release>-windows-x86_64.exe` | same store contract; PowerShell installer and managed update arrive with the release slice |
+```powershell
+irm https://github.com/liminal-ai/grok-build-lhc/releases/latest/download/install.ps1 -OutFile install.ps1
+powershell -ExecutionPolicy Bypass -File install.ps1 -Download
+# powershell -ExecutionPolicy Bypass -File install.ps1 -Download -Version 1.0.16-lhc.2
+```
+
+Defaults on Linux/macOS: command `~/.local/bin/grok-lhc`, managed store
+`~/.local/share/grok-lhc` (`versions/<release>/bin/grok`, `current` symlink,
+receipts `installed-name`, `installed-version`, `installed-prefix`). On
+Windows: launcher `%LOCALAPPDATA%\grok-lhc\bin\grok-lhc.cmd` (forwards all
+arguments and the exit status), store `%LOCALAPPDATA%\grok-lhc`
+(`versions\<release>\bin\grok.exe`, `current` directory junction, the same
+receipts). The Windows installer does not edit `PATH`; add
+`%LOCALAPPDATA%\grok-lhc\bin` yourself or call the launcher by path. Choose
+otherwise explicitly: `--name grok-memory`, `--prefix /opt/grok-lhc`,
+`--install-root DIR` (`-Name`, `-Prefix`, `-InstallRoot` on Windows).
+Re-running the installer against an existing store keeps its recorded name and
+prefix. `--uninstall` / `-Uninstall` removes the command and the store and
+preserves configuration and LHC archives. A downloaded candidate directory
+works offline with `--asset-dir DIR` / `-AssetDir DIR` (release lane).
+
+| Platform | Asset | Installer | Qualification of the published bytes |
+|---|---|---|---|
+| Linux x86_64 | `grok-<release>-linux-x86_64` | `install.sh` | Daytona sandbox: install, identity, default-on LHC persistence with a mock model, uninstall, data preservation |
+| macOS Apple Silicon | `grok-<release>-darwin-aarch64` | `install.sh` | build runner: architecture, identity, shell installer lifecycle with the built asset |
+| Windows x86_64 | `grok-<release>-windows-x86_64.exe` | `install.ps1` | build runner: architecture, identity, isolated installer lifecycle, native `grok update` against local release assets |
+
+Hosted checks are the release gate. Interactive use on the maintainers'
+own machines happens after publication (burn-in), not before. Executables are
+not code-signed or notarized: a browser-downloaded binary may be blocked by
+macOS Gatekeeper (`xattr -d com.apple.quarantine <file>`) or warned about by
+Windows SmartScreen; the installers download directly and are not affected.
+Intel macOS and Windows ARM64 are not built. Reinstalling the release that is
+currently running on Windows fails because the executable is locked: close
+`grok` first (a different release installs beside it).
 
 This is the **liminal-ai LHC fork**, not official xAI. Do **not** update with
-`curl … https://x.ai/cli/install.sh` — that replaces the fork with stock Grok.
+`curl … https://x.ai/cli/install.sh` or `irm … x.ai/cli/install.ps1` — that
+replaces the fork with stock Grok.
 
 ### Updating
 
 A managed install updates itself from this repo's GitHub Releases (no `gh`
 needed): `grok update` (explicit, always available) or `grok update --check`.
 Background/automatic updates are **opt-in**: set `[cli] auto_update = true`
-in `~/.grok/config.toml`; unset or `false` means off. The updater reads and
-writes only its own store (`<store>/version.json` cache, receipts, versions)
-and relaunches `<store>/current/bin/grok`. It never writes the shared
-`[cli].installer` key, `~/.grok/bin`, `~/.grok/downloads`, or
+in `~/.grok/config.toml`; unset or `false` means off. The updater fetches the
+selected release's own installer (`install.sh`, or `install.ps1` on Windows)
+and `SHA256SUMS`, verifies the installer against them, and runs it against its
+own store; it reads and writes only that store (`<store>/version.json` cache,
+receipts, versions) and relaunches `<store>/current/bin/grok`. It never writes
+the shared `[cli].installer` key, `~/.grok/bin`, `~/.grok/downloads`, or
 `~/.grok/version.json`, so a stock install's own updater is unaffected. A
 build that is not running from a managed store (source build, copied file)
-prints these install instructions instead.
+prints these install instructions instead. In T3 Code, the Update button of a
+Grok instance runs that instance's configured binary's `grok update`, so a
+stock instance and an LHC instance each update their own install.
 
 **Existing 0.3.1 installs** (`installed-name = grok`, no prefix receipt)
-cannot update themselves to an aligned release. Run the installer once
-against the existing store with its real prefix; the command name and links
-are kept and the prefix is recorded:
+cannot update themselves to an aligned release, and running `grok update` on
+the 0.3.1 binary would install into `~/.grok/bin` instead of the store. Do not
+run its updater; run the new installer once against the existing store with
+its real prefix. The command name and links are kept and the prefix is
+recorded:
 
 ```bash
 sh install.sh --download --install-root ~/.local/share/grok-lhc --prefix ~/.local
 ```
 
+If a stock Grok shares that machine, its `~/.grok/config.toml` `[cli]
+installer` key may still say `gh-release` from an earlier fork build. The fork
+never writes that key; restore the value stock recorded (`internal` for an
+official-installer install) by hand when stock should update itself again.
+
 Maintainers cut releases through three manual stages: **Grok LHC candidate**
-builds one immutable Linux bundle, **Grok LHC Linux smoke** qualifies those
-exact bytes in Daytona, and **Promote Grok LHC release** republishes them
-without rebuilding after protected Lee/CTO approval. A source tag alone does
-not publish anything.
+builds one immutable three-platform bundle with every platform verified on its
+own runner, **Grok LHC Linux smoke** qualifies the exact Linux bytes in
+Daytona, and **Promote Grok LHC release** republishes the same files without
+rebuilding through the `production` environment. A source tag alone does not
+publish anything.
 
 ## 4. Build from source
 
@@ -185,7 +228,17 @@ after a sync or local edit.
 - **Never run `grok upgrade` / self-update on this checkout.** It is a
   git-tracked source tree; self-update can clobber the fork.
 - **Upstream binaries ≠ this fork.** Official installers install xAI’s
-  build, not liminal-ai’s LHC integration.
+  build, not liminal-ai’s LHC integration. `grok --version` reports the
+  upstream *source* base this fork was built from; the same number on an
+  xAI-published binary is a different build.
+- **Long-session behavior (1.0.16):** LHC's own compacted history is no longer
+  re-captured into the transcript after a compact, and long tool-driven turns
+  are segmented LHC-side (about every 18k tokens of an open turn, at a
+  complete tool exchange) so compaction can cut inside a running task.
+  Limits: a segment holding only tool traffic compresses to an empty
+  detailed-band entry; a cancel right after a segment end lands on an empty
+  open turn; older huge turns are not split retrospectively. Details and the
+  live evidence are in `../FORK.md` (Known limitations).
 - **Derivation** uses a dedicated inference path (default model
   `grok-4.5`, low reasoning). Session chat model and derivation model are
   not the same thing by design.

@@ -8,7 +8,8 @@ lhc-release/VERSION, and against the built binary in the workflow; there is no
 separate validator script.
 
 Assets follow `grok-<release>-<os>-<arch>` (os linux|darwin|windows, arch
-x86_64|aarch64); every such asset present in --dist is published and listed.
+x86_64|aarch64); every such asset present in --dist is published and listed,
+plus both installers (install.sh for Linux/macOS, install.ps1 for Windows).
 """
 import argparse
 import hashlib
@@ -65,14 +66,18 @@ assets = []
 for platform in PLATFORMS:
     asset = args.dist / f"grok-{args.version}-{platform}"
     if platform.startswith("windows"):
-        asset = asset.with_suffix(".exe") if asset.with_suffix(".exe").is_file() else asset
+        # `.exe` must be appended, never substituted for the dotted version.
+        asset = asset.with_name(asset.name + ".exe")
     if asset.is_file():
         assets.append((asset, platform))
 if not assets:
     raise SystemExit(f"no release assets grok-{args.version}-<os>-<arch> in {args.dist}")
-installer = args.dist / "install.sh"
-if not installer.is_file():
-    raise SystemExit(f"missing candidate installer: {installer}")
+installers = []
+for name in ("install.sh", "install.ps1"):
+    installer = args.dist / name
+    if not installer.is_file():
+        raise SystemExit(f"missing candidate installer: {installer}")
+    installers.append(installer)
 
 
 def entry(path, platform=None):
@@ -82,7 +87,7 @@ def entry(path, platform=None):
     return item
 
 
-artifacts = [entry(path, platform) for path, platform in assets] + [entry(installer)]
+artifacts = [entry(path, platform) for path, platform in assets] + [entry(path) for path in installers]
 manifest = {
     "product": "grok-lhc",
     "release_version": args.version,

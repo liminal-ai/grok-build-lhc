@@ -80,10 +80,19 @@ jobs:
           assert manifest["upstream_version"] == os.environ["VERSION"].split("-lhc.")[0]
           assert manifest["candidate_run_id"] == os.environ["CANDIDATE_RUN_ID"]
           assert manifest["source_commit"] == os.environ["SOURCE_SHA"]
-          assert manifest["published_platforms"] == ["linux-x86_64"]
-          assert [item["platform"] for item in manifest["artifacts"] if "platform" in item] == ["linux-x86_64"]
+          platforms = ["linux-x86_64", "darwin-aarch64", "windows-x86_64"]
+          assert manifest["published_platforms"] == platforms
+          assert [item["platform"] for item in manifest["artifacts"] if "platform" in item] == platforms
+          # Exactly the seven published files: three executables, both installers, manifest, checksums.
           assert {item["path"] for item in manifest["artifacts"]} == {
-              f"grok-{os.environ['VERSION']}-linux-x86_64", "install.sh"
+              f"grok-{os.environ['VERSION']}-linux-x86_64",
+              f"grok-{os.environ['VERSION']}-darwin-aarch64",
+              f"grok-{os.environ['VERSION']}-windows-x86_64.exe",
+              "install.sh",
+              "install.ps1",
+          }
+          assert {p.name for p in Path("candidate").iterdir()} == {item["path"] for item in manifest["artifacts"]} | {
+              "release-manifest.json", "SHA256SUMS"
           }
           evidence = json.loads(Path("qualification/qualification.json").read_text())
           assert evidence == {
@@ -121,16 +130,34 @@ jobs:
           cat > RELEASE_NOTES.md <<EOF
           ## Grok-LHC v${VERSION}
 
-          Fork release ${VERSION} of upstream Grok ${upstream} (\`grok --version\`
-          reports the upstream base; \`grok --lhc-version\` reports ${VERSION}).
-          Install or update with the bundled \`install.sh\` (\`--download\`), which
-          keeps a managed store separate from any stock Grok install.
+          Fork release ${VERSION} of upstream Grok source ${upstream}
+          (\`grok --version\` reports the upstream base; \`grok --lhc-version\`
+          reports ${VERSION}). Built from the public grok-build source tree at
+          that base, not from xAI's separately published binaries. Install or
+          update with the bundled installers, which keep a managed store and a
+          separate command (default \`grok-lhc\`) beside any stock Grok install:
+          \`install.sh --download\` on Linux/macOS, \`install.ps1 -Download\` on
+          Windows. A managed install updates itself with \`grok update\`
+          (background updates only with \`[cli] auto_update = true\`).
 
-          This release publishes one prebuilt Linux x86-64 binary. The exact
-          candidate bytes passed Daytona install, identity, default-on LHC
+          Prebuilt executables: Linux x86-64, macOS Apple Silicon (darwin-aarch64),
+          Windows x86-64. Qualification of these exact bytes: the Linux binary
+          passed the Daytona install, identity, default-on LHC
           prompt/assistant/turn persistence, uninstall, and data-preservation
-          checks. Windows x86-64 and macOS Apple Silicon remain maintained
-          source-compatibility targets but are not prebuilt in this release lane.
+          smoke; the macOS binary passed architecture/identity checks and the
+          shell installer lifecycle on its build runner; the Windows binary
+          passed architecture/identity checks, the isolated installer lifecycle,
+          and a native \`grok update\` against local release assets on its build
+          runner. Interactive use on real machines is post-publication burn-in.
+          Binaries are not code-signed or notarized (macOS Gatekeeper and Windows
+          SmartScreen may warn on browser downloads; the installers use direct
+          downloads).
+
+          LHC changes since 0.3.1: compacted history is no longer re-captured
+          into the transcript after a compact (1A), and long tool-driven turns
+          are segmented LHC-side so compaction can cut inside a running task
+          (1B; a segment holding only tool traffic compresses to an empty
+          detailed-band entry, older huge turns are not split retrospectively).
 
           Candidate run: ${CANDIDATE_RUN_ID}
           Linux smoke run: ${SMOKE_RUN_ID}
@@ -148,7 +175,10 @@ jobs:
           body_path: RELEASE_NOTES.md
           files: |
             candidate/grok-*-linux-x86_64
+            candidate/grok-*-darwin-aarch64
+            candidate/grok-*-windows-x86_64.exe
             candidate/install.sh
+            candidate/install.ps1
             candidate/release-manifest.json
             candidate/SHA256SUMS
           fail_on_unmatched_files: true
