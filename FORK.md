@@ -607,9 +607,31 @@ Chunk 1 means the first real upstream sync already has a proven fallback.)
   into the open turn. The write-back body is bands + the whole open turn
   verbatim; native does not shrink until the turn closes, and the native
   trigger re-fires on every later model call in that turn (7 write-backs in
-  one 8-read turn at a 150k debug window; each re-records the turn's tool
-  calls). The turn still completes and the record stays one turn; the first
-  call after the turn closes compacts normally.
+  one 8-read turn at a 150k debug window). The turn still completes and the
+  record stays one turn; the first call after the turn closes compacts
+  normally. (The "each re-records the turn's tool calls" symptom seen on
+  2026-09-04 was the write-back recapture below, fixed in slice 1A.)
+- **LHC's own write-back was re-recorded as canonical input — FIXED in slice
+  1A (2026-09-08, commits `e8a6389c`, `32689991`).** Hook 5 installed the
+  generated body through `replace_history`, the tee mirrored it into capture,
+  and the re-map recorded the band, the translated tool rounds and an empty
+  `turn_end` as source; each later compact re-banded the previous band. Now
+  the write-back goes through `replace_history_for_lhc_writeback(items,
+  source_tip)` (native persistence unchanged), the checkpoint file carries
+  `lhc_source_tip`, and capture keeps the installed body's digests: every
+  whole-history re-map (bootstrap / `ReplaceHistory`) skips the body with an
+  exact ordered walk and keys the genuine remainder from the frozen
+  pre-compact baseline. Any shape mismatch warns `LHC writeback prefix walk
+  stopped early`, forgets the prefix and falls back to the previous full
+  re-map. Accepted limitations (steward ruling 2026-09-08): (a) a rewind into
+  the installed body followed by new items and a whole-history replace or
+  restart recaptures the surviving body prefix once, with that warning; (b) a
+  subagent with an unreleased inherited prefix across a restart, and an
+  image-strip/removal inside the body, take the same fallback; (c) a
+  frozen-baseline read failure leaves the slice unsubmitted (reported through
+  the replace error path) rather than keying it from a guessed baseline.
+  Pinned by certification `a1_*` / `c1_*` tests, the five write-back gates,
+  and the isolated live drill recorded in the campaign `HANDOFF-1A.md`.
 - **Served body carried the system prompt twice — FIXED in v0.3.1 (L5
   finding, 2026-09-04; Lee's ruling: bug).** Native `System` is captured as
   `runtime_note` and was served back as a `[runtime note]` synthetic user

@@ -60,6 +60,16 @@ hand-maintained (dropped five touchpoints after Chunk 2; dropped the root
 - `Cargo.lock` — regenerate with `cargo check` after applying.
 - `FORK.md`, `patches/`, `scripts/check-lhc-hooks.sh` — fork-owned, copied.
 
+## Upstream files added by slice 1A (2026-09-08)
+
+Three files outside the original hook set entered the patch and stay there
+until upstream carries the change: `crates/codegen/xai-grok-shell/src/
+extensions/notification.rs` (the `lhc_source_tip: Option<u64>` field on
+`CompactionCheckpointFile`, serde default) and two struct-literal test sites
+that must name it — `session/helpers/replay.rs` (test mod) and
+`session/storage/jsonl/copy_tests.rs`. On the next upstream sync expect
+conflicts only if upstream touches that struct or those literals.
+
 ## Verifying
 
 Rehearse the drill: worktree (or fresh clone) at raw `upstream/main`,
