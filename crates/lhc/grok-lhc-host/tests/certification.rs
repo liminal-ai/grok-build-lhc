@@ -2028,10 +2028,6 @@ fn b2_steer_keeps_pairing_and_genuine_end_releases_abandoned_calls() {
     wait_registry_gone(sid);
 }
 
-/// B3 — ordinary compact after segmentation: the compact point moves inside
-/// the still-running native task, the write-back body keeps complete pairs,
-/// 1A holds (no band recapture) across a second compact and a resume, and the
-/// resumed session still segments.
 /// Poll the turn projection directly (no worker command, so a deferred
 /// item-mapped close is not released by the observation itself).
 fn wait_turn_rows(
@@ -2049,12 +2045,11 @@ fn wait_turn_rows(
     turn_rows(root, sid)
 }
 
-/// B4 (review correction) — a stop-gate continuation (`GoalClassifierNudge`,
-/// a turn-starting synthetic input) lands the toolless Assistant's deferred
-/// close through the existing supersede rule and leaves its own
-/// `pre_synthetic` close deferred for the rest of the native task (a
-/// non-turn-starting reason would instead leave the Assistant's close
-/// deferred — same `Option`, same consequence). Segments of the continued
+/// B4 (review correction) — the real stop-gate continuation
+/// (`ConversationItem::stop_hook_feedback`, `StopHookFeedback`, pushed by
+/// `turn.rs` on `KeepWorking`) is a non-turn-starting synthetic input: it maps
+/// a runtime note and no close, so the toolless Assistant's item-mapped close
+/// stays deferred for the rest of the native task. Segments of the continued
 /// tool loop still close; the deferred close keeps its own landing rule and
 /// receives the shell facts at the genuine close (same key, no
 /// shell-authored third end); replace/bootstrap mint nothing.
@@ -2073,11 +2068,8 @@ fn b4_deferred_close_from_stop_gate_continuation_does_not_block_segments() {
     let c1 = call("c1");
     let r1 = ConversationItem::tool_result("c1", "small");
     let partial = ConversationItem::assistant("partial answer");
-    // Stop-gate continuation input.
-    let mut cont = ConversationItem::user_meta("continue the task");
-    if let ConversationItem::User(u) = &mut cont {
-        u.synthetic_reason = Some(SyntheticReason::GoalClassifierNudge);
-    }
+    // Stop-gate continuation input, exactly as the shell pushes it.
+    let cont = ConversationItem::stop_hook_feedback("keep working: parts remain");
     for item in [&c1, &r1, &partial, &cont] {
         handle.persist(item);
     }
@@ -2089,14 +2081,12 @@ fn b4_deferred_close_from_stop_gate_continuation_does_not_block_segments() {
     handle.persist(&c2);
     handle.persist(&r2);
     native.extend([c2, r2]);
-    // Rows: preamble, the Assistant's close landed by the continuation
-    // (supersede rule), the segment, the open continued task. The
-    // pre-synthetic close is still deferred at this point.
-    let rows = wait_turn_rows(root.path(), sid, 4);
+    // Rows: preamble, the segment, the open continued task. The Assistant's
+    // close is still deferred (the continuation mapped no close).
+    let rows = wait_turn_rows(root.path(), sid, 3);
     assert_eq!(
         rows,
         vec![
-            ("closed".into(), None, None),
             ("closed".into(), None, None),
             (
                 "closed".into(),
@@ -2120,8 +2110,8 @@ fn b4_deferred_close_from_stop_gate_continuation_does_not_block_segments() {
     let ends = turn_ends(&ev);
     assert_eq!(
         ends.len(),
-        3,
-        "Assistant close + one segment end + the deferred pre-synthetic close, no shell-authored end"
+        2,
+        "one segment end + the deferred Assistant close, no shell-authored end"
     );
     assert_eq!(segment_ends(&ev).len(), 1);
     let genuine = ends
@@ -2130,9 +2120,7 @@ fn b4_deferred_close_from_stop_gate_continuation_does_not_block_segments() {
         .expect("deferred close landed with facts");
     assert!(genuine.turn_end_payload().unwrap().started_at.is_some());
     assert!(
-        genuine
-            .idempotency_key()
-            .ends_with(":turn_end:pre_synthetic"),
+        genuine.idempotency_key().ends_with(":turn_end"),
         "the deferred item-mapped key, not shell-authored: {}",
         genuine.idempotency_key()
     );
@@ -2140,7 +2128,6 @@ fn b4_deferred_close_from_stop_gate_continuation_does_not_block_segments() {
     assert_eq!(
         turn_rows(root.path(), sid),
         vec![
-            ("closed".into(), None, None),
             ("closed".into(), None, None),
             (
                 "closed".into(),
@@ -2180,6 +2167,10 @@ fn b4_deferred_close_from_stop_gate_continuation_does_not_block_segments() {
     wait_registry_gone(sid);
 }
 
+/// B3 — ordinary compact after segmentation: the compact point moves inside
+/// the still-running native task, the write-back body keeps complete pairs,
+/// 1A holds (no band recapture) across a second compact and a resume, and the
+/// resumed session still segments.
 #[test]
 fn b3_compact_moves_inside_native_task_and_1a_holds_across_resume() {
     use grok_lhc_host::{
