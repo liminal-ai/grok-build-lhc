@@ -6247,7 +6247,7 @@ index c43ce4bc..c81fac32 100644
  #[tokio::test(flavor = "current_thread")]
  #[serial_test::serial(archive_build_fault)]
 diff --git a/crates/codegen/xai-grok-update/src/auto_update.rs b/crates/codegen/xai-grok-update/src/auto_update.rs
-index 7a391e7e..1dea39f5 100644
+index 7a391e7e..90cbedc5 100644
 --- a/crates/codegen/xai-grok-update/src/auto_update.rs
 +++ b/crates/codegen/xai-grok-update/src/auto_update.rs
 @@ -10,6 +10,7 @@ use futures::StreamExt;
@@ -6322,7 +6322,19 @@ index 7a391e7e..1dea39f5 100644
      }
  }
  
-@@ -245,7 +238,8 @@ pub async fn check_update_status(update_config: &UpdateConfig) -> UpdateStatus {
+@@ -223,7 +216,10 @@ pub fn print_update_status(status: &UpdateStatus, json: bool) -> anyhow::Result<
+ 
+ pub async fn check_update_status(update_config: &UpdateConfig) -> UpdateStatus {
+     let installer = get_installer().await.map(|value| value.to_string());
+-    let current_version = get_installed_grok_version();
++    let current_version = installer
++        .as_deref()
++        .map(running_version_for)
++        .unwrap_or_else(get_installed_grok_version);
+     let current_config = config::load_config().await;
+     let auto_update = current_config.cli.auto_update;
+     let channel = update_config.channel.clone();
+@@ -245,7 +241,8 @@ pub async fn check_update_status(update_config: &UpdateConfig) -> UpdateStatus {
          Ok(latest) => match plan_for(&config::VersionPolicy::resolve(), latest) {
              UpdatePlan::Install { target, .. } => {
                  let mut error = None;
@@ -6332,7 +6344,16 @@ index 7a391e7e..1dea39f5 100644
                      &current_version,
                      &target,
                      &channel,
-@@ -396,6 +390,9 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
+@@ -350,7 +347,7 @@ async fn fetch_update_plan(
+ /// Gates on the installer (via `installer_allows_downgrade`) so npm is never downgraded; the decision depends on the installer, never the caller.
+ pub async fn auto_update_target(update_config: &UpdateConfig) -> Option<(&'static str, String)> {
+     let installer = get_installer().await?;
+-    let current = get_installed_grok_version();
++    let current = running_version_for(installer);
+     let policy = config::VersionPolicy::resolve();
+     let UpdatePlan::Install { target, .. } = fetch_update_plan(installer, update_config, &policy)
+         .await
+@@ -396,6 +393,9 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
      let Some(installer) = get_installer().await else {
          return Ok(outcome);
      };
@@ -6342,17 +6363,21 @@ index 7a391e7e..1dea39f5 100644
      heal_managed_install(installer).await;
      let allow_downgrade = installer_allows_downgrade(installer);
      let policy = config::VersionPolicy::resolve();
-@@ -407,7 +404,8 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
+@@ -405,9 +405,10 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
+         return Ok(outcome);
+     };
  
-     let effective_current =
-         disk_version_for_installer(installer).unwrap_or_else(get_installed_grok_version);
+-    let effective_current =
+-        disk_version_for_installer(installer).unwrap_or_else(get_installed_grok_version);
 -    if needs_update(
++    let effective_current = disk_version_for_installer(installer)
++        .unwrap_or_else(|| running_version_for(installer));
 +    if needs_update_for(
 +        installer,
          &effective_current,
          &target,
          &update_config.channel,
-@@ -451,6 +449,8 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
+@@ -451,6 +452,8 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
  /// Unknown installers are treated like npm (no trustworthy disk version).
  fn disk_version_for_installer(installer: &str) -> Option<String> {
      match installer {
@@ -6361,7 +6386,7 @@ index 7a391e7e..1dea39f5 100644
          "internal" | "gh-release" => crate::version::installed_on_disk_version(),
          _ => None,
      }
-@@ -478,6 +478,12 @@ fn env_installer() -> Option<&'static str> {
+@@ -478,6 +481,12 @@ fn env_installer() -> Option<&'static str> {
  }
  
  pub async fn get_installer() -> Option<&'static str> {
@@ -6374,7 +6399,7 @@ index 7a391e7e..1dea39f5 100644
      if let Some(i) = env_installer() {
          return Some(i);
      }
-@@ -505,6 +511,21 @@ fn is_under_node_modules(exe: &std::path::Path) -> bool {
+@@ -505,6 +514,21 @@ fn is_under_node_modules(exe: &std::path::Path) -> bool {
      exe.components().any(|c| c.as_os_str() == "node_modules")
  }
  
@@ -6396,7 +6421,7 @@ index 7a391e7e..1dea39f5 100644
  fn needs_update(current: &str, target: &str, channel: &str, allow_downgrade: bool) -> Option<bool> {
      let current = semver::Version::parse(current).ok()?;
      let target = semver::Version::parse(target).ok()?;
-@@ -582,6 +603,9 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
+@@ -582,6 +606,9 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
      let Some(installer) = get_installer().await else {
          return BackgroundUpdateCheck::none();
      };
@@ -6406,7 +6431,16 @@ index 7a391e7e..1dea39f5 100644
  
      heal_managed_install(installer).await;
  
-@@ -604,7 +628,8 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
+@@ -594,7 +621,7 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
+         return BackgroundUpdateCheck::none();
+     }
+ 
+-    let current_version = get_installed_grok_version();
++    let current_version = running_version_for(installer);
+     let policy = config::VersionPolicy::resolve();
+     let target_version = match fetch_update_plan(installer, update_config, &policy).await {
+         Ok(UpdatePlan::Install { target, .. }) => target,
+@@ -604,7 +631,8 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
      };
  
      let allow_downgrade = installer_allows_downgrade(installer);
@@ -6416,7 +6450,7 @@ index 7a391e7e..1dea39f5 100644
          &current_version,
          &target_version,
          &update_config.channel,
-@@ -671,6 +696,10 @@ pub async fn run_update_if_available(
+@@ -671,6 +699,10 @@ pub async fn run_update_if_available(
          return Ok(false);
      };
  
@@ -6427,7 +6461,7 @@ index 7a391e7e..1dea39f5 100644
      heal_managed_install(inst).await;
  
      if is_version_cache_fresh().await {
-@@ -684,9 +713,11 @@ pub async fn run_update_if_available(
+@@ -684,9 +716,11 @@ pub async fn run_update_if_available(
      }
  
      // Resolve effective auto_update: None defaults to true (first-run).
@@ -6440,7 +6474,16 @@ index 7a391e7e..1dea39f5 100644
          && let Err(e) = config::update_config(|st| {
              if st.cli.auto_update.is_none() {
                  st.cli.auto_update = Some(true);
-@@ -706,7 +737,8 @@ pub async fn run_update_if_available(
+@@ -697,7 +731,7 @@ pub async fn run_update_if_available(
+         tracing::warn!("Failed to save auto-update setting: {}", e);
+     }
+ 
+-    let current_version = get_installed_grok_version();
++    let current_version = running_version_for(inst);
+     let policy = config::VersionPolicy::resolve();
+     // Don't write version.json here
+     // Only cache after confirming no update is needed or after a successful install
+@@ -706,7 +740,8 @@ pub async fn run_update_if_available(
          Ok(UpdatePlan::Install { target, .. }) => target,
          Ok(UpdatePlan::Skip { .. } | UpdatePlan::Unavailable { .. }) | Err(_) => return Ok(false),
      };
@@ -6450,7 +6493,7 @@ index 7a391e7e..1dea39f5 100644
          &current_version,
          &latest_version,
          &update_config.channel,
-@@ -851,6 +883,11 @@ async fn run_update_subcommand(
+@@ -851,6 +886,11 @@ async fn run_update_subcommand(
  /// `current_exe()` resolves symlinks via `/proc/self/exe` (see proc(5)), so it returns the old versioned target after a symlink swap.
  /// Prefer `~/.grok/bin/grok` which always points to the latest version.
  fn resolve_restart_exe() -> Result<std::path::PathBuf> {
@@ -6462,7 +6505,18 @@ index 7a391e7e..1dea39f5 100644
      let canonical = grok_application();
      if canonical.exists() {
          return Ok(canonical);
-@@ -914,6 +951,11 @@ pub async fn run_install_script(
+@@ -902,8 +942,8 @@ pub async fn run_install_script(
+     trigger: CliUpdateTrigger,
+ ) -> Result<()> {
+     // What's on disk is being replaced, not this (possibly stale) process's version; npm has no trustworthy disk version, so it falls back
+-    let from_version =
+-        disk_version_for_installer(installer).unwrap_or_else(get_installed_grok_version);
++    let from_version = disk_version_for_installer(installer)
++        .unwrap_or_else(|| running_version_for(installer));
+     let started = Instant::now();
+     // Internal reports the version it actually activated; npm/gh-release resolve their own artifact, so the requested target stands in
+     let result: Result<Option<String>> = match installer {
+@@ -914,6 +954,11 @@ pub async fn run_install_script(
          )
          .map(|()| None),
          "gh-release" => install_gh_release(target).await.map(|()| None),
@@ -6474,12 +6528,23 @@ index 7a391e7e..1dea39f5 100644
          _ => install_internal(target, update_config).await.map(Some),
      };
      // Measured before the success-only cache sweep, so the sweep cannot inflate success durations
-@@ -950,6 +992,59 @@ pub async fn run_install_script(
+@@ -950,6 +995,70 @@ pub async fn run_install_script(
      })
  }
  
 +fn is_lhc_installer(installer: &str) -> bool {
 +    installer == INSTALLER_LHC_MANAGED || installer == INSTALLER_LHC_UNMANAGED
++}
++
++/// The version this running process compares against a release: the embedded fork
++/// release for the fork kinds (never the native upstream base, which every fork
++/// revision shares), upstream's compiled-in version otherwise.
++fn running_version_for(installer: &str) -> String {
++    if is_lhc_installer(installer) {
++        crate::lhc_release::LHC_RELEASE_VERSION.to_string()
++    } else {
++        get_installed_grok_version()
++    }
 +}
 +
 +/// Background/automatic updates for the fork are opt-in: a managed LHC store runs them
@@ -6534,7 +6599,7 @@ index 7a391e7e..1dea39f5 100644
  /// Detect the platform (os, arch) to download binaries for.
  ///
  /// Arch is the compile-time arch with one correction: an x86_64 build on an Apple Silicon host (Rosetta) selects `aarch64`.
-@@ -2612,9 +2707,13 @@ pub async fn run_update(
+@@ -2612,9 +2721,13 @@ pub async fn run_update(
              return Ok(None);
          }
      };
@@ -6550,7 +6615,16 @@ index 7a391e7e..1dea39f5 100644
          let _ = config::update_config(|st| {
              st.cli.installer = Some(installer.to_string());
          })
-@@ -2638,10 +2737,11 @@ pub async fn run_update(
+@@ -2623,7 +2736,7 @@ pub async fn run_update(
+ 
+     heal_managed_install(installer).await;
+ 
+-    let current_version = get_installed_grok_version();
++    let current_version = running_version_for(installer);
+     let policy = config::VersionPolicy::resolve();
+ 
+     // When --version is given, skip the latest-version check and install directly
+@@ -2638,10 +2751,11 @@ pub async fn run_update(
          eprintln!();
          run_install_script(installer, Some(version), update_config, trigger).await?;
          refresh_deployment_config().await;
@@ -6566,7 +6640,7 @@ index 7a391e7e..1dea39f5 100644
          {
              tracing::warn!("Failed to persist auto_update=false for pinned install: {e}");
          }
-@@ -2696,7 +2796,8 @@ pub async fn run_update(
+@@ -2696,7 +2810,8 @@ pub async fn run_update(
          disk_version_for_installer(installer).unwrap_or_else(|| current_version.clone());
  
      if !force {
@@ -6576,7 +6650,7 @@ index 7a391e7e..1dea39f5 100644
              &effective_current,
              &install_target,
              &update_config.channel,
-@@ -2746,7 +2847,8 @@ pub async fn run_update(
+@@ -2746,7 +2861,8 @@ pub async fn run_update(
      }
  
      let target_version = if force
@@ -6587,7 +6661,7 @@ index 7a391e7e..1dea39f5 100644
              &install_target,
              &update_config.channel,
 diff --git a/crates/codegen/xai-grok-update/src/auto_update_tests.rs b/crates/codegen/xai-grok-update/src/auto_update_tests.rs
-index 8b7c58cf..6604a404 100644
+index 8b7c58cf..35a971f3 100644
 --- a/crates/codegen/xai-grok-update/src/auto_update_tests.rs
 +++ b/crates/codegen/xai-grok-update/src/auto_update_tests.rs
 @@ -934,76 +934,70 @@ fn test_reinstall_hint_gh_release_mentions_gh_command() {
@@ -6703,7 +6777,7 @@ index 8b7c58cf..6604a404 100644
          );
      }
  }
-@@ -2439,3 +2433,170 @@ fn npm_entry_is_recognized_by_the_binary_location() {
+@@ -2439,3 +2433,184 @@ fn npm_entry_is_recognized_by_the_binary_location() {
      assert!(super::is_under_node_modules(&resolved));
      assert!(!super::is_under_node_modules(&root.join("home/bin/grok")));
  }
@@ -6824,6 +6898,20 @@ index 8b7c58cf..6604a404 100644
 +    }
 +    assert!(!is_lhc_installer("internal"));
 +    assert_eq!(disk_version_for_installer(INSTALLER_LHC_UNMANAGED), None);
++}
++
++/// The fork compares its embedded release, never the shared native base.
++#[test]
++fn lhc_running_version_is_the_fork_release() {
++    use crate::lhc_release::{INSTALLER_LHC_MANAGED, INSTALLER_LHC_UNMANAGED, LHC_RELEASE_VERSION};
++    assert_eq!(running_version_for(INSTALLER_LHC_MANAGED), LHC_RELEASE_VERSION);
++    assert_eq!(running_version_for(INSTALLER_LHC_UNMANAGED), LHC_RELEASE_VERSION);
++    assert_eq!(running_version_for("internal"), get_installed_grok_version());
++    // A build at fork revision N must not see its own base as "newer".
++    assert_eq!(
++        needs_update_for(INSTALLER_LHC_MANAGED, "1.0.16-lhc.1", "1.0.16-lhc.1", "stable", false),
++        Some(false)
++    );
 +}
 +
 +/// Restart resolves the store's activated binary, not `~/.grok/bin/grok`.
