@@ -11,7 +11,7 @@ index 585a482b..58ca001e 100644
      "third_party/dagre_rust",
      "third_party/graphlib_rust",
 diff --git a/crates/codegen/xai-chat-state/src/actor/mod.rs b/crates/codegen/xai-chat-state/src/actor/mod.rs
-index f554da1f..69e5a0ae 100644
+index f554da1f..299d3f12 100644
 --- a/crates/codegen/xai-chat-state/src/actor/mod.rs
 +++ b/crates/codegen/xai-chat-state/src/actor/mod.rs
 @@ -204,6 +204,12 @@ impl ChatStateActor {
@@ -27,10 +27,30 @@ index f554da1f..69e5a0ae 100644
              ChatStateCommand::RecordSubagentUsage {
                  by_model,
                  attribute_to_prompt,
+@@ -239,8 +245,9 @@ impl ChatStateActor {
+             ChatStateCommand::ReplaceConversation {
+                 items,
+                 is_compaction,
++                lhc_source_tip,
+             } => {
+-                self.replace_conversation(items, is_compaction);
++                self.replace_conversation(items, is_compaction, lhc_source_tip);
+             }
+             ChatStateCommand::RepairHistory {
+                 dry_run,
 diff --git a/crates/codegen/xai-chat-state/src/actor/mutations.rs b/crates/codegen/xai-chat-state/src/actor/mutations.rs
-index 6ff942d7..6decd78f 100644
+index 6ff942d7..00f9ec09 100644
 --- a/crates/codegen/xai-chat-state/src/actor/mutations.rs
 +++ b/crates/codegen/xai-chat-state/src/actor/mutations.rs
+@@ -193,7 +193,7 @@ impl ChatStateActor {
+                 "History repair modified the conversation"
+             );
+             // Full replace: persists atomically and re-bases token estimates.
+-            self.replace_conversation(items, false);
++            self.replace_conversation(items, false, None);
+         } else {
+             // Nothing changed — put the conversation back untouched.
+             self.state.conversation = items;
 @@ -281,7 +281,25 @@ impl ChatStateActor {
      }
  
@@ -91,6 +111,39 @@ index 6ff942d7..6decd78f 100644
      }
  
      pub(super) fn record_subagent_usage(
+@@ -608,6 +652,7 @@ impl ChatStateActor {
+         &mut self,
+         items: Vec<ConversationItem>,
+         is_compaction: bool,
++        lhc_source_tip: Option<u64>,
+     ) {
+         self.snapshot_turn_slice();
+         if is_compaction && let Some(cap) = &mut self.state.turn_capture {
+@@ -616,7 +661,14 @@ impl ChatStateActor {
+         // `harness_trace_buffer` / `harness_trace_turns` intentionally untouched:
+         // the planner/verifier subagents ran, so their sealed trace turns survive
+         // a conversation replace (same intent as the `TruncateToPromptIndex` arm).
+-        self.persistence.replace_history(&items);
++        match lhc_source_tip {
++            // LHC write-back body: native persists it; capture is told it is
++            // installed rather than receiving it as canonical source.
++            Some(tip) => self
++                .persistence
++                .replace_history_for_lhc_writeback(&items, tip),
++            None => self.persistence.replace_history(&items),
++        }
+         let base_estimate = super::state::estimate_conversation_tokens(&items);
+         let estimated_tokens = self.reseed_total_tokens(base_estimate);
+         self.state.conversation = items;
+@@ -651,7 +703,7 @@ impl ChatStateActor {
+         let changed =
+             crate::conversation_util::replace_or_insert_system_head(&mut conversation, prompt);
+         debug_assert!(changed, "head mismatch must produce a change");
+-        self.replace_conversation(conversation, false);
++        self.replace_conversation(conversation, false, None);
+         changed
+     }
+ 
 diff --git a/crates/codegen/xai-chat-state/src/actor/state.rs b/crates/codegen/xai-chat-state/src/actor/state.rs
 index 21b04f43..43851eb6 100644
 --- a/crates/codegen/xai-chat-state/src/actor/state.rs
@@ -365,7 +418,7 @@ index 220c654b..60e4e6bf 100644
  async fn record_last_turn_usage_round_trip() {
      use xai_grok_sampling_types::TokenUsage;
 diff --git a/crates/codegen/xai-chat-state/src/commands.rs b/crates/codegen/xai-chat-state/src/commands.rs
-index d3243775..702e4714 100644
+index d3243775..f77d2edd 100644
 --- a/crates/codegen/xai-chat-state/src/commands.rs
 +++ b/crates/codegen/xai-chat-state/src/commands.rs
 @@ -114,6 +114,14 @@ pub enum ChatStateCommand {
@@ -383,8 +436,28 @@ index d3243775..702e4714 100644
      /// Subagent usage into session (and prompt when attributable). Replies when applied.
      RecordSubagentUsage {
          by_model: Vec<(String, crate::usage::UsageTotals)>,
+@@ -149,6 +157,11 @@ pub enum ChatStateCommand {
+     ReplaceConversation {
+         items: Vec<ConversationItem>,
+         is_compaction: bool,
++        /// `Some` when `items` is LHC's generated write-back body: the
++        /// canonical event order it was generated from. Routes persistence to
++        /// `replace_history_for_lhc_writeback` so capture does not record the
++        /// body as source. `None` for every other replacement.
++        lhc_source_tip: Option<u64>,
+     },
+ 
+     /// Out-of-band history repair (`x.ai/session/repair`): run
+@@ -484,6 +497,7 @@ mod tests {
+         let _ = ChatStateCommand::ReplaceConversation {
+             items: vec![],
+             is_compaction: false,
++            lhc_source_tip: None,
+         };
+         let _ = ChatStateCommand::CachePromptText {
+             text: "prompt".to_string(),
 diff --git a/crates/codegen/xai-chat-state/src/handle.rs b/crates/codegen/xai-chat-state/src/handle.rs
-index ca73dd7c..b37ff6e8 100644
+index ca73dd7c..3733e0a1 100644
 --- a/crates/codegen/xai-chat-state/src/handle.rs
 +++ b/crates/codegen/xai-chat-state/src/handle.rs
 @@ -171,6 +171,24 @@ impl ChatStateHandle {
@@ -412,6 +485,46 @@ index ca73dd7c..b37ff6e8 100644
      /// Apply subagent usage; returns false if the actor did not acknowledge.
      pub async fn record_subagent_usage(
          &self,
+@@ -255,19 +273,36 @@ impl ChatStateHandle {
+ 
+     /// Replace conversation history.
+     pub fn replace_conversation(&self, items: Vec<ConversationItem>) {
+-        self.send_replace(items, false);
++        self.send_replace(items, false, None);
+     }
+ 
+     /// Replace conversation history for compaction.
+     /// Sets `compaction_occurred` on the active turn capture.
+     pub fn replace_conversation_for_compaction(&self, items: Vec<ConversationItem>) {
+-        self.send_replace(items, true);
++        self.send_replace(items, true, None);
+     }
+ 
+-    fn send_replace(&self, items: Vec<ConversationItem>, is_compaction: bool) {
++    /// Replace conversation history with LHC's generated write-back body
++    /// (compaction semantics). `source_tip` — the canonical event order the
++    /// body was generated from — travels to persistence unchanged.
++    pub fn replace_conversation_for_lhc_writeback(
++        &self,
++        items: Vec<ConversationItem>,
++        source_tip: u64,
++    ) {
++        self.send_replace(items, true, Some(source_tip));
++    }
++
++    fn send_replace(
++        &self,
++        items: Vec<ConversationItem>,
++        is_compaction: bool,
++        lhc_source_tip: Option<u64>,
++    ) {
+         let _ = self.cmd_tx.send(ChatStateCommand::ReplaceConversation {
+             items,
+             is_compaction,
++            lhc_source_tip,
+         });
+     }
+ 
 diff --git a/crates/codegen/xai-chat-state/src/lib.rs b/crates/codegen/xai-chat-state/src/lib.rs
 index 4391495f..8eed7986 100644
 --- a/crates/codegen/xai-chat-state/src/lib.rs
@@ -428,7 +541,7 @@ index 4391495f..8eed7986 100644
  pub use types::*;
  pub use usage::{UsageLedger, UsageTotals};
 diff --git a/crates/codegen/xai-chat-state/src/persistence.rs b/crates/codegen/xai-chat-state/src/persistence.rs
-index 4d5ac957..ad4ae507 100644
+index 4d5ac957..9fb14c38 100644
 --- a/crates/codegen/xai-chat-state/src/persistence.rs
 +++ b/crates/codegen/xai-chat-state/src/persistence.rs
 @@ -8,10 +8,58 @@
@@ -515,7 +628,25 @@ index 4d5ac957..ad4ae507 100644
      /// Persist one working-directory switch generation and report commit status.
      fn persist_working_directory_switch_and_ack(
          &mut self,
-@@ -70,8 +135,20 @@ pub enum StripOutcome {
+@@ -33,6 +98,17 @@ pub trait ChatPersistence: Send + 'static {
+     /// Replace the entire chat history (compaction / rewind).
+     fn replace_history(&mut self, items: &[ConversationItem]);
+ 
++    /// LHC write-back: the host installs LHC's generated compacted body as
++    /// the native conversation. Native persistence is unchanged (this default
++    /// forwards to [`Self::replace_history`]); an LHC-aware backend must not
++    /// capture the body as canonical source. `source_tip` is the canonical
++    /// event order the body was generated from, carried unchanged from the
++    /// compact operation so the checkpoint and the capture side agree.
++    fn replace_history_for_lhc_writeback(&mut self, items: &[ConversationItem], source_tip: u64) {
++        let _ = source_tip;
++        self.replace_history(items);
++    }
++
+     /// Destructive image-strip rewrite: back up the on-disk history, then
+     /// replace it, acking the DISK outcome. A failed backup gates off the
+     /// rewrite so recoverability never silently evaporates; backends without
+@@ -70,8 +146,20 @@ pub enum StripOutcome {
  /// A record of a persistence call, sent over a channel to the test.
  #[derive(Debug, Clone)]
  pub enum PersistenceRecord {
@@ -537,7 +668,7 @@ index 4d5ac957..ad4ae507 100644
      /// A persistence-acknowledged switch append was requested.
      AcknowledgedMessage(ConversationItem),
      /// The full history was replaced.
-@@ -169,12 +246,15 @@ impl MockPersistenceReceiver {
+@@ -169,12 +257,15 @@ impl MockPersistenceReceiver {
          }
      }
  
@@ -555,7 +686,7 @@ index 4d5ac957..ad4ae507 100644
                  _ => None,
              })
              .collect()
-@@ -186,6 +266,32 @@ impl ChatPersistence for MockChatPersistence {
+@@ -186,6 +277,32 @@ impl ChatPersistence for MockChatPersistence {
          let _ = self.tx.send(PersistenceRecord::Message(item.clone()));
      }
  
@@ -1896,6 +2027,24 @@ index 01da7063..51c51e53 100644
  #[test]
  #[cfg(target_os = "linux")]
  fn required_bwrap_routes_fail_closed() {
+diff --git a/crates/codegen/xai-grok-shell/src/extensions/notification.rs b/crates/codegen/xai-grok-shell/src/extensions/notification.rs
+index e24a14c1..7e8e0adc 100644
+--- a/crates/codegen/xai-grok-shell/src/extensions/notification.rs
++++ b/crates/codegen/xai-grok-shell/src/extensions/notification.rs
+@@ -1298,6 +1298,13 @@ pub struct CompactionCheckpointFile {
+     /// Informational: kept for debugging and for understanding replay.
+     #[serde(default)]
+     pub reread_file_paths: Vec<String>,
++    /// LHC write-back provenance (fork): the canonical event order the
++    /// LHC-generated `compacted_history` was built from. `None` for native
++    /// compaction and for files written before this field existed. When
++    /// present, a resumed session tells LHC capture that this body is
++    /// generated context, not canonical source.
++    #[serde(default)]
++    pub lhc_source_tip: Option<u64>,
+ }
+ 
+ /// A compaction segment to persist under `compaction/segment_NNN.md`.
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session.rs b/crates/codegen/xai-grok-shell/src/session/acp_session.rs
 index 5a784287..311ba4e4 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session.rs
@@ -2324,16 +2473,63 @@ index e24ad6d2..7779cdde 100644
                  let msg = match Self::do_hooks_trust_project(&self.session_info.cwd) {
                      Ok(root) => {
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs
-index e5638318..cc18cc4a 100644
+index e5638318..1c6c8547 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs
-@@ -557,13 +557,29 @@ pub(crate) async fn spawn_session_actor(
+@@ -69,6 +69,40 @@ fn configured_memory_retrieval_mode(
+ /// A subagent with an active pacer (`pacer_max_attempts > 0`) paces 429s itself, so the sampler retry is disabled.
+ /// With the pacer off, the subagent falls back to the sampler retry, so disabling the pacer is a true rollback rather than zero 429 handling.
+ /// Main sessions always keep the sampler retry.
++/// LHC (slice 1A): the latest compaction checkpoint, when LHC-marked
++/// (`lhc_source_tip` present), gives capture the generated body and the tip it
++/// was built from. Native or pre-1A checkpoints yield `None` and bootstrap
++/// captures as before. The checkpoint file is the same one cross-compaction
++/// rewind reads (`compaction_checkpoints/{id}.json`).
++fn lhc_generated_prefix_from_checkpoint(
++    session_dir: &std::path::Path,
++) -> Option<grok_lhc_host::GeneratedPrefix> {
++    let updates_path = session_dir.join("updates.jsonl");
++    let info = crate::session::helpers::replay::find_latest_compaction_checkpoint(&updates_path)
++        .ok()
++        .flatten()?;
++    let path = session_dir.join(&info.checkpoint_file);
++    let file: crate::extensions::notification::CompactionCheckpointFile = match std::fs::read(&path)
++        .map_err(|e| e.to_string())
++        .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()))
++    {
++        Ok(file) => file,
++        Err(err) => {
++            tracing::warn!(
++                path = %path.display(),
++                %err,
++                "LHC: compaction checkpoint unreadable; bootstrap without generated prefix"
++            );
++            return None;
++        }
++    };
++    let source_tip = file.lhc_source_tip?;
++    Some(grok_lhc_host::GeneratedPrefix {
++        items: file.compacted_history,
++        source_tip,
++    })
++}
++
+ fn subagent_sampler_rate_limit_threshold(is_subagent: bool, pacer_max_attempts: u32) -> u32 {
+     if is_subagent && pacer_max_attempts > 0 {
+         xai_grok_sampler::RATE_LIMIT_RETRY_DISABLED
+@@ -557,13 +591,36 @@ pub(crate) async fn spawn_session_actor(
          hard_clear_age_turns: session_pruning_config.hard_clear_age_turns,
      };
      let (chat_state_event_tx, chat_state_event_rx) = mpsc::unbounded_channel();
 +    let chat_persistence = Box::new(super::chat_persistence::ChannelChatPersistence::new(
 +        persistence.tx.clone(),
 +    ));
++    // LHC (slice 1A): an LHC-marked compaction checkpoint tells capture which
++    // leading items of `conversation` are LHC-generated context (not canonical
++    // source) and the canonical tip they were generated from.
++    let lhc_generated_prefix = lhc_generated_prefix_from_checkpoint(
++        &crate::session::persistence::session_dir(&session_info),
++    );
      let chat_state_handle = xai_chat_state::ChatStateActor::spawn_with_pruning(
          conversation.clone(),
          chat_state_sampling_config,
@@ -2346,6 +2542,7 @@ index e5638318..cc18cc4a 100644
 +            session_info.id.0.as_ref(),
 +            session_info.cwd.as_ref(),
 +            &conversation,
++            lhc_generated_prefix,
 +            chat_persistence,
 +            Some(
 +                crate::session::lhc_inference::ShellLhcInferenceSampler::new(
@@ -2360,7 +2557,7 @@ index e5638318..cc18cc4a 100644
          chat_state_event_tx,
          tokio_util::sync::CancellationToken::new(),
      );
-@@ -1057,6 +1073,39 @@ pub(crate) async fn spawn_session_actor(
+@@ -1057,6 +1114,39 @@ pub(crate) async fn spawn_session_actor(
              resources.insert(task_wake_suppressed);
          })
          .await;
@@ -4204,10 +4401,18 @@ index b232da71..9cc268b6 100644
              let stashed = actor
                  .chat_state_handle
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/rewind_cross_compaction_tests.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/rewind_cross_compaction_tests.rs
-index 108bdada..1a995671 100644
+index 108bdada..509b1d9d 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/rewind_cross_compaction_tests.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/rewind_cross_compaction_tests.rs
-@@ -452,3 +452,227 @@ async fn run_forked_rewind_scenario() {
+@@ -65,6 +65,7 @@ fn write_compacted_session_fixture(session_dir: &std::path::Path, ckpt_id: &str)
+         created_at: "2026-01-01T00:00:00Z".to_string(),
+         original_user_info: Some("UI0".to_string()),
+         reread_file_paths: vec![],
++        lhc_source_tip: None,
+     };
+     std::fs::write(
+         session_dir.join(format!("compaction_checkpoints/{ckpt_id}.json")),
+@@ -452,3 +453,260 @@ async fn run_forked_rewind_scenario() {
          "prompt_index must be reset to the rewind target"
      );
  }
@@ -4435,6 +4640,39 @@ index 108bdada..1a995671 100644
 +        }
 +    }
 +}
++
++/// LHC (slice 1A): `lhc_source_tip` marks an LHC-generated checkpoint body.
++/// Older / native files read as `None`; a marked file round-trips its tip.
++#[test]
++fn compaction_checkpoint_lhc_source_tip_is_optional_and_round_trips() {
++    let legacy = serde_json::json!({
++        "checkpoint_id": "ck-legacy",
++        "prompt_index_at_compaction": 3,
++        "compacted_history": [],
++        "schema_version": 1,
++        "created_at": "2026-09-08T00:00:00Z"
++    });
++    let file: CompactionCheckpointFile = serde_json::from_value(legacy).unwrap();
++    assert_eq!(
++        file.lhc_source_tip, None,
++        "pre-1A / native checkpoint is unmarked"
++    );
++
++    let marked = CompactionCheckpointFile {
++        checkpoint_id: "ck-lhc".into(),
++        prompt_index_at_compaction: 3,
++        compacted_history: vec![ConversationItem::system("sys")],
++        schema_version: 1,
++        created_at: "2026-09-08T00:00:00Z".into(),
++        original_user_info: None,
++        reread_file_paths: vec![],
++        lhc_source_tip: Some(41),
++    };
++    let json = serde_json::to_string(&marked).unwrap();
++    assert!(json.contains("\"lhc_source_tip\":41"));
++    let back: CompactionCheckpointFile = serde_json::from_str(&json).unwrap();
++    assert_eq!(back.lhc_source_tip, Some(41));
++}
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/tool_layer_images_bridge_tests.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/tool_layer_images_bridge_tests.rs
 index 63c41fc0..339907fc 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/tool_layer_images_bridge_tests.rs
@@ -4631,7 +4869,7 @@ index a241e5b0..7aa7f6e6 100644
 +        .await;
 +}
 diff --git a/crates/codegen/xai-grok-shell/src/session/compaction.rs b/crates/codegen/xai-grok-shell/src/session/compaction.rs
-index 5ce113f0..b085a65a 100644
+index 5ce113f0..d851ff51 100644
 --- a/crates/codegen/xai-grok-shell/src/session/compaction.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/compaction.rs
 @@ -567,6 +567,16 @@ impl SessionActor {
@@ -4651,7 +4889,15 @@ index 5ce113f0..b085a65a 100644
          let (_cancel, _cancel_scope) = self.compaction.cancel.enter();
          self.record_compaction_variant();
          let total_tokens = self.chat_state_handle.get_total_tokens().await;
-@@ -1979,6 +1989,165 @@ impl SessionActor {
+@@ -1780,6 +1790,7 @@ impl SessionActor {
+             prompt_index_at_compaction,
+             auto_continue,
+             original_user_info,
++            None,
+         );
+         let prefix_len = if self
+             .compaction
+@@ -1979,6 +1990,168 @@ impl SessionActor {
          let estimated_total = self.chat_state_handle.get_estimated_total_tokens().await;
          estimated_total > context_window
      }
@@ -4725,11 +4971,14 @@ index 5ce113f0..b085a65a 100644
 +            }),
 +            _ => None,
 +        });
++        // LHC-generated body: the checkpoint carries the source tip so a
++        // resumed session does not recapture the body as canonical source.
 +        self.persist_compaction_checkpoint(
 +            &items,
 +            prompt_index_at_compaction,
 +            None,
 +            original_user_info,
++            Some(writeback.source_tip),
 +        );
 +        let context_window = self
 +            .chat_state_handle
@@ -4759,7 +5008,7 @@ index 5ce113f0..b085a65a 100644
 +        };
 +        let new_len = items.len();
 +        self.chat_state_handle
-+            .replace_conversation_for_compaction(items);
++            .replace_conversation_for_lhc_writeback(items, writeback.source_tip);
 +        if self.startup_hints.inherited_prefix_len.is_some() {
 +            let post_replace_tokens = self.chat_state_handle.get_total_tokens().await;
 +            if xai_token_estimation::exceeds_threshold(
@@ -4817,7 +5066,7 @@ index 5ce113f0..b085a65a 100644
      /// Pre-sampling compaction check.
      /// Uses `get_estimated_total_tokens()` (exact prior count plus a byte-estimate of items since last response) so tool results are accounted for.
      /// Returns `None` when `is_flushing`.
-@@ -2033,6 +2202,7 @@ impl SessionActor {
+@@ -2033,6 +2206,7 @@ impl SessionActor {
                  trigger_info.tokens_used,
                  trigger_info.context_window,
              );
@@ -4825,7 +5074,7 @@ index 5ce113f0..b085a65a 100644
              return Some(trigger_info);
          }
          None
-@@ -2099,6 +2269,7 @@ impl SessionActor {
+@@ -2099,6 +2273,7 @@ impl SessionActor {
              cfg.context_window.get(),
              trigger_info.percentage,
          );
@@ -4833,7 +5082,7 @@ index 5ce113f0..b085a65a 100644
          if let Err(e) = self.run_compact_only(trigger_info, false).await {
              tracing::error!(error = %e, "Model-switch compaction failed");
              if Self::is_auth_compact_error(&e) {
-@@ -2139,6 +2310,10 @@ impl SessionActor {
+@@ -2139,6 +2314,10 @@ impl SessionActor {
          trigger_info: AutoCompactTriggerInfo,
          lossy_input: bool,
      ) -> Result<(), acp::Error> {
@@ -4844,7 +5093,7 @@ index 5ce113f0..b085a65a 100644
          use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
          let (_cancel, _cancel_scope) = self.compaction.cancel.enter();
          self.record_compaction_variant();
-@@ -2287,7 +2462,7 @@ impl SessionActor {
+@@ -2287,12 +2466,13 @@ impl SessionActor {
      /// Writes the compacted history to a separate file and records a `CompactionCheckpoint` marker in `updates.jsonl`.
      ///
      /// `auto_continue` should be `Some` when this compaction was triggered by auto-compact and an auto-continue prompt will follow.
@@ -4853,6 +5102,32 @@ index 5ce113f0..b085a65a 100644
          &self,
          compacted_history: &[ConversationItem],
          prompt_index_at_compaction: usize,
+         auto_continue: Option<crate::extensions::notification::AutoContinueInfo>,
+         original_user_info: Option<String>,
++        lhc_source_tip: Option<u64>,
+     ) {
+         use crate::extensions::notification::{
+             CompactionCheckpointFile, CompactionCheckpointInfo, SessionUpdate as XaiSessionUpdate,
+@@ -2308,6 +2488,7 @@ impl SessionActor {
+             created_at: created_at.clone(),
+             original_user_info,
+             reread_file_paths: vec![],
++            lhc_source_tip,
+         };
+         if self
+             .notifications
+diff --git a/crates/codegen/xai-grok-shell/src/session/helpers/replay.rs b/crates/codegen/xai-grok-shell/src/session/helpers/replay.rs
+index 67830878..820c57c7 100644
+--- a/crates/codegen/xai-grok-shell/src/session/helpers/replay.rs
++++ b/crates/codegen/xai-grok-shell/src/session/helpers/replay.rs
+@@ -769,6 +769,7 @@ mod tests {
+             created_at: "2024-01-01T00:00:00Z".to_string(),
+             original_user_info: None,
+             reread_file_paths: vec![],
++            lhc_source_tip: None,
+         };
+         let bytes = serde_json::to_vec_pretty(&file).unwrap();
+         std::fs::write(dir.join(format!("{checkpoint_id}.json")), bytes).unwrap();
 diff --git a/crates/codegen/xai-grok-shell/src/session/lhc_inference.rs b/crates/codegen/xai-grok-shell/src/session/lhc_inference.rs
 new file mode 100644
 index 00000000..c403cd77
@@ -5815,6 +6090,18 @@ index 07d1ee80..137eb4bb 100644
              BuiltinAction::HooksTrust => false,
              BuiltinAction::HooksList => false,
              BuiltinAction::HooksAdd { .. } => true,
+diff --git a/crates/codegen/xai-grok-shell/src/session/storage/jsonl/copy_tests.rs b/crates/codegen/xai-grok-shell/src/session/storage/jsonl/copy_tests.rs
+index 5541899f..f0093157 100644
+--- a/crates/codegen/xai-grok-shell/src/session/storage/jsonl/copy_tests.rs
++++ b/crates/codegen/xai-grok-shell/src/session/storage/jsonl/copy_tests.rs
+@@ -457,6 +457,7 @@ async fn write_checkpoint_file(adapter: &JsonlStorageAdapter, info: &Info, id: &
+                 created_at: "2026-01-01T00:00:00Z".to_string(),
+                 original_user_info: None,
+                 reread_file_paths: vec![],
++                lhc_source_tip: None,
+             },
+         )
+         .await
 diff --git a/crates/codegen/xai-grok-shell/src/upload/memory_tests.rs b/crates/codegen/xai-grok-shell/src/upload/memory_tests.rs
 index c43ce4bc..c81fac32 100644
 --- a/crates/codegen/xai-grok-shell/src/upload/memory_tests.rs
