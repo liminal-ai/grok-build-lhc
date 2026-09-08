@@ -26,6 +26,12 @@ concurrency:
 jobs:
   cheap-gates:
     name: Candidate handoff and packaging gates
+    # The tripwire needs cargo + rustfmt and a protoc: rustup on this image installs
+    # the pinned 1.94.0 toolchain (rust-toolchain.toml, rustfmt component) on first
+    # use, and bin/protoc (dotslash, installed below) fetches protoc. No apt or
+    # rust-toolchain step is required: this exact runner ran the tripwire fresh in
+    # 4m17s (run 33866966760, 2026-09-04) and 4m25s / 5m35s in the two runs before,
+    # all under the 15-minute timeout with the same job setup.
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:

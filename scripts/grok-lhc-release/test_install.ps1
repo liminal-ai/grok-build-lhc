@@ -33,7 +33,8 @@ function MakeRelease([string]$Version) {
     return $rel
 }
 function Receipt([string]$Store, [string]$Name) { return ([System.IO.File]::ReadAllText((Join-Path $Store $Name))).Trim() }
-function Install([string[]]$Arguments) { & $installer @Arguments | Out-Null }
+# Named splatting: an array splat would bind positionally (-Version would land in $Version as text).
+function Install([hashtable]$Arguments) { & $installer @Arguments | Out-Null }
 
 try {
     New-Item -ItemType Directory -Path $root | Out-Null
@@ -46,7 +47,7 @@ try {
     [System.IO.File]::WriteAllText((Join-Path $data "keep"), "archive")
 
     # Fresh install: default name grok-lhc, receipts, junction, launcher forwards args and exit status.
-    Install @("-Version", "1.0.16", "-AssetDir", $first, "-Prefix", $prefix, "-InstallRoot", $store)
+    Install @{ Version = "1.0.16"; AssetDir = $first; Prefix = $prefix; InstallRoot = $store }
     $launcher = Join-Path $prefix "bin\grok-lhc.cmd"
     Check (Test-Path $launcher) "launcher installed at $launcher"
     Check ((Receipt $store "installed-name") -eq "grok-lhc") "installed-name = grok-lhc"
@@ -68,11 +69,11 @@ try {
 
     # Collision with an unmanaged command of the requested name refuses.
     [System.IO.File]::WriteAllText((Join-Path $prefix "bin\other.cmd"), "@echo off`r`nexit /b 0`r`n")
-    Expect { Install @("-Version", "1.0.16", "-AssetDir", $first, "-Prefix", $prefix, "-InstallRoot", (Join-Path $root "p2"), "-Name", "other") } "refuses to replace an unmanaged other.cmd"
+    Expect { Install @{ Version = "1.0.16"; AssetDir = $first; Prefix = $prefix; InstallRoot = (Join-Path $root "p2"); Name = "other" } } "refuses to replace an unmanaged other.cmd"
     Check (-not (Test-Path (Join-Path $root "p2"))) "refused install leaves no store"
 
     # Update names only the store: name and prefix come from receipts; old versions are kept.
-    Install @("-Version", "1.0.16-lhc.1", "-AssetDir", $second, "-InstallRoot", $store)
+    Install @{ Version = "1.0.16-lhc.1"; AssetDir = $second; InstallRoot = $store }
     Check ((Receipt $store "installed-version") -eq "1.0.16-lhc.1") "update recorded 1.0.16-lhc.1"
     Check ((Receipt $store "installed-name") -eq "grok-lhc") "update kept the name"
     Check ((Receipt $store "installed-prefix") -eq $prefix) "update kept the prefix"
@@ -84,12 +85,12 @@ try {
     Check ($LASTEXITCODE -eq 0) "launcher still runs through current"
 
     # Name change for a managed store refuses; invalid release strings never reach the store.
-    Expect { Install @("-Version", "1.0.16", "-AssetDir", $first, "-InstallRoot", $store, "-Name", "grok-other") } "refuses a command name change"
+    Expect { Install @{ Version = "1.0.16"; AssetDir = $first; InstallRoot = $store; Name = "grok-other" } } "refuses a command name change"
     Check (-not (Test-Path (Join-Path $prefix "bin\grok-other.cmd"))) "no grok-other launcher"
-    Expect { Install @("-Version", "1.0.16-alpha.1", "-AssetDir", $first, "-InstallRoot", (Join-Path $root "bad")) } "refuses an invalid release string"
+    Expect { Install @{ Version = "1.0.16-alpha.1"; AssetDir = $first; InstallRoot = (Join-Path $root "bad") } } "refuses an invalid release string"
 
     # Uninstall takes name and prefix from receipts and preserves user data.
-    Install @("-InstallRoot", $store, "-Uninstall")
+    Install @{ InstallRoot = $store; Uninstall = $true }
     Check (-not (Test-Path $launcher)) "launcher removed"
     Check (-not (Test-Path $store)) "store removed"
     Check (Test-Path (Join-Path $data "keep")) "LHC data preserved"
@@ -98,17 +99,17 @@ try {
     # Checksum mismatch and a manifest for another release refuse before anything is written.
     $tampered = MakeRelease "1.0.17"
     [System.IO.File]::WriteAllText((Join-Path $tampered "grok-1.0.17-$platform.exe"), "tampered")
-    Expect { Install @("-Version", "1.0.17", "-AssetDir", $tampered, "-Prefix", $prefix, "-InstallRoot", (Join-Path $root "t")) } "refuses a checksum mismatch"
+    Expect { Install @{ Version = "1.0.17"; AssetDir = $tampered; Prefix = $prefix; InstallRoot = (Join-Path $root "t") } } "refuses a checksum mismatch"
     Check (-not (Test-Path (Join-Path $root "t"))) "mismatch leaves no store"
     $wrong = MakeRelease "1.0.18"
     [System.IO.File]::WriteAllText((Join-Path $wrong "release-manifest.json"), "{`"release_version`": `"0.0.0`"}`n")
-    Expect { Install @("-Version", "1.0.18", "-AssetDir", $wrong, "-Prefix", $prefix, "-InstallRoot", (Join-Path $root "w")) } "refuses a manifest for another release"
+    Expect { Install @{ Version = "1.0.18"; AssetDir = $wrong; Prefix = $prefix; InstallRoot = (Join-Path $root "w") } } "refuses a manifest for another release"
 
     # An existing unmanaged directory is never taken over.
     $owned = Join-Path $root "owned"
     New-Item -ItemType Directory -Path $owned | Out-Null
     [System.IO.File]::WriteAllText((Join-Path $owned "keep"), "user-owned")
-    Expect { Install @("-Version", "1.0.16", "-AssetDir", $first, "-Prefix", $prefix, "-InstallRoot", $owned) } "refuses an unowned install root"
+    Expect { Install @{ Version = "1.0.16"; AssetDir = $first; Prefix = $prefix; InstallRoot = $owned } } "refuses an unowned install root"
     Check (([System.IO.File]::ReadAllText((Join-Path $owned "keep"))) -eq "user-owned") "unowned root untouched"
 
     # Download mode against a loopback server: latest resolution, platform asset, receipts.
@@ -122,12 +123,12 @@ try {
     Start-Sleep -Seconds 2
     $env:GROK_LHC_RELEASE_BASE = "http://127.0.0.1:$port"
     $dlStore = Join-Path $root "dl-store"
-    Install @("-Download", "-Prefix", $prefix, "-InstallRoot", $dlStore)
+    Install @{ Download = $true; Prefix = $prefix; InstallRoot = $dlStore }
     Check ((Receipt $dlStore "installed-version") -eq "1.0.16-lhc.2") "download mode resolved latest = 1.0.16-lhc.2"
     Check (Test-Path (Join-Path $prefix "bin\grok-lhc.cmd")) "download mode installed the default command"
-    Expect { Install @("-Download", "-Version", "9.9.9", "-InstallRoot", (Join-Path $root "m")) } "missing release refuses"
+    Expect { Install @{ Download = $true; Version = "9.9.9"; InstallRoot = (Join-Path $root "m") } } "missing release refuses"
     Check (-not (Test-Path (Join-Path $root "m"))) "missing release leaves no store"
-    Install @("-InstallRoot", $dlStore, "-Uninstall")
+    Install @{ InstallRoot = $dlStore; Uninstall = $true }
     Check (-not (Test-Path $dlStore)) "download-mode store removed"
     Write-Host "Windows installer fixture: PASS"
 } finally {
