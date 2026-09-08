@@ -35,15 +35,11 @@ function RemoveJunction([string]$Path) {
     # Removes the link only; never recurses into the target.
     if (Test-Path -LiteralPath $Path) { [System.IO.Directory]::Delete($Path) }
 }
-# cmd.exe reads batch files in the OEM code page, so the launcher carries the
-# executable path in that code page (UTF-8 without BOM when the OEM page is
-# 65001). Unrepresentable characters raise instead of being replaced.
-function LauncherEncoding() {
-    $codePage = [System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage
-    if ($codePage -eq 65001) { return New-Object System.Text.UTF8Encoding($false, $true) }
-    return [System.Text.Encoding]::GetEncoding($codePage, [System.Text.EncoderFallback]::ExceptionFallback, [System.Text.DecoderFallback]::ExceptionFallback)
-}
-function ReadLauncher([string]$Path) { return (LauncherEncoding).GetString([System.IO.File]::ReadAllBytes($Path)) }
+# The launcher is BOM-less UTF-8: an ASCII `chcp 65001 >nul` line switches the
+# console to UTF-8 before cmd.exe reads the line carrying the executable path, so
+# any Unicode install root is preserved (the console stays UTF-8 afterwards).
+$launcherEncoding = New-Object System.Text.UTF8Encoding($false)
+function ReadLauncher([string]$Path) { return $launcherEncoding.GetString([System.IO.File]::ReadAllBytes($Path)) }
 
 $releaseBase = $env:GROK_LHC_RELEASE_BASE
 if ($releaseBase) {
@@ -153,9 +149,7 @@ try {
         if ($text -notmatch [regex]::Escape($InstallRoot)) { Fail "$launcher already exists; choose another name" }
     }
     $exe = Join-Path (Join-Path $current "bin") "grok.exe"
-    $encoding = LauncherEncoding
-    try { $launcherBytes = $encoding.GetBytes("@echo off`r`n`"$($exe.Replace('%', '%%'))`" %*`r`nexit /b %ERRORLEVEL%`r`n") }
-    catch { Fail "$exe cannot be written to a batch launcher in code page $($encoding.CodePage); choose an install root and prefix representable in it" }
+    $launcherBytes = $launcherEncoding.GetBytes("@echo off`r`nchcp 65001 >nul`r`n`"$($exe.Replace('%', '%%'))`" %*`r`nexit /b %ERRORLEVEL%`r`n")
 
     New-Item -ItemType Directory -Path $BinDir -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $InstallRoot "versions") -Force | Out-Null

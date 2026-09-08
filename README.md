@@ -24,6 +24,25 @@
 > separately published binaries; not code-signed. Official `curl \| x.ai/cli`
 > installers do **not** include LHC and must not be run over a fork install.
 >
+> What the fork changes for you, beyond the long-horizon views:
+>
+> - **Compaction stays clean.** Each context compaction serves a compact
+>   generated summary; that summary is no longer re-recorded into the transcript,
+>   so repeated compactions do not pile up duplicated context or phantom tool calls.
+> - **Long tasks can shrink mid-task.** Once a long stretch of tool work reaches
+>   half the full-fidelity budget, the transcript is segmented at the next
+>   complete tool exchange, so compaction has a cut point without waiting for the
+>   task to end. Limitation: a task cancelled right after a segment boundary
+>   records its cancellation on an empty segment.
+> - **Side-by-side, self-updating installs.** `grok-lhc` keeps its own managed
+>   store and updates itself (`grok-lhc update`, or automatically when
+>   `auto_update` is on) without touching a stock `grok` or its updater, on
+>   Linux x86-64, macOS Apple Silicon, and Windows x86-64. Limitations:
+>   binaries are unsigned; an install from before the shared-source releases
+>   must be re-run through the installer once; the shared `~/.grok` updater key
+>   left by an older fork install is a manual correction. Details:
+>   [Install & use](lhc-docs/INSTALL.md).
+>
 > Everything below is upstream's README.
 
 <div align="center">

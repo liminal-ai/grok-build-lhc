@@ -8,9 +8,10 @@ $ErrorActionPreference = "Stop"
 
 $installer = Join-Path $PSScriptRoot "install.ps1"
 $tempBase = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [System.IO.Path]::GetTempPath() }
-# The whole fixture lives under a non-ASCII path (u-umlaut, U+00FC) so the launcher,
-# receipts, junction, and download server all carry it; the code point keeps this file ASCII.
-$root = Join-Path $tempBase "grok-lhc-install-test-$([char]0x00FC)-$([guid]::NewGuid())"
+# The whole fixture lives under a Unicode path beyond any single OEM code page
+# (u-umlaut U+00FC and U+6F22) so the launcher, receipts, junction, and download
+# server all carry it; the code points keep this file ASCII.
+$root = Join-Path $tempBase "grok-lhc-install-test-$([char]0x00FC)$([char]0x6F22)-$([guid]::NewGuid())"
 $platform = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "windows-aarch64" } else { "windows-x86_64" }
 $fixture = "$env:SystemRoot\System32\where.exe"
 $server = $null
@@ -58,10 +59,10 @@ try {
     $viaCurrent = (Get-FileHash (Join-Path $store "current\bin\grok.exe") -Algorithm SHA256).Hash
     $viaVersion = (Get-FileHash (Join-Path $store "versions\1.0.16\bin\grok.exe") -Algorithm SHA256).Hash
     Check ($viaCurrent -eq $viaVersion) "current\bin\grok.exe resolves to versions\1.0.16"
-    $oem = [System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage
-    $launcherText = [System.Text.Encoding]::GetEncoding($oem).GetString([System.IO.File]::ReadAllBytes($launcher))
-    Check ($launcherText.Contains("`"$store\current\bin\grok.exe`" %*")) "launcher carries the non-ASCII store path in OEM code page $oem"
-    Check (-not $launcherText.Contains("?")) "launcher path has no replacement characters"
+    $launcherBytes = [System.IO.File]::ReadAllBytes($launcher)
+    Check ($launcherBytes[0] -eq 0x40) "launcher has no BOM (starts with @echo off)"
+    $launcherText = (New-Object System.Text.UTF8Encoding($false, $true)).GetString($launcherBytes)
+    Check ($launcherText.Contains("`r`nchcp 65001 >nul`r`n`"$store\current\bin\grok.exe`" %*`r`n")) "launcher switches to UTF-8 and carries the Unicode store path intact"
     & $launcher /Q cmd.exe | Out-Null
     Check ($LASTEXITCODE -eq 0) "launcher forwards arguments (where /Q cmd.exe -> 0)"
     & $launcher /Q definitely-not-a-program-$([guid]::NewGuid()) | Out-Null
