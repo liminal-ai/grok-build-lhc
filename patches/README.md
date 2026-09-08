@@ -13,8 +13,10 @@ apply the patch -> `scripts/check-lhc-hooks.sh`. The full drill is in
 
 ## Model: ONE state diff from ONE recorded base
 
-- `BASE` — the upstream commit the diff was generated against (always the
-  `main` == `upstream/main` of the last sync).
+- `BASE` — the upstream commit the diff was generated against: the
+  `upstream/main` tip taken in by the last sync. It is a recorded fact of
+  the fork, not a branch; no local branch layout is consulted. (`origin/main`
+  and `origin/lhc` both carry the product tree — neither is the base.)
 - `0001-lhc-touchpoints.patch` — `git diff` of every fork-owned core-file
   delta, path list derived (see below).
 
@@ -39,18 +41,27 @@ the touchpoints as one commit.
 
 ## Regenerating (after any hook change; after every sync)
 
-    git rev-parse main > patches/BASE
-    git diff main..HEAD \
-      -- $(git diff --name-only main -- crates/codegen/ Cargo.toml | tr '\n' ' ') \
-      > patches/0001-lhc-touchpoints.patch
+Commit the source change first, then:
 
-**`main` must already be fast-forwarded to `upstream/main`** (sync drill
-step 4) so BASE records the actual current base.
+    scripts/refresh-lhc-patch.sh   # git diff $(cat patches/BASE) HEAD -- crates/codegen/ Cargo.toml
+    git add patches/0001-lhc-touchpoints.patch && git commit
 
-**The path list is DERIVED, never hand-maintained.** That `$( )` is the
-whole point: the invariant this file used to merely assert — "the list must
-equal `git diff --name-only main -- crates/codegen/ Cargo.toml`" — is
-structurally guaranteed instead of checked. It broke silently twice while
+The script reads `BASE`, diffs it against the **committed** HEAD over the
+fixed scope, and writes the one patch file. It never writes `BASE` and never
+stages anything. An empty diff is an empty file — ordinary `git diff`
+output, nothing special-cased.
+
+**`BASE` moves only in an upstream sync** (FORK.md "Sync drill" step 6):
+write the merged `upstream/main` commit into `patches/BASE` by hand in the
+sync commit, then refresh. Never rewrite `BASE` as part of a routine
+refresh, and never derive it from a local branch — that is how the recorded
+base drifted to "whatever a developer's `main` was".
+
+**The path list is DERIVED, never hand-maintained.** The scope is the two
+pathspecs, so the file list is whatever differs under them — the invariant
+this file used to merely assert ("the list must equal
+`git diff --name-only BASE -- crates/codegen/ Cargo.toml`") is structurally
+guaranteed instead of checked. It broke silently twice while
 hand-maintained (dropped five touchpoints after Chunk 2; dropped the root
 `Cargo.toml` workspace entry by regenerating a single commit).
 
@@ -58,7 +69,18 @@ hand-maintained (dropped five touchpoints after Chunk 2; dropped the root
 - `crates/lhc/**` — fork-owned; the drill re-adds that directory wholesale
   (submodule + adapter), so patching it would be redundant and enormous.
 - `Cargo.lock` — regenerate with `cargo check` after applying.
-- `FORK.md`, `patches/`, `scripts/check-lhc-hooks.sh` — fork-owned, copied.
+- `FORK.md`, `patches/`, `scripts/**`, `lhc-docs/**`, `.github/workflows/**`,
+  `.gitignore`, `.gitmodules` — fork-owned, copied whole in recovery.
+- Root `README.md` — only the fork banner differs; re-asserted by hand at
+  every sync (FORK.md "Sync drill" step 3), not patched.
+
+**Known fork delta outside the scope, deliberately not covered (slice 2
+finding, 2026-09-08):** `crates/build/xai-proto-build/src/lib.rs` (+132/-35
+vs BASE) — Windows-safe protoc dependency handling from the 2026-08 sync
+line (`a4650096`, `18277e97`, `33385ce5`). It carries no `LHC-HOOK` marker
+and is not an LHC touchpoint; the recovery drill would not restore it.
+Left as-is for a later slice to decide (upstream it, or widen scope
+deliberately); do not add it to the pathspecs silently.
 
 ## Upstream files added by slice 1A (2026-09-08)
 
@@ -72,7 +94,9 @@ conflicts only if upstream touches that struct or those literals.
 
 ## Verifying
 
-Rehearse the drill: worktree (or fresh clone) at raw `upstream/main`,
-`git apply --3way` the patch, then assert the sentinel count (10/10
-`LHC-HOOK` markers) and the root `Cargo.toml` workspace entry. Rehearsed
-green 2026-08-06 against `a5589e9`.
+Rehearse the drill: disposable worktree at the commit named in
+`patches/BASE`, `git apply --3way` the patch, then assert the covered paths
+match the candidate (`git diff <candidate> -- crates/codegen/ Cargo.toml`
+empty in that worktree), the sentinel count (10/10 `LHC-HOOK` markers), and
+the root `Cargo.toml` workspace entry. Rehearsed green 2026-08-06 against
+`a5589e9`; 2026-09-08 (slice 2) against `72a61251` from `d3bd799c`.

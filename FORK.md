@@ -12,7 +12,9 @@ Fork of [`xai-org/grok-build`](https://github.com/xai-org/grok-build) adding
 Context): event-sourced capture of every session into a per-thread SQLite
 record, with banded compaction replacing native auto-compact — full history
 preserved and rebuildable at full fidelity. Working branch and default
-branch: `lhc`. `main` tracks upstream, untouched.
+branch: `lhc` (the product; `origin/main` is kept equal to it). The upstream
+base is the remote `upstream/main` and is recorded in `patches/BASE`; no
+local branch stands in for it.
 
 Status: **Chunk 3B live certification run 2026-09-04** on the installed v0.3.0
 (L1–L4, L6 PASS; L2 kill/recovery PASS; mid-turn, image and t3code drills PASS;
@@ -87,7 +89,8 @@ reset recovery restores the slash/config wiring.
 Rules: hooks are 1–5 line additive insertions marked
 `// LHC-HOOK <n>/<total>: <purpose>`; the sentinel total in
 `scripts/check-lhc-hooks.sh` and this table change in the same commit as any
-hook; each hook is regenerated into `patches/` after commit (Lee). Patch
+hook; after the hook commit, `scripts/refresh-lhc-patch.sh` regenerates the
+patch from `patches/BASE` and the patch is committed on its own. Patch
 `0001` currently covers only the Chunk 1 hooks — do not claim it covers 4–9.
 
 Schema v5 G1 carve-out (hooks 7–9): `xai-chat-state` stashes the last model
@@ -508,14 +511,17 @@ durable representation of the fork.
    restore it from the previous `lhc` tip. `lhc-docs/**` and `FORK.md` are
    fork-only; they should not conflict with upstream.
 4. `scripts/check-lhc-hooks.sh` — all layers green.
-5. Fast-forward `main` to `upstream/main`.
+5. (No local `main` step. `origin/main` is pushed equal to `lhc` in step 7;
+   it is not the upstream base and nothing derives from it.)
 6. **Advance the patch base.** `patches/BASE` names the upstream commit the
-   state diff is generated from; a merge moves the tree past it. Rewrite
-   `BASE` with the new `main` and regenerate `0001-lhc-touchpoints.patch`
-   (`patches/README.md`). This step is **part of the sync**, not cleanup
-   after it — the codex-lhc fork learned this the hard way (its `patch-repro`
-   gate failed at the first real sync for exactly this omission).
-7. Push both branches.
+   state diff is generated from; a merge moves the tree past it. Write the
+   merged upstream tip (`git rev-parse upstream/main`) into `patches/BASE`
+   by hand, then run `scripts/refresh-lhc-patch.sh` and commit both
+   (`patches/README.md`). This is the only time `BASE` changes. This step is
+   **part of the sync**, not cleanup after it — the codex-lhc fork learned
+   this the hard way (its `patch-repro` gate failed at the first real sync
+   for exactly this omission).
+7. Push `lhc` and `main` (both at the product tip).
 8. Sync commit body records: upstream range, tripwire results, smoke verdict,
    and whether the README banner was re-applied. Append an entry to the Sync
    record section above.
@@ -527,8 +533,8 @@ implausibly large, upstream reset. Do not merge. Instead:
 
 1. Fresh clone of new upstream; branch `lhc` from its tip.
 2. Copy `crates/lhc/` (or re-add the submodule + adapter), `patches/`,
-   `scripts/check-lhc-hooks.sh`, `FORK.md` from the old tree — these are
-   fork-owned, upstream never touches them.
+   `scripts/` (tripwire + patch refresh), `FORK.md` from the old tree — these
+   are fork-owned, upstream never touches them.
 3. `git apply --3way patches/0001-lhc-touchpoints.patch` — one state diff
    from `patches/BASE` (model changed 2026-08-06; see patches/README.md).
 4. `scripts/check-lhc-hooks.sh` — green means the fork is whole.
