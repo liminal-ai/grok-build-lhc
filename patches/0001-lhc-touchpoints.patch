@@ -6246,8 +6246,35 @@ index c43ce4bc..c81fac32 100644
  use crate::upload::trace::{ArchiveBuildFault, set_archive_build_fault, spawn_upload_queue};
  #[tokio::test(flavor = "current_thread")]
  #[serial_test::serial(archive_build_fault)]
+diff --git a/crates/codegen/xai-grok-update/Cargo.toml b/crates/codegen/xai-grok-update/Cargo.toml
+index d0e3d849..86ef368e 100644
+--- a/crates/codegen/xai-grok-update/Cargo.toml
++++ b/crates/codegen/xai-grok-update/Cargo.toml
+@@ -5,6 +5,7 @@ version = "0.1.220-alpha.4"
+ edition.workspace = true
+ 
+ [dependencies]
++sha2 = { workspace = true }
+ dunce = { workspace = true }
+ anyhow = { workspace = true }
+ futures = { workspace = true }
+@@ -30,7 +31,14 @@ zstd = { workspace = true }
+ [target.'cfg(target_os = "macos")'.dependencies]
+ libc = { workspace = true }
+ 
++[features]
++# Fork (test-only seam): lets tests route the updater through upstream's stock
++# installer kinds via `GROK_INSTALLER` and pin the managed-store lookup via
++# `GROK_LHC_TEST_EXE`. Never enabled in a shipping build.
++lhc-test-seams = []
++
+ [dev-dependencies]
++xai-grok-update = { path = ".", features = ["lhc-test-seams"] }
+ semver = { workspace = true }
+ serde_json = { workspace = true }
+ serial_test = { workspace = true }
 diff --git a/crates/codegen/xai-grok-update/src/auto_update.rs b/crates/codegen/xai-grok-update/src/auto_update.rs
-index 7a391e7e..90cbedc5 100644
+index 7a391e7e..92807bc7 100644
 --- a/crates/codegen/xai-grok-update/src/auto_update.rs
 +++ b/crates/codegen/xai-grok-update/src/auto_update.rs
 @@ -10,6 +10,7 @@ use futures::StreamExt;
@@ -6363,21 +6390,42 @@ index 7a391e7e..90cbedc5 100644
      heal_managed_install(installer).await;
      let allow_downgrade = installer_allows_downgrade(installer);
      let policy = config::VersionPolicy::resolve();
-@@ -405,9 +405,10 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
-         return Ok(outcome);
+@@ -406,8 +406,9 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
      };
  
--    let effective_current =
+     let effective_current =
 -        disk_version_for_installer(installer).unwrap_or_else(get_installed_grok_version);
 -    if needs_update(
-+    let effective_current = disk_version_for_installer(installer)
-+        .unwrap_or_else(|| running_version_for(installer));
++        disk_version_for_installer(installer).unwrap_or_else(|| running_version_for(installer));
 +    if needs_update_for(
 +        installer,
          &effective_current,
          &target,
          &update_config.channel,
-@@ -451,6 +452,8 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
+@@ -431,13 +432,18 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
+ 
+     // Relaunch when the running binary differs from what's on disk in the channel's update direction
+     // This covers binaries installed by other processes, not just the install above
+-    let running = get_installed_grok_version();
++    let running = running_version_for(installer);
+     if let Some(disk_now) =
+         disk_version_for_installer(installer).or_else(|| outcome.installed.clone())
+     {
+-        outcome.relaunch_needed =
+-            needs_update(&running, &disk_now, &update_config.channel, allow_downgrade)
+-                .unwrap_or(false);
++        outcome.relaunch_needed = needs_update_for(
++            installer,
++            &running,
++            &disk_now,
++            &update_config.channel,
++            allow_downgrade,
++        )
++        .unwrap_or(false);
+     }
+     Ok(outcome)
+ }
+@@ -451,6 +457,8 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
  /// Unknown installers are treated like npm (no trustworthy disk version).
  fn disk_version_for_installer(installer: &str) -> Option<String> {
      match installer {
@@ -6386,20 +6434,23 @@ index 7a391e7e..90cbedc5 100644
          "internal" | "gh-release" => crate::version::installed_on_disk_version(),
          _ => None,
      }
-@@ -478,6 +481,12 @@ fn env_installer() -> Option<&'static str> {
+@@ -478,6 +486,15 @@ fn env_installer() -> Option<&'static str> {
  }
  
  pub async fn get_installer() -> Option<&'static str> {
-+    // Fork: this binary is always an LHC build. Without an explicit `GROK_INSTALLER`
-+    // override (tests) it classifies itself by its managed store and never by the
-+    // shared `[cli].installer` key, so stock's selection is neither read nor written.
-+    if std::env::var_os("GROK_INSTALLER").is_none() {
++    // Fork: this binary is always an LHC build. It classifies itself by its managed
++    // store and never by `GROK_INSTALLER`, `GROK_MANAGED_BY_*`, or the shared
++    // `[cli].installer` key, so stock's selection is neither read nor written and no
++    // environment can route it to npm/CDN/gh-release destinations. Upstream's
++    // classification below stays reachable only for the crate's own tests
++    // (`lhc-test-seams`), which exercise the stock decision paths through it.
++    if !cfg!(feature = "lhc-test-seams") || std::env::var_os("GROK_INSTALLER").is_none() {
 +        return Some(crate::lhc_release::installer_kind());
 +    }
      if let Some(i) = env_installer() {
          return Some(i);
      }
-@@ -505,6 +514,21 @@ fn is_under_node_modules(exe: &std::path::Path) -> bool {
+@@ -505,6 +522,21 @@ fn is_under_node_modules(exe: &std::path::Path) -> bool {
      exe.components().any(|c| c.as_os_str() == "node_modules")
  }
  
@@ -6421,7 +6472,7 @@ index 7a391e7e..90cbedc5 100644
  fn needs_update(current: &str, target: &str, channel: &str, allow_downgrade: bool) -> Option<bool> {
      let current = semver::Version::parse(current).ok()?;
      let target = semver::Version::parse(target).ok()?;
-@@ -582,6 +606,9 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
+@@ -582,6 +614,9 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
      let Some(installer) = get_installer().await else {
          return BackgroundUpdateCheck::none();
      };
@@ -6431,7 +6482,7 @@ index 7a391e7e..90cbedc5 100644
  
      heal_managed_install(installer).await;
  
-@@ -594,7 +621,7 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
+@@ -594,7 +629,7 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
          return BackgroundUpdateCheck::none();
      }
  
@@ -6440,7 +6491,7 @@ index 7a391e7e..90cbedc5 100644
      let policy = config::VersionPolicy::resolve();
      let target_version = match fetch_update_plan(installer, update_config, &policy).await {
          Ok(UpdatePlan::Install { target, .. }) => target,
-@@ -604,7 +631,8 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
+@@ -604,7 +639,8 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
      };
  
      let allow_downgrade = installer_allows_downgrade(installer);
@@ -6450,7 +6501,7 @@ index 7a391e7e..90cbedc5 100644
          &current_version,
          &target_version,
          &update_config.channel,
-@@ -671,6 +699,10 @@ pub async fn run_update_if_available(
+@@ -671,6 +707,10 @@ pub async fn run_update_if_available(
          return Ok(false);
      };
  
@@ -6461,7 +6512,7 @@ index 7a391e7e..90cbedc5 100644
      heal_managed_install(inst).await;
  
      if is_version_cache_fresh().await {
-@@ -684,9 +716,11 @@ pub async fn run_update_if_available(
+@@ -684,9 +724,11 @@ pub async fn run_update_if_available(
      }
  
      // Resolve effective auto_update: None defaults to true (first-run).
@@ -6474,7 +6525,7 @@ index 7a391e7e..90cbedc5 100644
          && let Err(e) = config::update_config(|st| {
              if st.cli.auto_update.is_none() {
                  st.cli.auto_update = Some(true);
-@@ -697,7 +731,7 @@ pub async fn run_update_if_available(
+@@ -697,7 +739,7 @@ pub async fn run_update_if_available(
          tracing::warn!("Failed to save auto-update setting: {}", e);
      }
  
@@ -6483,7 +6534,7 @@ index 7a391e7e..90cbedc5 100644
      let policy = config::VersionPolicy::resolve();
      // Don't write version.json here
      // Only cache after confirming no update is needed or after a successful install
-@@ -706,7 +740,8 @@ pub async fn run_update_if_available(
+@@ -706,7 +748,8 @@ pub async fn run_update_if_available(
          Ok(UpdatePlan::Install { target, .. }) => target,
          Ok(UpdatePlan::Skip { .. } | UpdatePlan::Unavailable { .. }) | Err(_) => return Ok(false),
      };
@@ -6493,30 +6544,28 @@ index 7a391e7e..90cbedc5 100644
          &current_version,
          &latest_version,
          &update_config.channel,
-@@ -851,6 +886,11 @@ async fn run_update_subcommand(
+@@ -851,6 +894,11 @@ async fn run_update_subcommand(
  /// `current_exe()` resolves symlinks via `/proc/self/exe` (see proc(5)), so it returns the old versioned target after a symlink swap.
  /// Prefer `~/.grok/bin/grok` which always points to the latest version.
  fn resolve_restart_exe() -> Result<std::path::PathBuf> {
 +    // Fork: a managed LHC install restarts from its own store, never from `~/.grok/bin/grok`
 +    // (which may be a stock install living side by side).
-+    if let Some(exe) = crate::lhc_release::managed_install().and_then(|m| managed_restart_exe(&m)) {
-+        return Ok(exe);
++    if let Some(managed) = crate::lhc_release::managed_install() {
++        return Ok(managed_restart_exe(&managed));
 +    }
      let canonical = grok_application();
      if canonical.exists() {
          return Ok(canonical);
-@@ -902,8 +942,8 @@ pub async fn run_install_script(
-     trigger: CliUpdateTrigger,
+@@ -903,7 +951,7 @@ pub async fn run_install_script(
  ) -> Result<()> {
      // What's on disk is being replaced, not this (possibly stale) process's version; npm has no trustworthy disk version, so it falls back
--    let from_version =
+     let from_version =
 -        disk_version_for_installer(installer).unwrap_or_else(get_installed_grok_version);
-+    let from_version = disk_version_for_installer(installer)
-+        .unwrap_or_else(|| running_version_for(installer));
++        disk_version_for_installer(installer).unwrap_or_else(|| running_version_for(installer));
      let started = Instant::now();
      // Internal reports the version it actually activated; npm/gh-release resolve their own artifact, so the requested target stands in
      let result: Result<Option<String>> = match installer {
-@@ -914,6 +954,11 @@ pub async fn run_install_script(
+@@ -914,6 +962,11 @@ pub async fn run_install_script(
          )
          .map(|()| None),
          "gh-release" => install_gh_release(target).await.map(|()| None),
@@ -6528,7 +6577,7 @@ index 7a391e7e..90cbedc5 100644
          _ => install_internal(target, update_config).await.map(Some),
      };
      // Measured before the success-only cache sweep, so the sweep cannot inflate success durations
-@@ -950,6 +995,70 @@ pub async fn run_install_script(
+@@ -950,6 +1003,68 @@ pub async fn run_install_script(
      })
  }
  
@@ -6568,16 +6617,14 @@ index 7a391e7e..90cbedc5 100644
 +}
 +
 +/// The binary a managed LHC install relaunches after an update: the store's activated
-+/// binary, or `None` when it is missing (caller falls back to upstream's rule).
-+fn managed_restart_exe(
-+    managed: &crate::lhc_release::LhcManagedInstall,
-+) -> Option<std::path::PathBuf> {
-+    let current = managed.current_bin();
-+    current.exists().then_some(current)
++/// binary. Always the store, even if the path is missing at that instant; the exec
++/// then fails and reports it, rather than switching products to `~/.grok/bin/grok`.
++fn managed_restart_exe(managed: &crate::lhc_release::LhcManagedInstall) -> std::path::PathBuf {
++    managed.current_bin()
 +}
 +
 +/// Install `target` (or the latest fork release) into the running executable's managed
-+/// store by launching the embedded shell installer. Returns the activated release.
++/// store by launching that release's own installer. Returns the activated release.
 +async fn install_lhc_managed(target: Option<&str>) -> Result<String> {
 +    let Some(managed) = crate::lhc_release::managed_install() else {
 +        anyhow::bail!("{}", crate::lhc_release::managed_installer_guidance());
@@ -6599,7 +6646,7 @@ index 7a391e7e..90cbedc5 100644
  /// Detect the platform (os, arch) to download binaries for.
  ///
  /// Arch is the compile-time arch with one correction: an x86_64 build on an Apple Silicon host (Rosetta) selects `aarch64`.
-@@ -2612,9 +2721,13 @@ pub async fn run_update(
+@@ -2612,9 +2727,13 @@ pub async fn run_update(
              return Ok(None);
          }
      };
@@ -6615,7 +6662,7 @@ index 7a391e7e..90cbedc5 100644
          let _ = config::update_config(|st| {
              st.cli.installer = Some(installer.to_string());
          })
-@@ -2623,7 +2736,7 @@ pub async fn run_update(
+@@ -2623,7 +2742,7 @@ pub async fn run_update(
  
      heal_managed_install(installer).await;
  
@@ -6624,7 +6671,7 @@ index 7a391e7e..90cbedc5 100644
      let policy = config::VersionPolicy::resolve();
  
      // When --version is given, skip the latest-version check and install directly
-@@ -2638,10 +2751,11 @@ pub async fn run_update(
+@@ -2638,10 +2757,11 @@ pub async fn run_update(
          eprintln!();
          run_install_script(installer, Some(version), update_config, trigger).await?;
          refresh_deployment_config().await;
@@ -6640,7 +6687,7 @@ index 7a391e7e..90cbedc5 100644
          {
              tracing::warn!("Failed to persist auto_update=false for pinned install: {e}");
          }
-@@ -2696,7 +2810,8 @@ pub async fn run_update(
+@@ -2696,7 +2816,8 @@ pub async fn run_update(
          disk_version_for_installer(installer).unwrap_or_else(|| current_version.clone());
  
      if !force {
@@ -6650,7 +6697,7 @@ index 7a391e7e..90cbedc5 100644
              &effective_current,
              &install_target,
              &update_config.channel,
-@@ -2746,7 +2861,8 @@ pub async fn run_update(
+@@ -2746,7 +2867,8 @@ pub async fn run_update(
      }
  
      let target_version = if force
@@ -6661,7 +6708,7 @@ index 7a391e7e..90cbedc5 100644
              &install_target,
              &update_config.channel,
 diff --git a/crates/codegen/xai-grok-update/src/auto_update_tests.rs b/crates/codegen/xai-grok-update/src/auto_update_tests.rs
-index 8b7c58cf..35a971f3 100644
+index 8b7c58cf..f505be06 100644
 --- a/crates/codegen/xai-grok-update/src/auto_update_tests.rs
 +++ b/crates/codegen/xai-grok-update/src/auto_update_tests.rs
 @@ -934,76 +934,70 @@ fn test_reinstall_hint_gh_release_mentions_gh_command() {
@@ -6777,7 +6824,7 @@ index 8b7c58cf..35a971f3 100644
          );
      }
  }
-@@ -2439,3 +2433,184 @@ fn npm_entry_is_recognized_by_the_binary_location() {
+@@ -2439,3 +2433,456 @@ fn npm_entry_is_recognized_by_the_binary_location() {
      assert!(super::is_under_node_modules(&resolved));
      assert!(!super::is_under_node_modules(&root.join("home/bin/grok")));
  }
@@ -6900,42 +6947,54 @@ index 8b7c58cf..35a971f3 100644
 +    assert_eq!(disk_version_for_installer(INSTALLER_LHC_UNMANAGED), None);
 +}
 +
-+/// The fork compares its embedded release, never the shared native base.
++/// The fork compares its own release identity, never the shared native base.
 +#[test]
 +fn lhc_running_version_is_the_fork_release() {
 +    use crate::lhc_release::{INSTALLER_LHC_MANAGED, INSTALLER_LHC_UNMANAGED, LHC_RELEASE_VERSION};
-+    assert_eq!(running_version_for(INSTALLER_LHC_MANAGED), LHC_RELEASE_VERSION);
-+    assert_eq!(running_version_for(INSTALLER_LHC_UNMANAGED), LHC_RELEASE_VERSION);
-+    assert_eq!(running_version_for("internal"), get_installed_grok_version());
++    assert_eq!(
++        running_version_for(INSTALLER_LHC_MANAGED),
++        LHC_RELEASE_VERSION
++    );
++    assert_eq!(
++        running_version_for(INSTALLER_LHC_UNMANAGED),
++        LHC_RELEASE_VERSION
++    );
++    assert_eq!(
++        running_version_for("internal"),
++        get_installed_grok_version()
++    );
 +    // A build at fork revision N must not see its own base as "newer".
 +    assert_eq!(
-+        needs_update_for(INSTALLER_LHC_MANAGED, "1.0.16-lhc.1", "1.0.16-lhc.1", "stable", false),
++        needs_update_for(
++            INSTALLER_LHC_MANAGED,
++            "1.0.16-lhc.1",
++            "1.0.16-lhc.1",
++            "stable",
++            false
++        ),
 +        Some(false)
 +    );
 +}
 +
-+/// Restart resolves the store's activated binary, not `~/.grok/bin/grok`.
++/// Restart resolves the store's activated binary, not `~/.grok/bin/grok`, whether or
++/// not that path exists at the moment (a missing store binary fails the exec and is
++/// reported; it never switches products).
 +#[test]
 +fn lhc_managed_restart_uses_the_store_current_binary() {
 +    let tmp = tempfile::tempdir().unwrap();
 +    let store = tmp.path().join("grok-lhc");
-+    std::fs::create_dir_all(store.join("current").join("bin")).unwrap();
 +    let managed = crate::lhc_release::LhcManagedInstall {
 +        store: store.clone(),
 +        release: "1.0.16".into(),
 +        name: "grok".into(),
 +    };
-+    assert_eq!(
-+        managed_restart_exe(&managed),
-+        None,
-+        "missing current binary falls back"
-+    );
 +    let bin = if cfg!(windows) { "grok.exe" } else { "grok" };
-+    std::fs::write(store.join("current").join("bin").join(bin), b"bin").unwrap();
-+    assert_eq!(
-+        managed_restart_exe(&managed),
-+        Some(store.join("current").join("bin").join(bin))
-+    );
++    let expected = store.join("current").join("bin").join(bin);
++    assert!(!expected.exists());
++    assert_eq!(managed_restart_exe(&managed), expected);
++    std::fs::create_dir_all(expected.parent().unwrap()).unwrap();
++    std::fs::write(&expected, b"bin").unwrap();
++    assert_eq!(managed_restart_exe(&managed), expected);
 +}
 +
 +/// An LHC build outside a managed store never falls through to npm/CDN or `~/.grok/bin`.
@@ -6962,12 +7021,272 @@ index 8b7c58cf..35a971f3 100644
 +    .unwrap_err();
 +    assert!(err.to_string().contains("install.sh --download"), "{err}");
 +}
++
++/// Fixture: a managed store whose activated release is `release`, presented as the
++/// running executable via the crate's test seam, with a loopback release server.
++#[cfg(unix)]
++mod lhc_decisions {
++    use super::*;
++    use crate::lhc_release::{
++        INSTALLER_ASSET, INSTALLER_LHC_MANAGED, LHC_RELEASE_BASE_ENV, LHC_TEST_EXE_ENV, sha256_hex,
++    };
++    use wiremock::matchers::{method, path};
++    use wiremock::{Mock, MockServer, ResponseTemplate};
++
++    fn host_platform() -> Option<&'static str> {
++        match (std::env::consts::OS, std::env::consts::ARCH) {
++            ("linux", "x86_64") => Some("linux-x86_64"),
++            ("linux", "aarch64") => Some("linux-aarch64"),
++            ("macos", "x86_64") => Some("darwin-x86_64"),
++            ("macos", "aarch64") => Some("darwin-aarch64"),
++            _ => None,
++        }
++    }
++
++    fn update_config() -> UpdateConfig {
++        UpdateConfig {
++            proxy_base_url: String::new(),
++            auth_scope: String::new(),
++            deployment_key: None,
++            alpha_test_key: None,
++            channel: "stable".into(),
++            npm_registry: None,
++        }
++    }
++
++    struct Fixture {
++        _tmp: tempfile::TempDir,
++        store: std::path::PathBuf,
++        server: MockServer,
++    }
++
++    impl Fixture {
++        /// Store at `installed` (receipt + activated binary), server advertising `latest`
++        /// with a real downloadable release behind it.
++        async fn new(installed: &str, latest: &str) -> Self {
++            let tmp = tempfile::tempdir().unwrap();
++            let store = tmp.path().join("grok-lhc");
++            let bin = store.join("versions").join(installed).join("bin");
++            std::fs::create_dir_all(&bin).unwrap();
++            std::fs::write(bin.join("grok"), b"binary").unwrap();
++            std::os::unix::fs::symlink(
++                store.join("versions").join(installed),
++                store.join("current"),
++            )
++            .unwrap();
++            std::fs::write(store.join(".grok-lhc-managed"), b"managed\n").unwrap();
++            std::fs::write(store.join("installed-name"), b"grok-lhc\n").unwrap();
++            std::fs::write(store.join("installed-version"), format!("{installed}\n")).unwrap();
++            let prefix = tmp.path().join("prefix");
++            std::fs::create_dir_all(prefix.join("bin")).unwrap();
++            std::os::unix::fs::symlink(store.join("current/bin/grok"), prefix.join("bin/grok-lhc"))
++                .unwrap();
++            std::fs::write(
++                store.join("installed-prefix"),
++                format!("{}\n", prefix.display()),
++            )
++            .unwrap();
++            // One grok home for the whole process: the resolved home is cached after
++            // first use, so a per-fixture directory would go stale. Config is rewritten
++            // per fixture. C1: the converge/background paths run only when opted in.
++            static HOME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
++            let home = HOME
++                .get_or_init(|| tempfile::tempdir().unwrap().keep().join("dotgrok"))
++                .clone();
++            std::fs::create_dir_all(&home).unwrap();
++            std::fs::write(home.join("config.toml"), "[cli]\nauto_update = true\n").unwrap();
++
++            let server = MockServer::start().await;
++            Mock::given(method("GET"))
++                .and(path("/latest"))
++                .respond_with(
++                    ResponseTemplate::new(200)
++                        .set_body_json(serde_json::json!({"tag_name": format!("v{latest}")})),
++                )
++                .mount(&server)
++                .await;
++            let asset_name = format!("grok-{latest}-{}", host_platform().unwrap());
++            let body = b"#!/bin/sh\nprintf 'updated\\n'\n".to_vec();
++            let installer = std::fs::read(
++                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
++                    .join("../../../scripts/grok-lhc-release/install.sh"),
++            )
++            .unwrap();
++            let sums = format!(
++                "{}  {asset_name}\n{}  {INSTALLER_ASSET}\n",
++                sha256_hex(&body),
++                sha256_hex(&installer)
++            );
++            let manifest =
++                format!("{{\"product\": \"grok-lhc\", \"release_version\": \"{latest}\"}}\n");
++            for (name, bytes) in [
++                ("SHA256SUMS", sums.into_bytes()),
++                ("release-manifest.json", manifest.into_bytes()),
++                (asset_name.as_str(), body),
++                (INSTALLER_ASSET, installer),
++            ] {
++                Mock::given(method("GET"))
++                    .and(path(format!("/download/v{latest}/{name}")))
++                    .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
++                    .mount(&server)
++                    .await;
++            }
++            // SAFETY: serial tests; cleared in `Drop`.
++            unsafe {
++                std::env::set_var(LHC_TEST_EXE_ENV, prefix.join("bin/grok-lhc"));
++                std::env::set_var(LHC_RELEASE_BASE_ENV, server.uri());
++                std::env::set_var("GROK_CLI_BASE_URL", server.uri());
++                std::env::set_var("GROK_HOME", &home);
++            }
++            Self {
++                _tmp: tmp,
++                store,
++                server,
++            }
++        }
++
++        fn disk_release(&self) -> String {
++            std::fs::read_to_string(self.store.join("installed-version"))
++                .unwrap()
++                .trim()
++                .to_string()
++        }
++
++        async fn downloads(&self) -> usize {
++            self.server
++                .received_requests()
++                .await
++                .unwrap()
++                .iter()
++                .filter(|r| r.url.path().starts_with("/download/"))
++                .count()
++        }
++    }
++
++    impl Drop for Fixture {
++        fn drop(&mut self) {
++            // SAFETY: serial tests.
++            unsafe {
++                std::env::remove_var(LHC_TEST_EXE_ENV);
++                std::env::remove_var(LHC_RELEASE_BASE_ENV);
++                std::env::remove_var("GROK_CLI_BASE_URL");
++                std::env::remove_var("GROK_HOME");
++            }
++        }
++    }
++
++    /// `update --check` compares the running fork release (the embedded identity, here
++    /// revision 0 of the base) with the published one through the real status path.
++    #[tokio::test]
++    #[serial_test::serial]
++    async fn check_status_same_fork_revision_is_current_later_is_an_update() {
++        let base = crate::lhc_release::LHC_RELEASE_VERSION;
++        let fx = Fixture::new(base, base).await;
++        let status = check_update_status(&update_config()).await;
++        assert_eq!(status.installer.as_deref(), Some(INSTALLER_LHC_MANAGED));
++        assert_eq!(status.current_version, base);
++        assert_eq!(status.latest_version.as_deref(), Some(base));
++        assert!(!status.update_available, "{status:?}");
++        assert_eq!(status.error, None);
++        drop(fx);
++
++        let later = format!("{base}-lhc.1");
++        let fx = Fixture::new(base, &later).await;
++        let status = check_update_status(&update_config()).await;
++        assert_eq!(status.current_version, base);
++        assert_eq!(status.latest_version.as_deref(), Some(later.as_str()));
++        assert!(status.update_available, "{status:?}");
++        assert_eq!(status.error, None);
++        drop(fx);
++    }
++
++    /// The converge path (leader / background) decides on the store's receipt, not the
++    /// native base: a store already at the published revision installs nothing, a
++    /// store behind it runs the release installer and activates the target.
++    #[tokio::test]
++    #[serial_test::serial]
++    async fn converge_uses_the_store_receipt_and_installs_only_a_later_revision() {
++        let base = crate::lhc_release::LHC_RELEASE_VERSION;
++        let later = format!("{base}-lhc.1");
++        let fx = Fixture::new(&later, &later).await;
++        let outcome = ensure_latest_on_disk(&update_config()).await.unwrap();
++        assert_eq!(
++            outcome.installed, None,
++            "same fork revision on disk: nothing to do"
++        );
++        assert_eq!(fx.downloads().await, 0, "no release asset fetched");
++        assert_eq!(fx.disk_release(), later);
++        // The running process (revision 0) is behind the disk (revision 1): relaunch.
++        assert!(outcome.relaunch_needed);
++        drop(fx);
++
++        let fx = Fixture::new(base, &later).await;
++        let outcome = ensure_latest_on_disk(&update_config()).await.unwrap();
++        assert_eq!(outcome.installed.as_deref(), Some(later.as_str()));
++        assert_eq!(fx.disk_release(), later);
++        assert_eq!(
++            std::fs::read_link(fx.store.join("current")).unwrap(),
++            dunce::canonicalize(&fx.store)
++                .unwrap()
++                .join("versions")
++                .join(&later)
++        );
++        assert!(
++            fx.downloads().await >= 4,
++            "sums, installer, manifest, asset"
++        );
++        drop(fx);
++    }
++
++    /// Explicit `grok update` on a store already at the published revision reports up to
++    /// date from the receipt and fetches no release asset; it never reinstalls the same
++    /// revision because the native base sorts lower.
++    #[tokio::test]
++    #[serial_test::serial]
++    async fn explicit_update_at_the_same_fork_revision_reinstalls_nothing() {
++        let base = crate::lhc_release::LHC_RELEASE_VERSION;
++        let later = format!("{base}-lhc.1");
++        let fx = Fixture::new(&later, &later).await;
++        let mut cfg = update_config();
++        let result = run_update(false, None, None, &mut cfg, CliUpdateTrigger::UserCommand)
++            .await
++            .unwrap();
++        assert_eq!(
++            result.as_deref(),
++            Some(later.as_str()),
++            "disk target reported, not reinstalled"
++        );
++        assert_eq!(fx.downloads().await, 0);
++        assert_eq!(fx.disk_release(), later);
++        assert!(
++            fx.store.join("version.json").is_file(),
++            "update cache lives in the store"
++        );
++        drop(fx);
++    }
++
++    /// No environment routes the fork binary to a stock installer: with the seams
++    /// feature the retained upstream tests can, but only through `GROK_INSTALLER`,
++    /// which production compiles out; `GROK_MANAGED_BY_*` alone never reclassifies.
++    #[tokio::test]
++    #[serial_test::serial]
++    async fn managed_by_env_never_reclassifies_the_fork_binary() {
++        let base = crate::lhc_release::LHC_RELEASE_VERSION;
++        let fx = Fixture::new(base, base).await;
++        // SAFETY: serial test; removed below.
++        unsafe { std::env::set_var("GROK_MANAGED_BY_NPM", "1") };
++        let kind = get_installer().await;
++        unsafe { std::env::remove_var("GROK_MANAGED_BY_NPM") };
++        assert_eq!(kind, Some(INSTALLER_LHC_MANAGED));
++        drop(fx);
++    }
++}
 diff --git a/crates/codegen/xai-grok-update/src/lhc_release.rs b/crates/codegen/xai-grok-update/src/lhc_release.rs
 new file mode 100644
-index 00000000..b58afd40
+index 00000000..2db149d1
 --- /dev/null
 +++ b/crates/codegen/xai-grok-update/src/lhc_release.rs
-@@ -0,0 +1,553 @@
+@@ -0,0 +1,673 @@
 +//! Fork release identity and managed-store ownership for the liminal-ai
 +//! **grok-build-lhc** build. Fork-owned file: upstream never touches it.
 +//!
@@ -7019,9 +7338,9 @@ index 00000000..b58afd40
 +/// Installer kind for an LHC build that is not running from a managed store.
 +pub const INSTALLER_LHC_UNMANAGED: &str = "lhc-unmanaged";
 +
-+/// The one shell installer, embedded so the running build installs a release
-+/// with the installer it was qualified with (no unverified script download).
-+pub const INSTALLER_SCRIPT: &str = include_str!("../../../../scripts/grok-lhc-release/install.sh");
++/// Name of the installer asset every fork release publishes next to its binaries,
++/// listed in that release's `SHA256SUMS`.
++pub const INSTALLER_ASSET: &str = "install.sh";
 +
 +/// Parse `<major>.<minor>.<patch>[-lhc.<revision>]`; a bare base is revision 0.
 +/// Anything else (stock pre-releases, garbage) is `None`.
@@ -7132,8 +7451,17 @@ index 00000000..b58afd40
 +    })
 +}
 +
++/// Test-only seam (`lhc-test-seams`): the executable path the crate's tests present as
++/// "the running binary" so decision paths can be driven from a fake managed store.
++pub const LHC_TEST_EXE_ENV: &str = "GROK_LHC_TEST_EXE";
++
 +/// The managed store of the running executable, if any.
 +pub fn managed_install() -> Option<LhcManagedInstall> {
++    if cfg!(feature = "lhc-test-seams")
++        && let Some(exe) = std::env::var_os(LHC_TEST_EXE_ENV)
++    {
++        return managed_install_for_exe(Path::new(&exe));
++    }
 +    managed_install_for_exe(&std::env::current_exe().ok()?)
 +}
 +
@@ -7208,15 +7536,75 @@ index 00000000..b58afd40
 +    )
 +}
 +
-+/// Run the embedded installer against the managed store for `release`.
-+/// Name and prefix come from the store's receipts; nothing under `~/.grok` is
-+/// touched. Windows returns guidance instead of invoking a script that does
-+/// not exist yet.
++fn release_download_base(release: &str) -> String {
++    match release_base_override() {
++        Some(base) => format!("{base}/download/v{release}"),
++        None => format!("{LHC_RELEASE_DOWNLOAD_BASE}/v{release}"),
++    }
++}
++
++fn release_client() -> Result<reqwest::Client> {
++    xai_grok_extra_ca::build_reqwest_client(|b| {
++        b.timeout(std::time::Duration::from_secs(60))
++            .user_agent(format!("grok-lhc/{LHC_RELEASE_VERSION}"))
++    })
++    .context("cannot build the release download client")
++}
++
++async fn fetch_release_asset(client: &reqwest::Client, base: &str, name: &str) -> Result<Vec<u8>> {
++    let url = format!("{base}/{name}");
++    let bytes = client
++        .get(&url)
++        .send()
++        .await
++        .with_context(|| format!("download failed: {url}"))?
++        .error_for_status()
++        .with_context(|| format!("download failed: {url}"))?
++        .bytes()
++        .await
++        .with_context(|| format!("download failed: {url}"))?;
++    Ok(bytes.to_vec())
++}
++
++/// The recorded digest of `name` in a release's `SHA256SUMS` (`<hex>  <name>` lines).
++pub fn recorded_sha256<'a>(sums: &'a str, name: &str) -> Option<&'a str> {
++    sums.lines().find_map(|line| {
++        let mut parts = line.split_whitespace();
++        let digest = parts.next()?;
++        let entry = parts.next()?.trim_start_matches('*');
++        (entry == name && parts.next().is_none()).then_some(digest)
++    })
++}
++
++pub fn sha256_hex(bytes: &[u8]) -> String {
++    use sha2::Digest as _;
++    format!("{:x}", sha2::Sha256::digest(bytes))
++}
++
++/// Install `release` into `managed`'s store with **that release's own installer**:
++/// `install.sh` and `SHA256SUMS` are fetched from the release, the installer is
++/// verified against the sums (the same file it will verify the binary with), and it
++/// runs in download mode against the store. Name and prefix come from the store's
++/// receipts. The Codex shape: installer behavior ships with the release it installs.
 +pub async fn run_managed_installer(managed: &LhcManagedInstall, release: &str) -> Result<()> {
 +    if cfg!(windows) {
 +        anyhow::bail!("{}", windows_update_guidance());
 +    }
 +    parse_lhc_release(release).with_context(|| format!("not a fork release: {release}"))?;
++    let base = release_download_base(release);
++    let client = release_client()?;
++    let sums = fetch_release_asset(&client, &base, "SHA256SUMS").await?;
++    let sums = String::from_utf8(sums).context("SHA256SUMS is not UTF-8")?;
++    let installer = fetch_release_asset(&client, &base, INSTALLER_ASSET).await?;
++    let expected = recorded_sha256(&sums, INSTALLER_ASSET).with_context(|| {
++        format!("release {release} does not list {INSTALLER_ASSET} in SHA256SUMS")
++    })?;
++    let actual = sha256_hex(&installer);
++    if !actual.eq_ignore_ascii_case(expected) {
++        anyhow::bail!(
++            "installer checksum mismatch for release {release}: expected {expected}, got {actual}"
++        );
++    }
 +    let script = std::env::temp_dir().join(format!(
 +        "grok-lhc-install-{}-{}.sh",
 +        std::process::id(),
@@ -7225,7 +7613,7 @@ index 00000000..b58afd40
 +            .map(|d| d.as_millis())
 +            .unwrap_or(0)
 +    ));
-+    tokio::fs::write(&script, INSTALLER_SCRIPT)
++    tokio::fs::write(&script, &installer)
 +        .await
 +        .with_context(|| format!("cannot stage installer at {}", script.display()))?;
 +    let mut cmd = tokio::process::Command::new("sh");
@@ -7381,13 +7769,14 @@ index 00000000..b58afd40
 +        }
 +    }
 +
-+    /// Rust launches the embedded installer against the store: download mode over a
-+    /// loopback server, checksums, receipts (name/prefix reused), activation, old
-+    /// versions kept. Nothing outside the store and the recorded prefix is written.
++    /// Rust fetches the target release's installer, verifies it against that release's
++    /// sums, and runs it against the store: download mode over a loopback server,
++    /// checksums, receipts (name/prefix reused), activation, old versions kept.
++    /// Nothing outside the store and the recorded prefix is written.
 +    #[cfg(unix)]
 +    #[tokio::test]
 +    #[serial_test::serial]
-+    async fn managed_update_runs_the_embedded_installer_against_the_store() {
++    async fn managed_update_runs_the_release_installer_against_the_store() {
 +        use wiremock::matchers::{method, path};
 +        use wiremock::{Mock, MockServer, ResponseTemplate};
 +        if host_platform() == "unsupported" {
@@ -7414,7 +7803,16 @@ index 00000000..b58afd40
 +        let release = "1.0.16-lhc.1";
 +        let asset_name = format!("grok-{release}-{}", host_platform());
 +        let body = b"#!/bin/sh\nprintf 'updated\\n'\n".to_vec();
-+        let digest = format!("{}  {asset_name}\n", sha256_hex(&body));
++        let installer = std::fs::read(
++            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
++                .join("../../../scripts/grok-lhc-release/install.sh"),
++        )
++        .unwrap();
++        let digest = format!(
++            "{}  {asset_name}\n{}  {INSTALLER_ASSET}\n",
++            sha256_hex(&body),
++            sha256_hex(&installer)
++        );
 +        let manifest =
 +            format!("{{\"product\": \"grok-lhc\", \"release_version\": \"{release}\"}}\n");
 +        let server = MockServer::start().await;
@@ -7430,6 +7828,7 @@ index 00000000..b58afd40
 +            ("SHA256SUMS", digest.into_bytes()),
 +            ("release-manifest.json", manifest.into_bytes()),
 +            (asset_name.as_str(), body.clone()),
++            (INSTALLER_ASSET, installer.clone()),
 +        ] {
 +            Mock::given(method("GET"))
 +                .and(path(format!("/download/v{release}/{name}")))
@@ -7495,21 +7894,61 @@ index 00000000..b58afd40
 +        );
 +    }
 +
++    #[test]
++    fn recorded_sha256_reads_sums_lines() {
++        let sums = "aa  grok-1.0.16-linux-x86_64\nbb  install.sh\ncc *grok-1.0.16-darwin-arm64\n";
++        assert_eq!(recorded_sha256(sums, "install.sh"), Some("bb"));
++        assert_eq!(
++            recorded_sha256(sums, "grok-1.0.16-darwin-arm64"),
++            Some("cc")
++        );
++        assert_eq!(recorded_sha256(sums, "missing"), None);
++        assert_eq!(
++            sha256_hex(b""),
++            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
++        );
++    }
++
++    /// A release whose installer does not match its own sums is refused before anything
++    /// runs; the store is untouched.
 +    #[cfg(unix)]
-+    fn sha256_hex(bytes: &[u8]) -> String {
-+        let mut child = std::process::Command::new("sha256sum")
-+            .stdin(std::process::Stdio::piped())
-+            .stdout(std::process::Stdio::piped())
-+            .spawn()
-+            .unwrap();
-+        std::io::Write::write_all(child.stdin.as_mut().unwrap(), bytes).unwrap();
-+        let out = child.wait_with_output().unwrap();
-+        String::from_utf8(out.stdout)
-+            .unwrap()
-+            .split_whitespace()
-+            .next()
-+            .unwrap()
-+            .to_string()
++    #[tokio::test]
++    #[serial_test::serial]
++    async fn managed_update_refuses_an_installer_that_fails_its_release_sums() {
++        use wiremock::matchers::{method, path};
++        use wiremock::{Mock, MockServer, ResponseTemplate};
++        let tmp = tempfile::tempdir().unwrap();
++        let store = fake_store(tmp.path(), "1.0.16", "grok");
++        std::os::unix::fs::symlink(store.join("versions/1.0.16"), store.join("current")).unwrap();
++        let release = "1.0.16-lhc.1";
++        let server = MockServer::start().await;
++        for (name, bytes) in [
++            (
++                "SHA256SUMS",
++                format!("{}  {INSTALLER_ASSET}\n", sha256_hex(b"other")).into_bytes(),
++            ),
++            (INSTALLER_ASSET, b"#!/bin/sh\ntouch \"$0.ran\"\n".to_vec()),
++        ] {
++            Mock::given(method("GET"))
++                .and(path(format!("/download/v{release}/{name}")))
++                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
++                .mount(&server)
++                .await;
++        }
++        // SAFETY: serial test; the variable is removed before returning.
++        unsafe { std::env::set_var(LHC_RELEASE_BASE_ENV, server.uri()) };
++        let managed = managed_install_for_exe(&store.join("versions/1.0.16/bin/grok")).unwrap();
++        let result = run_managed_installer(&managed, release).await;
++        unsafe { std::env::remove_var(LHC_RELEASE_BASE_ENV) };
++        let err = result.unwrap_err().to_string();
++        assert!(err.contains("installer checksum mismatch"), "{err}");
++        assert_eq!(
++            std::fs::read_to_string(store.join("installed-version"))
++                .unwrap()
++                .trim(),
++            "1.0.16"
++        );
++        assert!(!store.join("versions").join(release).exists());
 +    }
 +
 +    #[test]
