@@ -1758,6 +1758,479 @@ fn generated_body() -> Vec<ConversationItem> {
     ]
 }
 
+// ── Slice 1B — LHC-only segmentation of long native tasks ────────────────
+
+/// A tool result of about `tokens` tokens (o200k: one token per "word ").
+fn big_result(id: &str, tokens: usize) -> ConversationItem {
+    let text = "word ".repeat(tokens);
+    assert!(
+        lhc::shared_tech::token_counting::estimate_tokens(&text) >= tokens as i64 - 8,
+        "size helper must produce at least ~{tokens} tokens"
+    );
+    ConversationItem::tool_result(id, text)
+}
+
+fn call(id: &str) -> ConversationItem {
+    ConversationItem::assistant_tool_calls(vec![ToolCall {
+        id: id.into(),
+        name: "read_file".into(),
+        arguments: format!("{{\"path\":\"{id}.txt\"}}").into(),
+    }])
+}
+
+fn segment_ends(events: &[EventRecord]) -> Vec<&EventRecord> {
+    events
+        .iter()
+        .filter(|e| {
+            e.turn_end_payload()
+                .and_then(|p| p.outcome_reason.as_deref())
+                == Some(grok_lhc_host::SEGMENT_END_REASON)
+        })
+        .collect()
+}
+
+fn turn_ends(events: &[EventRecord]) -> Vec<&EventRecord> {
+    events
+        .iter()
+        .filter(|e| e.event_kind().as_str() == "turn_end")
+        .collect()
+}
+
+/// `(status, outcome, outcome_reason)` per turn row, in turn order.
+fn turn_rows(root: &std::path::Path, sid: &str) -> Vec<(String, Option<String>, Option<String>)> {
+    let db = grok_lhc_host::thread_file_path(root, sid);
+    let conn = rusqlite::Connection::open(db).expect("open sqlite");
+    let mut stmt = conn
+        .prepare("SELECT status, outcome, outcome_reason FROM turns WHERE deleted_at IS NULL ORDER BY turn_order")
+        .unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+}
+
+/// Policy the worker reads: default continuation profile, lower 120000 × 30% / 2.
+/// (Any tighter test-only compact params are one-shot and do not change it.)
+const SEGMENT_TOKENS_OVER: usize = 19_000;
+
+fn completed_facts() -> grok_lhc_host::TurnEndFacts {
+    grok_lhc_host::TurnEndFacts::from_shell_outcome(
+        "completed",
+        None,
+        1500,
+        std::time::SystemTime::now(),
+    )
+}
+
+/// B1 — a qualifying complete exchange closes one segment; an outstanding
+/// parallel call or a below-threshold segment does not; the genuine close
+/// still carries the shell facts; replay/re-map never mints a second end.
+#[test]
+fn b1_segment_closes_only_at_complete_exchange_over_threshold() {
+    logcap::install();
+    let root = TempDir::new().unwrap();
+    let sid = "cert-1b-b1";
+    let mut p0 = ConversationItem::user("research the chapters");
+    p0.set_prompt_index(0);
+    let mut native = vec![ConversationItem::system("sys"), p0];
+    let handle = spawn_capture(sid, Some("/tmp"), &native, Some(root.path()), None).unwrap();
+    let _ = wait_exact(&handle, 2);
+
+    // Two parallel calls; the big result lands first, c2 still outstanding.
+    let parallel = ConversationItem::assistant_tool_calls(vec![
+        ToolCall {
+            id: "c1".into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        },
+        ToolCall {
+            id: "c2".into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        },
+    ]);
+    let r1 = big_result("c1", SEGMENT_TOKENS_OVER);
+    handle.persist(&parallel);
+    handle.persist(&r1);
+    handle.flush_blocking();
+    let ev = wait_exact(&handle, 5); // assistant(2 calls → 2 events) + result
+    assert!(
+        segment_ends(&ev).is_empty(),
+        "c2 outstanding: no segment end"
+    );
+    native.extend([parallel, r1]);
+
+    let r2 = ConversationItem::tool_result("c2", "short");
+    handle.persist(&r2);
+    handle.flush_blocking();
+    let ev = wait_exact(&handle, 7);
+    let ends = segment_ends(&ev);
+    assert_eq!(
+        ends.len(),
+        1,
+        "exchange complete over threshold: one segment end"
+    );
+    let r2_key = ev
+        .iter()
+        .find(|e| e.idempotency_key().ends_with(":tool_result:c2"))
+        .unwrap()
+        .idempotency_key()
+        .to_string();
+    let head = r2_key.strip_suffix(":tool_result:c2").unwrap();
+    assert_eq!(ends[0].idempotency_key(), format!("{head}:segment_end"));
+    let p = ends[0].turn_end_payload().unwrap();
+    assert!(
+        p.started_at.is_none() && p.ended_at.is_none(),
+        "no host timestamps on a segment end"
+    );
+    // Rows: the pre-prompt bootstrap turn (closed by the prompt), the segment
+    // (closed, completed, segment reason), and the SDK-opened next segment.
+    assert_eq!(
+        turn_rows(root.path(), sid),
+        vec![
+            ("closed".into(), None, None),
+            (
+                "closed".into(),
+                Some("completed".into()),
+                Some(grok_lhc_host::SEGMENT_END_REASON.into())
+            ),
+            ("open".into(), None, None),
+        ]
+    );
+    native.push(r2);
+
+    // Next exchange below threshold: no end.
+    let c3 = call("c3");
+    let r3 = ConversationItem::tool_result("c3", "small");
+    handle.persist(&c3);
+    handle.persist(&r3);
+    handle.flush_blocking();
+    let ev = wait_exact(&handle, 9);
+    assert_eq!(segment_ends(&ev).len(), 1, "below threshold: no new end");
+    native.extend([c3, r3]);
+
+    // Genuine completion: item-mapped close + shell facts; facts never on a segment end.
+    let fin = ConversationItem::assistant("done");
+    handle.persist(&fin);
+    handle.turn_end_facts(1, completed_facts());
+    handle.flush_blocking();
+    let ev = wait_exact(&handle, 11);
+    let ends = turn_ends(&ev);
+    assert_eq!(ends.len(), 2);
+    let genuine = ends
+        .iter()
+        .find(|e| e.turn_end_payload().unwrap().outcome_reason.as_deref() == Some("completed"))
+        .expect("genuine close");
+    assert!(genuine.turn_end_payload().unwrap().started_at.is_some());
+    assert_eq!(segment_ends(&ev).len(), 1);
+    native.push(fin);
+    let keys_before = keys(&ev);
+
+    // Whole-history replace (repair/prune shape) re-maps everything: dedup, no minted ends.
+    handle.replace_history(&native);
+    handle.flush_blocking();
+    thread::sleep(Duration::from_millis(150));
+    let ev = handle.list_events_blocking().unwrap();
+    assert_eq!(keys(&ev), keys_before, "re-map mints nothing");
+    assert_eq!(segment_ends(&ev).len(), 1);
+    handle.shutdown_blocking();
+    wait_registry_gone(sid);
+
+    // Restart bootstrap over the same history: nothing minted either.
+    let handle2 = spawn_capture(sid, Some("/tmp"), &native, Some(root.path()), None).unwrap();
+    handle2.flush_blocking();
+    thread::sleep(Duration::from_millis(150));
+    let ev = handle2.list_events_blocking().unwrap();
+    assert_eq!(keys(&ev), keys_before, "bootstrap mints nothing");
+    assert!(
+        logcap::lines_for(sid, "segment").is_empty(),
+        "no segment warnings"
+    );
+    handle2.shutdown_blocking();
+    wait_registry_gone(sid);
+}
+
+/// B2 — same-task steering keeps pairing; a genuine end (cancel before a
+/// result) releases the abandoned call so the next task can segment; a close
+/// straight after a segment end keeps its facts event (no turn-row projection).
+#[test]
+fn b2_steer_keeps_pairing_and_genuine_end_releases_abandoned_calls() {
+    let root = TempDir::new().unwrap();
+    let sid = "cert-1b-b2";
+    let mut p0 = ConversationItem::user("task one");
+    p0.set_prompt_index(0);
+    let handle = spawn_capture(
+        sid,
+        Some("/tmp"),
+        &[ConversationItem::system("sys"), p0],
+        Some(root.path()),
+        None,
+    )
+    .unwrap();
+    let _ = wait_exact(&handle, 2);
+
+    handle.persist(&call("c1"));
+    handle.persist(&ConversationItem::interjection(
+        "steer: also check the index",
+    ));
+    handle.persist(&big_result("c1", SEGMENT_TOKENS_OVER));
+    handle.flush_blocking();
+    let ev = wait_exact(&handle, 6); // call(2) + steer + result + segment end
+    assert_eq!(
+        segment_ends(&ev).len(),
+        1,
+        "steer inside the exchange keeps pairing"
+    );
+
+    // Cancel right after the segment end: shell close lands on the empty open
+    // turn — event recorded with its facts, no turn row projected for it.
+    let aborted = grok_lhc_host::TurnEndFacts::from_shell_outcome(
+        "cancelled",
+        Some("user_interrupt".into()),
+        300,
+        std::time::SystemTime::now(),
+    );
+    handle.turn_end_facts(1, aborted.clone());
+    handle.flush_blocking();
+    let ev = wait_exact(&handle, 7);
+    let facts_ev = turn_ends(&ev)
+        .into_iter()
+        .find(|e| e.turn_end_payload().unwrap().outcome_reason.as_deref() == Some("user_interrupt"))
+        .expect("cancel facts recorded as an event");
+    assert!(facts_ev.turn_end_payload().unwrap().ended_at.is_some());
+    let rows = turn_rows(root.path(), sid);
+    assert_eq!(
+        rows.len(),
+        3,
+        "empty-turn close projects no extra row (bootstrap, segment, open): {rows:?}"
+    );
+
+    // Task two: abandoned call, cancelled before its result.
+    let mut p1 = ConversationItem::user("task two");
+    p1.set_prompt_index(1);
+    handle.persist(&p1);
+    handle.persist(&call("c9"));
+    handle.turn_end_facts(2, aborted);
+    handle.flush_blocking();
+    let ev = wait_exact(&handle, 10);
+    assert_eq!(segment_ends(&ev).len(), 1);
+
+    // Task three segments although c9 never got a result.
+    let mut p2 = ConversationItem::user("task three");
+    p2.set_prompt_index(2);
+    handle.persist(&p2);
+    handle.persist(&call("c10"));
+    handle.persist(&big_result("c10", SEGMENT_TOKENS_OVER));
+    handle.flush_blocking();
+    let ev = wait_exact(&handle, 14);
+    assert_eq!(segment_ends(&ev).len(), 2, "genuine end released c9");
+    handle.shutdown_blocking();
+    wait_registry_gone(sid);
+}
+
+/// B3 — ordinary compact after segmentation: the compact point moves inside
+/// the still-running native task, the write-back body keeps complete pairs,
+/// 1A holds (no band recapture) across a second compact and a resume, and the
+/// resumed session still segments.
+#[test]
+fn b3_compact_moves_inside_native_task_and_1a_holds_across_resume() {
+    use grok_lhc_host::{
+        CountingLhcInferenceSampler, GeneratedPrefix, replace_compact_for_writeback,
+        set_compact_mode_for_test, set_compact_params_override_for_test,
+        set_sever_compact_signal_for_test, set_use_deterministic_inference_for_test,
+    };
+    use lhc::shared_tech::view::{PartialViewProfilePercentages, ViewCompactParams};
+
+    fn tight() -> ViewCompactParams {
+        ViewCompactParams {
+            lower_bound: Some(400.0),
+            percentages: Some(PartialViewProfilePercentages {
+                full: Some(30.0),
+                smooth: Some(25.0),
+                detailed: Some(20.0),
+                brief: Some(25.0),
+            }),
+            newest_closed_protection: None,
+        }
+    }
+    fn pairs_complete(items: &[ConversationItem]) {
+        let calls: BTreeSet<String> = items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::Assistant(a) => {
+                    Some(a.tool_calls.iter().map(|c| c.id.to_string()))
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        for i in items {
+            if let ConversationItem::ToolResult(r) = i {
+                assert!(
+                    calls.contains(&r.tool_call_id),
+                    "orphan result {}",
+                    r.tool_call_id
+                );
+            }
+        }
+    }
+
+    let _g = env_lock();
+    logcap::install();
+    let root = TempDir::new().unwrap();
+    let sid = "cert-1b-b3";
+    let mut p0 = ConversationItem::user("read every chapter and report");
+    p0.set_prompt_index(0);
+    let mut native = vec![ConversationItem::system("sys"), p0];
+    let counter = Arc::new(CountingLhcInferenceSampler::new());
+    let handle =
+        spawn_capture(sid, Some("/tmp"), &native, Some(root.path()), Some(counter)).unwrap();
+    let seeded = wait_exact(&handle, 2);
+    let prompt_order = seeded[1].event_order();
+
+    // Three big exchanges inside one native task → three closed segments.
+    for i in 1..=3 {
+        let c = call(&format!("c{i}"));
+        let r = big_result(&format!("c{i}"), SEGMENT_TOKENS_OVER);
+        handle.persist(&c);
+        handle.persist(&r);
+        native.extend([c, r]);
+    }
+    handle.flush_blocking();
+    // Per exchange: tool_call + tool_result + segment end (a tool-call-only
+    // assistant emits no assistant_text).
+    let ev = wait_exact(&handle, 2 + 3 * 3);
+    assert_eq!(segment_ends(&ev).len(), 3);
+    let first_end_order = segment_ends(&ev)[0].event_order();
+
+    set_compact_mode_for_test(Some(CompactMode::Replace));
+    set_use_deterministic_inference_for_test(true);
+    set_sever_compact_signal_for_test(false);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let _ = rt.block_on(handle.drain_settled());
+    set_compact_params_override_for_test(Some(tight()));
+    let wb = rt
+        .block_on(replace_compact_for_writeback(sid))
+        .expect("compact");
+    assert!(
+        wb.receipt.compact_point > prompt_order && wb.receipt.compact_point >= first_end_order,
+        "compact point inside the native task, at/after the first segment end: point={} prompt={prompt_order} first_end={first_end_order}",
+        wb.receipt.compact_point
+    );
+    let body = build_writeback_conversation(&native, &wb.view, &wb.kinds).expect("body");
+    eprintln!(
+        "B3: compact_point={} prompt_order={prompt_order} first_segment_end={first_end_order} \
+         receipt_total={} tail={} lower_bound={} native_items={} body_items={}",
+        wb.receipt.compact_point,
+        wb.receipt.total_tokens,
+        wb.receipt.tail_tokens,
+        wb.receipt.config.lower_bound,
+        native.len(),
+        body.len()
+    );
+    pairs_complete(&body);
+    let native_chars: usize = native.iter().map(|i| i.text_content().len()).sum();
+    let body_chars: usize = body.iter().map(|i| i.text_content().len()).sum();
+    assert!(
+        body_chars * 2 < native_chars,
+        "body {body_chars} vs native {native_chars}"
+    );
+    assert!(
+        body.iter().any(|i| i.text_content().contains("[context")),
+        "bands served"
+    );
+
+    // 1A: install + replace records nothing; the band is never canonical.
+    let keys_pre = keys(&handle.list_events_blocking().unwrap());
+    handle.writeback_installed(&body, wb.source_tip);
+    handle.replace_history(&body);
+    handle.flush_blocking();
+    thread::sleep(Duration::from_millis(150));
+    let ev = handle.list_events_blocking().unwrap();
+    assert_eq!(keys(&ev), keys_pre, "write-back is not canonical input");
+    assert_eq!(summary_count(&ev), 0);
+
+    // The same native task continues on the compacted body: one more segment,
+    // then genuine completion.
+    let mut native2 = body.clone();
+    let c4 = call("c4");
+    let r4 = big_result("c4", SEGMENT_TOKENS_OVER);
+    let fin = ConversationItem::assistant("report: all chapters read");
+    for it in [&c4, &r4, &fin] {
+        handle.persist(it);
+    }
+    handle.turn_end_facts(1, completed_facts());
+    handle.flush_blocking();
+    let ev = wait_events(&handle, keys_pre.len() + 5);
+    assert_eq!(segment_ends(&ev).len(), 4);
+    native2.extend([c4, r4, fin]);
+
+    // Second compact + write-back on top of the first: still zero recapture.
+    let _ = rt.block_on(handle.drain_settled());
+    set_compact_params_override_for_test(Some(tight()));
+    let wb2 = rt
+        .block_on(replace_compact_for_writeback(sid))
+        .expect("compact 2");
+    let body2 = build_writeback_conversation(&native2, &wb2.view, &wb2.kinds).expect("body2");
+    pairs_complete(&body2);
+    let keys_pre2 = keys(&handle.list_events_blocking().unwrap());
+    handle.writeback_installed(&body2, wb2.source_tip);
+    handle.replace_history(&body2);
+    handle.flush_blocking();
+    thread::sleep(Duration::from_millis(150));
+    let ev = handle.list_events_blocking().unwrap();
+    assert_eq!(keys(&ev), keys_pre2);
+    assert_eq!(
+        summary_count(&ev),
+        0,
+        "second compact re-bands nothing canonical"
+    );
+    set_compact_params_override_for_test(None);
+    set_use_deterministic_inference_for_test(false);
+    set_compact_mode_for_test(None);
+    handle.shutdown_blocking();
+    wait_registry_gone(sid);
+
+    // Resume on the installed body: nothing recorded, no minted ends; a new
+    // task after resume still segments (pairing state seeded from bootstrap).
+    let generated = GeneratedPrefix {
+        items: body2.clone(),
+        source_tip: wb2.source_tip,
+    };
+    let handle2 = spawn_capture_resumed(
+        sid,
+        Some("/tmp"),
+        &body2,
+        Some(generated),
+        Some(root.path()),
+        None,
+    )
+    .unwrap();
+    handle2.flush_blocking();
+    thread::sleep(Duration::from_millis(150));
+    let ev = handle2.list_events_blocking().unwrap();
+    assert_eq!(keys(&ev), keys_pre2, "resume records nothing");
+    let mut p1 = ConversationItem::user("now summarize chapter 9");
+    p1.set_prompt_index(1);
+    handle2.persist(&p1);
+    handle2.persist(&call("c5"));
+    handle2.persist(&big_result("c5", SEGMENT_TOKENS_OVER));
+    handle2.flush_blocking();
+    let ev = wait_events(&handle2, keys_pre2.len() + 4);
+    assert_eq!(
+        segment_ends(&ev).len(),
+        5,
+        "segmentation continues after resume"
+    );
+    assert!(logcap::lines_for(sid, WALK_STOPPED_EARLY).is_empty());
+    handle2.shutdown_blocking();
+    wait_registry_gone(sid);
+}
+
 /// Process-global capture of WARN/ERROR tracing lines (the capture worker
 /// logs from its own thread, so a thread-local subscriber would miss it).
 mod logcap {

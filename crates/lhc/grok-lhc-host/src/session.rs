@@ -90,6 +90,12 @@ fn sever_compact_signal_for_test() -> bool {
     false
 }
 
+/// The profile ordinary compact resolves when `CompactOpts.profile` is `None`
+/// (SDK `thread_view::DEFAULT_PROFILE_NAME`, private there; the first
+/// built-in). Grok's compact bridge always passes `profile: None`, so this is
+/// the effective policy the segment threshold must share (slice 1B).
+const SEGMENT_POLICY_PROFILE: &str = "continuation";
+
 /// Live LHC capture session (owns the SDK instance + thread path).
 pub struct LhcSession {
     pub session_id: String,
@@ -500,6 +506,32 @@ impl LhcSession {
                 }
             }
         }
+    }
+
+    /// Open-turn size and step edges (`lhc.thread_view.host_metadata`).
+    /// Slice 1B reads `active_turn.estimated_tokens` at each segment candidate.
+    pub async fn host_metadata(&self) -> Result<lhc::shared_tech::view::HostMetadata, String> {
+        match self
+            .lhc
+            .thread_view
+            .host_metadata(self.thread_ref.clone())
+            .await
+        {
+            OpResult::Ok { value } => Ok(value),
+            OpResult::Err { error } => Err(error.reason),
+        }
+    }
+
+    /// Segment threshold (slice 1B): half the full-fidelity budget of the
+    /// policy ordinary compact resolves when Grok passes `profile: None` —
+    /// the SDK default base profile — read from this instance's resolved view
+    /// config at each call, never cached and never a literal. `None` only if
+    /// the profile is absent from the resolved config (built-ins make it
+    /// always present).
+    pub fn segment_threshold_tokens(&self) -> Option<i64> {
+        let profile = self.lhc.config.view.profiles.get(SEGMENT_POLICY_PROFILE)?;
+        let full_budget = profile.lower_bound * profile.percentages.full / 100.0;
+        Some((full_budget / 2.0).floor() as i64)
     }
 
     /// View derivation / visibility status (`lhc.thread_view.status`).

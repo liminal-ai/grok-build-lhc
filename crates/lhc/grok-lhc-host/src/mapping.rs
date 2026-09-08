@@ -174,6 +174,34 @@ pub fn shell_turn_end_event(
     event
 }
 
+/// `outcomeReason` of a host-generated segment end (slice 1B). Event metadata
+/// only — never model-visible content, not a new event or turn kind.
+pub const SEGMENT_END_REASON: &str = "grok_lhc_segment";
+
+/// Host-authored `turn_end` that closes an LHC-only segment of a still-running
+/// native task (slice 1B). Anchored to the closing tool-result event key
+/// (`…:{digest}:{occ}:tool_result:{call}` → `…:{digest}:{occ}:segment_end`):
+/// the same captured-item identity the original event carries, so a replay or
+/// repeated persist of that item is an SDK dedup skip and can never close a
+/// different segment. Never minted on bootstrap / replace re-map. Carries no
+/// host timestamps — those belong to the genuine native close.
+pub fn segment_end_event(anchor_tool_result_key: &str) -> Option<MappedEvent> {
+    let (head, _call) = anchor_tool_result_key.split_once(":tool_result:")?;
+    let mut payload = Map::new();
+    payload.insert("outcome".into(), json!("completed"));
+    payload.insert("outcomeReason".into(), json!(SEGMENT_END_REASON));
+    Some(MappedEvent {
+        input: MessageEventInput {
+            event_kind: "turn_end".to_string(),
+            idempotency_key: Some(format!("{head}:segment_end")),
+            actor: ACTOR.to_string(),
+            harness: HARNESS.to_string(),
+            payload,
+            extra: Map::new(),
+        },
+    })
+}
+
 /// Map a single conversation item into zero or more LHC events.
 ///
 /// `turn_end_facts` populates optional `turn_end` payload fields when this
@@ -1088,6 +1116,37 @@ mod tests {
     }
 
     /// Facts must not enter the idempotency key — load-bearing for rewind/replay dedup.
+    #[test]
+    fn segment_end_is_anchored_to_the_closing_tool_result_key() {
+        let mut tracker = OccurrenceTracker::new();
+        let item = ConversationItem::tool_result("c7", "out");
+        let mapped = map_item("s", 0, &item, &mut tracker, &TurnEndFacts::default());
+        let anchor = mapped[0].input.idempotency_key.clone().unwrap();
+        assert!(anchor.ends_with(":tool_result:c7"), "{anchor}");
+        let end = segment_end_event(&anchor).expect("anchored");
+        let key = end.input.idempotency_key.clone().unwrap();
+        let head = anchor.strip_suffix(":tool_result:c7").unwrap();
+        assert_eq!(key, format!("{head}:segment_end"));
+        assert_ne!(key, anchor);
+        assert_eq!(end.input.event_kind, "turn_end");
+        assert_eq!(end.input.payload.get("outcome"), Some(&json!("completed")));
+        assert_eq!(
+            end.input.payload.get("outcomeReason"),
+            Some(&json!(SEGMENT_END_REASON))
+        );
+        assert!(end.input.payload.get("startedAt").is_none());
+        assert!(end.input.payload.get("endedAt").is_none());
+        // Same item again → next occurrence → a different segment key.
+        let again = map_item("s", 0, &item, &mut tracker, &TurnEndFacts::default());
+        let anchor2 = again[0].input.idempotency_key.clone().unwrap();
+        assert_ne!(
+            segment_end_event(&anchor2).unwrap().input.idempotency_key,
+            end.input.idempotency_key
+        );
+        // Only a tool-result key can anchor a segment end.
+        assert!(segment_end_event("grok:s:g0:abc:0:assistant_text").is_none());
+    }
+
     #[test]
     fn turn_end_facts_do_not_enter_idempotency_key() {
         let empty = turn_end_event("s", 0, "digest", 0, None, &TurnEndFacts::default());

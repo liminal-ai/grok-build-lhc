@@ -58,9 +58,9 @@ pub use inference::{
 /// Re-exported so the shell sampler can stamp provenance without depending on `lhc` directly.
 pub use lhc::shared_tech::{InferenceRequestMessage, InferenceRequestRole};
 pub use mapping::{
-    MappedEvent, TurnEndFacts, apply_turn_end_facts, attach_assistant_identity,
+    MappedEvent, SEGMENT_END_REASON, TurnEndFacts, apply_turn_end_facts, attach_assistant_identity,
     attach_provider_usage, format_system_time_iso8601_millis, level_label, map_history,
-    map_history_from, map_item, map_model_change, shell_turn_end_event,
+    map_history_from, map_item, map_model_change, segment_end_event, shell_turn_end_event,
     token_usage_to_provider_usage,
 };
 pub use runtime_config::{

@@ -1,6 +1,6 @@
 //! Background capture worker + process-wide session registry.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -22,7 +22,7 @@ use crate::inference::{
 use crate::mapping::{
     MappedEvent, TurnEndFacts, apply_turn_end_facts, attach_assistant_identity,
     attach_provider_usage, map_history, map_history_from, map_item, map_model_change,
-    shell_turn_end_event,
+    segment_end_event, shell_turn_end_event,
 };
 use crate::session::LhcSession;
 
@@ -1129,6 +1129,11 @@ pub fn spawn_capture_resumed(
                 // Shell hook barriers on chat-state so Persist is enqueued before
                 // TurnEndFacts (capture mpsc FIFO).
                 let mut deferred_turn_end: Option<MappedEvent> = None;
+                // Slice 1B: pairing state seeded from the resumed history so a
+                // restart mid-task keeps its outstanding calls; historical
+                // segment ends are never re-minted here (they are in the record).
+                let mut segment = SegmentState::default();
+                segment.reset_from(&bootstrap);
 
                 loop {
                     // Crash arm exists only under test-util; shipping build awaits
@@ -1163,6 +1168,7 @@ pub fn spawn_capture_resumed(
                                         dropped_for_worker.as_ref(),
                                         &mut deferred_turn_end,
                                         &mut installed,
+                                        &mut segment,
                                         #[cfg(any(test, feature = "test-util"))]
                                         &mut crash_rx,
                                         #[cfg(any(test, feature = "test-util"))]
@@ -1198,6 +1204,7 @@ pub fn spawn_capture_resumed(
                                 dropped_for_worker.as_ref(),
                                 &mut deferred_turn_end,
                                 &mut installed,
+                                &mut segment,
                                 #[cfg(any(test, feature = "test-util"))]
                                 &mut crash_rx,
                                 #[cfg(any(test, feature = "test-util"))]
@@ -1228,6 +1235,7 @@ pub fn spawn_capture_resumed(
                                         dropped_for_worker.as_ref(),
                                         &mut deferred_turn_end,
                                         &mut installed,
+                                        &mut segment,
                                         #[cfg(any(test, feature = "test-util"))]
                                         &mut crash_rx,
                                         #[cfg(any(test, feature = "test-util"))]
@@ -1378,6 +1386,101 @@ async fn remap_slice(
 }
 
 /// Process one command. Returns true if the worker should exit (crash).
+/// Slice 1B — tool pairing of the current native task, folded from every
+/// item the worker sees (live persist, bootstrap, replace re-map), so a
+/// host-generated segment end can only land at a complete exchange: no
+/// outstanding tool call, parallel calls included. Cleared at the genuine
+/// native close (`TurnEndFacts`), which is where abandoned calls are released.
+/// Same-task steering never touches it (prompts carry no pairing).
+#[derive(Default)]
+struct SegmentState {
+    open_calls: HashSet<String>,
+}
+
+impl SegmentState {
+    fn fold_item(&mut self, item: &ConversationItem) {
+        match item {
+            ConversationItem::Assistant(a) => {
+                for tc in &a.tool_calls {
+                    self.open_calls.insert(tc.id.to_string());
+                }
+            }
+            ConversationItem::ToolResult(r) => {
+                self.open_calls.remove(&r.tool_call_id);
+            }
+            // BackendToolCall is self-paired; System/User/Reasoning carry no pairing.
+            _ => {}
+        }
+    }
+
+    /// Recompute from a whole native history (bootstrap / replace re-map).
+    fn reset_from(&mut self, items: &[ConversationItem]) {
+        self.open_calls.clear();
+        for item in items {
+            self.fold_item(item);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.open_calls.clear();
+    }
+}
+
+/// Slice 1B — after the tool-result item at `anchor` was submitted: when the
+/// exchange is complete, the anchor was **newly recorded** (a replay or
+/// repeated persist is a dedup skip and must not close a different, growing
+/// segment), no item-mapped close is pending, and the open turn has reached
+/// the threshold read from the live policy, append one ordinary `turn_end`.
+/// The native task continues; nothing is served, waited on, or summarized.
+async fn maybe_close_segment(
+    sess: &mut LhcSession,
+    session_id: &str,
+    segment: &SegmentState,
+    close_pending: bool,
+    anchor: &str,
+    batch: &lhc::intake_stream::BatchResult,
+) {
+    if close_pending || !segment.open_calls.is_empty() {
+        return;
+    }
+    let newly_recorded = batch
+        .events
+        .iter()
+        .any(|e| e.idempotency_key == anchor && matches!(e.outcome, BatchEventOutcome::Recorded));
+    if !newly_recorded {
+        return;
+    }
+    let Some(threshold) = sess.segment_threshold_tokens() else {
+        return;
+    };
+    let active = match sess.host_metadata().await {
+        Ok(meta) => meta.active_turn,
+        Err(err) => {
+            warn!(session_id, %err, "LHC: segment size read failed; no segment end");
+            return;
+        }
+    };
+    let Some(active) = active else {
+        return;
+    };
+    if active.estimated_tokens < threshold {
+        return;
+    }
+    let Some(end) = segment_end_event(anchor) else {
+        return;
+    };
+    match submit_mapped(sess, vec![end]).await {
+        Ok(_) => debug!(
+            session_id,
+            turn_id = %active.turn_id,
+            estimated_tokens = active.estimated_tokens,
+            threshold,
+            "LHC: segment end recorded (host-generated; native task continues)"
+        ),
+        Err(err) => warn!(session_id, %err, "LHC: segment end submit failed"),
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // test-util crash arms add optional params
 async fn process_cmd(
     cmd: CaptureCmd,
@@ -1388,6 +1491,7 @@ async fn process_cmd(
     dropped: &AtomicU64,
     deferred_turn_end: &mut Option<MappedEvent>,
     installed: &mut Option<InstalledPrefix>,
+    segment: &mut SegmentState,
     #[cfg(any(test, feature = "test-util"))] crash_rx: &mut watch::Receiver<bool>,
     #[cfg(any(test, feature = "test-util"))] crash_mid_replace_after: &AtomicUsize,
 ) -> bool {
@@ -1456,7 +1560,29 @@ async fn process_cmd(
                     let _ = submit_mapped(sess, turn_ends).await;
                 }
             }
-            let _ = submit_mapped(sess, mapped).await;
+            // Slice 1B: fold pairing from the item; a tool result whose
+            // exchange is complete is a segment candidate once submitted.
+            segment.fold_item(&item);
+            let anchor = if matches!(item, ConversationItem::ToolResult(_)) {
+                mapped
+                    .iter()
+                    .find(|e| e.input.event_kind == "tool_result")
+                    .and_then(|e| e.input.idempotency_key.clone())
+            } else {
+                None
+            };
+            let batch = submit_mapped(sess, mapped).await;
+            if let (Some(anchor), Ok(batch)) = (anchor, batch.as_ref()) {
+                maybe_close_segment(
+                    sess,
+                    session_id,
+                    segment,
+                    deferred_turn_end.is_some(),
+                    &anchor,
+                    batch,
+                )
+                .await;
+            }
             false
         }
         CaptureCmd::TurnEndFacts { turn_number, facts } => {
@@ -1469,6 +1595,9 @@ async fn process_cmd(
                 );
                 return false;
             }
+            // Genuine native close: abandoned calls (cancel / error before
+            // their results) are released so later tasks can segment.
+            segment.clear();
             if let Some(mut te) = deferred_turn_end.take() {
                 // Completed path: item-mapped turn_end (same key) + facts.
                 // Dedup law: one event, one key — never a second facts-bearing
@@ -1486,6 +1615,10 @@ async fn process_cmd(
             false
         }
         CaptureCmd::ReplaceHistory(items) => {
+            // Pairing follows the native history that now stands (rewind,
+            // dangling-call repair, prune, …); segment ends are never minted
+            // from a re-map.
+            segment.reset_from(&items);
             // Flush deferred empty first so a live close is not lost and
             // history re-map keys stay the sole survivors via dedup.
             if let Some(te) = deferred_turn_end.take() {
