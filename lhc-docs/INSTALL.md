@@ -75,7 +75,8 @@ Defaults on Linux/macOS: command `~/.local/bin/grok-lhc`, managed store
 `~/.local/share/grok-lhc` (`versions/<release>/bin/grok`, `current` symlink,
 receipts `installed-name`, `installed-version`, `installed-prefix`). On
 Windows: launcher `%LOCALAPPDATA%\grok-lhc\bin\grok-lhc.cmd` (forwards all
-arguments and the exit status), store `%LOCALAPPDATA%\grok-lhc`
+arguments and the exit status; it is UTF-8 and switches the console to code
+page 65001 first, so a non-ASCII profile or store path works), store `%LOCALAPPDATA%\grok-lhc`
 (`versions\<release>\bin\grok.exe`, `current` directory junction, the same
 receipts). The Windows installer does not edit `PATH`; add
 `%LOCALAPPDATA%\grok-lhc\bin` yourself or call the launcher by path. Choose

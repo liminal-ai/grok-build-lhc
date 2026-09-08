@@ -618,9 +618,11 @@ Chunk 1 means the first real upstream sync already has a proven fallback.)
   as the between-releases early warning; the release lane does not dispatch it.
 - Windows layout (`install.ps1`): store `%LOCALAPPDATA%\grok-lhc`,
   `versions\<release>\bin\grok.exe`, `current` is a **directory junction**
-  (no symlink privilege), launcher `<prefix>\bin\<name>.cmd` runs
-  `current\bin\grok.exe %*` and `exit /b %ERRORLEVEL%` (T3 and the updater read
-  the status); no PATH edit. `managed_install_for_exe` canonicalizes through
+  (no symlink privilege), launcher `<prefix>\bin\<name>.cmd` is BOM-less
+  UTF-8: `chcp 65001 >nul`, then `current\bin\grok.exe %*` and
+  `exit /b %ERRORLEVEL%` (T3 and the updater read the status), so Unicode
+  store paths survive regardless of the console code page; the console stays
+  UTF-8 afterwards. No PATH edit. `managed_install_for_exe` canonicalizes through
   the junction, so the same detection serves all platforms. The Rust update
   path picks `install.ps1` on Windows and runs
   `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <staged>
