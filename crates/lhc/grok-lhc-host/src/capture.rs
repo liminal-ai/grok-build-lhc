@@ -1088,16 +1088,22 @@ pub fn spawn_capture_resumed(
                         );
                     }
                 } else {
-                    let events = remap_slice(
+                    let submitted = match remap_slice(
                         &mut session,
                         &mut tracker,
                         &mut installed,
                         &session_id_for_worker,
                         &bootstrap,
                     )
-                    .await;
-                    let inputs: Vec<_> = events.into_iter().map(|e| e.input).collect();
-                    match session.submit_events(&inputs).await {
+                    .await
+                    {
+                        Ok(events) => {
+                            let inputs: Vec<_> = events.into_iter().map(|e| e.input).collect();
+                            session.submit_events(&inputs).await
+                        }
+                        Err(err) => Err(err),
+                    };
+                    match submitted {
                         Ok(batch) => {
                             let recorded = batch
                                 .events
@@ -1285,20 +1291,24 @@ pub fn spawn_capture_resumed(
     Some(CaptureHandle { inner: shared })
 }
 
-/// Process one command. Returns true if the worker should exit (crash).
-#[allow(clippy::too_many_arguments)] // test-util crash arms add optional params
 /// Whole-history re-map (bootstrap / `ReplaceHistory`). With an installed
 /// LHC-generated prefix (slice 1A), skip it and key the genuine remainder from
 /// the frozen pre-write-back baseline; otherwise — and on any early stop, with
 /// the C1 warning — map the whole slice from a fresh tracker as before. LHC
 /// dedup is the diff either way.
+///
+/// `Err` when the prefix covers the slice but the frozen baseline cannot be
+/// read: the slice is *not* mapped (mapping known generated source from a
+/// guessed baseline would submit the body under wrong keys). The caller
+/// reports it exactly like a failed submit of the slice; the prefix stays
+/// installed and the next re-map retries the read.
 async fn remap_slice(
     sess: &mut LhcSession,
     tracker: &mut OccurrenceTracker,
     installed: &mut Option<InstalledPrefix>,
     session_id: &str,
     items: &[ConversationItem],
-) -> Vec<MappedEvent> {
+) -> Result<Vec<MappedEvent>, String> {
     let facts = TurnEndFacts::default();
     let full = || map_history(session_id, ITEM_KEY_GENERATION, items, &facts);
     let (events, local) = match installed.as_mut() {
@@ -1323,12 +1333,10 @@ async fn remap_slice(
                 remainder,
             } => match prefix.frozen_seed(sess).await {
                 Err(err) => {
-                    error!(
-                        session_id,
-                        %err,
-                        "LHC: frozen baseline read failed; full re-map of this slice"
-                    );
-                    full()
+                    return Err(format!(
+                        "frozen baseline read failed (source_tip={}): {err}",
+                        prefix.source_tip()
+                    ));
                 }
                 Ok(seed) => {
                     let mut out = Vec::new();
@@ -1366,9 +1374,11 @@ async fn remap_slice(
         },
     };
     tracker.merge_monotonic(&local);
-    events
+    Ok(events)
 }
 
+/// Process one command. Returns true if the worker should exit (crash).
+#[allow(clippy::too_many_arguments)] // test-util crash arms add optional params
 async fn process_cmd(
     cmd: CaptureCmd,
     session: &mut Option<LhcSession>,
@@ -1486,7 +1496,15 @@ async fn process_cmd(
             // occurrence high-water marks. Empty facts: history re-map has
             // no live turn-boundary signal (scout §4.4). An installed LHC
             // write-back body is skipped (slice 1A).
-            let events = remap_slice(sess, tracker, installed, session_id, &items).await;
+            let events = match remap_slice(sess, tracker, installed, session_id, &items).await {
+                Ok(events) => events,
+                Err(err) => {
+                    // Same terminal handling as a failed submit of this slice.
+                    warn!(session_id, %err, "LHC: replace_history re-map failed; slice not submitted");
+                    baseline_poisoned.store(false, Ordering::SeqCst);
+                    return false;
+                }
+            };
             #[cfg(any(test, feature = "test-util"))]
             {
                 let n = crash_mid_replace_after.swap(0, Ordering::SeqCst);
@@ -1515,7 +1533,9 @@ async fn process_cmd(
                     return false;
                 }
             }
-            let _ = submit_mapped(sess, events).await;
+            if let Err(err) = submit_mapped(sess, events).await {
+                warn!(session_id, %err, "LHC: replace_history submit failed");
+            }
             baseline_poisoned.store(false, Ordering::SeqCst);
             debug!(
                 session_id,

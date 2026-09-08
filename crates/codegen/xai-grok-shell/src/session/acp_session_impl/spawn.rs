@@ -63,12 +63,6 @@ fn configured_memory_retrieval_mode(
         Some(_) => FtsOnly,
     }
 }
-/// Choose the sampler's own 429 retry threshold for a session's inference path.
-///
-/// One 429 layer per role, never stacked, never zero.
-/// A subagent with an active pacer (`pacer_max_attempts > 0`) paces 429s itself, so the sampler retry is disabled.
-/// With the pacer off, the subagent falls back to the sampler retry, so disabling the pacer is a true rollback rather than zero 429 handling.
-/// Main sessions always keep the sampler retry.
 /// LHC (slice 1A): the latest compaction checkpoint, when LHC-marked
 /// (`lhc_source_tip` present), gives capture the generated body and the tip it
 /// was built from. Native or pre-1A checkpoints yield `None` and bootstrap
@@ -103,6 +97,12 @@ fn lhc_generated_prefix_from_checkpoint(
     })
 }
 
+/// Choose the sampler's own 429 retry threshold for a session's inference path.
+///
+/// One 429 layer per role, never stacked, never zero.
+/// A subagent with an active pacer (`pacer_max_attempts > 0`) paces 429s itself, so the sampler retry is disabled.
+/// With the pacer off, the subagent falls back to the sampler retry, so disabling the pacer is a true rollback rather than zero 429 handling.
+/// Main sessions always keep the sampler retry.
 fn subagent_sampler_rate_limit_threshold(is_subagent: bool, pacer_max_attempts: u32) -> u32 {
     if is_subagent && pacer_max_attempts > 0 {
         xai_grok_sampler::RATE_LIMIT_RETRY_DISABLED

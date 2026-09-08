@@ -1436,8 +1436,6 @@ fn writeback_fixture() -> (Vec<ConversationItem>, Vec<ConversationItem>) {
     (native, body)
 }
 
-const WB_BAND_SUMMARY_NEEDLE: &str = "[context · brief]";
-
 /// Gate property: write-back twice with the same ctx → byte-identical body + keys.
 #[test]
 fn writeback_body_is_fixpoint_through_replace_history() {
@@ -2071,6 +2069,43 @@ fn c1_inherited_prefix_shape_warns_and_falls_back() {
     let warns = logcap::lines_for(sid, WALK_STOPPED_EARLY);
     assert_eq!(warns.len(), 1, "exactly one early-stop warn, got {warns:?}");
     assert!(warns[0].contains("index=0") && warns[0].contains("digest_mismatch"));
+    handle.shutdown_blocking();
+}
+
+/// Steward correction: a frozen-baseline read failure on a covered slice is
+/// reported through the replace error path and submits nothing — it must not
+/// fall back to a full re-map that keys the generated body from a guessed
+/// baseline. The prefix stays installed.
+#[test]
+fn a1_frozen_baseline_read_failure_reports_and_submits_nothing() {
+    logcap::install();
+    let root = TempDir::new().unwrap();
+    let sid = "cert-1a-frozen-fail";
+    let (native, _) = repeated_prompt_native();
+    let handle = spawn_capture(sid, Some("/tmp"), &native, Some(root.path()), None).unwrap();
+    let seeded = wait_exact(&handle, 7);
+    let tip = source_tip(&seeded);
+    let body = generated_body();
+    handle.writeback_installed(&body, tip);
+
+    // Break the record before the first covered re-map (seed not yet cached).
+    let thread = thread_file_path(root.path(), sid);
+    sqlite_exec(&thread, "PRAGMA foreign_keys=OFF; DROP TABLE event;");
+    handle.replace_history(&body);
+    handle.flush_blocking();
+    thread::sleep(Duration::from_millis(200));
+
+    let failed = logcap::lines_for(sid, "replace_history re-map failed; slice not submitted");
+    assert_eq!(failed.len(), 1, "one re-map failure report, got {failed:?}");
+    assert!(failed[0].contains("frozen baseline read failed"));
+    assert!(
+        logcap::lines_for(sid, "re-map skipped installed LHC write-back body").is_empty(),
+        "no covered re-map may be claimed"
+    );
+    assert!(
+        logcap::lines_for(sid, WALK_STOPPED_EARLY).is_empty(),
+        "a read failure is not a shape mismatch"
+    );
     handle.shutdown_blocking();
 }
 
