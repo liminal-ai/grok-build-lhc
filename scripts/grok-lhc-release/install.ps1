@@ -35,6 +35,15 @@ function RemoveJunction([string]$Path) {
     # Removes the link only; never recurses into the target.
     if (Test-Path -LiteralPath $Path) { [System.IO.Directory]::Delete($Path) }
 }
+# cmd.exe reads batch files in the OEM code page, so the launcher carries the
+# executable path in that code page (UTF-8 without BOM when the OEM page is
+# 65001). Unrepresentable characters raise instead of being replaced.
+function LauncherEncoding() {
+    $codePage = [System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage
+    if ($codePage -eq 65001) { return New-Object System.Text.UTF8Encoding($false, $true) }
+    return [System.Text.Encoding]::GetEncoding($codePage, [System.Text.EncoderFallback]::ExceptionFallback, [System.Text.DecoderFallback]::ExceptionFallback)
+}
+function ReadLauncher([string]$Path) { return (LauncherEncoding).GetString([System.IO.File]::ReadAllBytes($Path)) }
 
 $releaseBase = $env:GROK_LHC_RELEASE_BASE
 if ($releaseBase) {
@@ -71,7 +80,7 @@ if ($Uninstall) {
     if ($Name -notmatch '^[A-Za-z0-9._-]+$') { Fail "invalid installed command receipt" }
     $launcher = Join-Path $BinDir "$Name.cmd"
     if (Test-Path -LiteralPath $launcher) {
-        $text = [System.IO.File]::ReadAllText($launcher)
+        $text = ReadLauncher $launcher
         if ($text -notmatch [regex]::Escape($InstallRoot)) { Fail "$launcher is not managed by this installer" }
         Remove-Item -LiteralPath $launcher -Force
     }
@@ -140,9 +149,13 @@ try {
     }
 
     if (Test-Path -LiteralPath $launcher) {
-        $text = [System.IO.File]::ReadAllText($launcher)
+        $text = ReadLauncher $launcher
         if ($text -notmatch [regex]::Escape($InstallRoot)) { Fail "$launcher already exists; choose another name" }
     }
+    $exe = Join-Path (Join-Path $current "bin") "grok.exe"
+    $encoding = LauncherEncoding
+    try { $launcherBytes = $encoding.GetBytes("@echo off`r`n`"$($exe.Replace('%', '%%'))`" %*`r`nexit /b %ERRORLEVEL%`r`n") }
+    catch { Fail "$exe cannot be written to a batch launcher in code page $($encoding.CodePage); choose an install root and prefix representable in it" }
 
     New-Item -ItemType Directory -Path $BinDir -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $InstallRoot "versions") -Force | Out-Null
@@ -160,9 +173,7 @@ try {
     RemoveJunction $current
     New-Item -ItemType Junction -Path $current -Value $destination | Out-Null
 
-    $exe = Join-Path (Join-Path $current "bin") "grok.exe"
-    $escaped = $exe.Replace('%', '%%')
-    [System.IO.File]::WriteAllText($launcher, "@echo off`r`n`"$escaped`" %*`r`nexit /b %ERRORLEVEL%`r`n", [System.Text.Encoding]::ASCII)
+    [System.IO.File]::WriteAllBytes($launcher, $launcherBytes)
     WriteReceipt (Join-Path $InstallRoot "installed-version") $Version
     WriteReceipt $nameReceipt $Name
     WriteReceipt $prefixReceipt $Prefix
