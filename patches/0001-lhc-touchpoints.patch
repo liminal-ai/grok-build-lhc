@@ -2473,13 +2473,13 @@ index e24ad6d2..7779cdde 100644
                  let msg = match Self::do_hooks_trust_project(&self.session_info.cwd) {
                      Ok(root) => {
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs
-index e5638318..1c6c8547 100644
+index e5638318..8eecb495 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs
-@@ -69,6 +69,40 @@ fn configured_memory_retrieval_mode(
- /// A subagent with an active pacer (`pacer_max_attempts > 0`) paces 429s itself, so the sampler retry is disabled.
- /// With the pacer off, the subagent falls back to the sampler retry, so disabling the pacer is a true rollback rather than zero 429 handling.
- /// Main sessions always keep the sampler retry.
+@@ -63,6 +63,40 @@ fn configured_memory_retrieval_mode(
+         Some(_) => FtsOnly,
+     }
+ }
 +/// LHC (slice 1A): the latest compaction checkpoint, when LHC-marked
 +/// (`lhc_source_tip` present), gives capture the generated body and the tip it
 +/// was built from. Native or pre-1A checkpoints yield `None` and bootstrap
@@ -2514,9 +2514,9 @@ index e5638318..1c6c8547 100644
 +    })
 +}
 +
- fn subagent_sampler_rate_limit_threshold(is_subagent: bool, pacer_max_attempts: u32) -> u32 {
-     if is_subagent && pacer_max_attempts > 0 {
-         xai_grok_sampler::RATE_LIMIT_RETRY_DISABLED
+ /// Choose the sampler's own 429 retry threshold for a session's inference path.
+ ///
+ /// One 429 layer per role, never stacked, never zero.
 @@ -557,13 +591,36 @@ pub(crate) async fn spawn_session_actor(
          hard_clear_age_turns: session_pruning_config.hard_clear_age_turns,
      };
