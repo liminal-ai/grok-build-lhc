@@ -1385,7 +1385,6 @@ async fn remap_slice(
     Ok(events)
 }
 
-/// Process one command. Returns true if the worker should exit (crash).
 /// Slice 1B — tool pairing of the current native task, folded from every
 /// item the worker sees (live persist, bootstrap, replace re-map), so a
 /// host-generated segment end can only land at a complete exchange: no
@@ -1427,20 +1426,35 @@ impl SegmentState {
 }
 
 /// Slice 1B — after the tool-result item at `anchor` was submitted: when the
-/// exchange is complete, the anchor was **newly recorded** (a replay or
-/// repeated persist is a dedup skip and must not close a different, growing
-/// segment), no item-mapped close is pending, and the open turn has reached
-/// the threshold read from the live policy, append one ordinary `turn_end`.
-/// The native task continues; nothing is served, waited on, or summarized.
+/// exchange is complete, the anchor was **newly recorded**, and the open turn
+/// has reached the threshold read from the live policy, append one ordinary
+/// `turn_end`. The native task continues; nothing is served, waited on, or
+/// summarized.
+///
+/// "Newly recorded" is an identity check, not content dedup: a live persist
+/// mints a fresh occurrence through `map_item`, so a byte-identical exchange
+/// persisted again is a new key and a genuine candidate. Only a source that
+/// is already keyed (bootstrap / re-map never reach here; a replayed key
+/// comes back `Skipped`) is refused, so a segment never closes on an identity
+/// this batch did not record.
+///
+/// A still-deferred item-mapped close is not a reason to withhold segments.
+/// After a toolless Assistant a stop-gate continuation input leaves one
+/// deferred for the rest of the native task (its own `pre_synthetic` close
+/// for a turn-starting reason, the Assistant's close otherwise); tool-call
+/// items map no close, so holding segments on it would suppress every
+/// segment of the continued task until final completion. It keeps its own
+/// landing rules (next item-mapped close, `TurnEndFacts`, replace, flush)
+/// and receives the shell facts at the genuine native close exactly as
+/// without segmentation.
 async fn maybe_close_segment(
     sess: &mut LhcSession,
     session_id: &str,
     segment: &SegmentState,
-    close_pending: bool,
     anchor: &str,
     batch: &lhc::intake_stream::BatchResult,
 ) {
-    if close_pending || !segment.open_calls.is_empty() {
+    if !segment.open_calls.is_empty() {
         return;
     }
     let newly_recorded = batch
@@ -1481,6 +1495,7 @@ async fn maybe_close_segment(
     }
 }
 
+/// Process one command. Returns true if the worker should exit (crash).
 #[allow(clippy::too_many_arguments)] // test-util crash arms add optional params
 async fn process_cmd(
     cmd: CaptureCmd,
@@ -1573,15 +1588,7 @@ async fn process_cmd(
             };
             let batch = submit_mapped(sess, mapped).await;
             if let (Some(anchor), Ok(batch)) = (anchor, batch.as_ref()) {
-                maybe_close_segment(
-                    sess,
-                    session_id,
-                    segment,
-                    deferred_turn_end.is_some(),
-                    &anchor,
-                    batch,
-                )
-                .await;
+                maybe_close_segment(sess, session_id, segment, &anchor, batch).await;
             }
             false
         }

@@ -2032,6 +2032,154 @@ fn b2_steer_keeps_pairing_and_genuine_end_releases_abandoned_calls() {
 /// the still-running native task, the write-back body keeps complete pairs,
 /// 1A holds (no band recapture) across a second compact and a resume, and the
 /// resumed session still segments.
+/// Poll the turn projection directly (no worker command, so a deferred
+/// item-mapped close is not released by the observation itself).
+fn wait_turn_rows(
+    root: &std::path::Path,
+    sid: &str,
+    n: usize,
+) -> Vec<(String, Option<String>, Option<String>)> {
+    for _ in 0..300 {
+        let rows = turn_rows(root, sid);
+        if rows.len() >= n {
+            return rows;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    turn_rows(root, sid)
+}
+
+/// B4 (review correction) — a stop-gate continuation (`GoalClassifierNudge`,
+/// a turn-starting synthetic input) lands the toolless Assistant's deferred
+/// close through the existing supersede rule and leaves its own
+/// `pre_synthetic` close deferred for the rest of the native task (a
+/// non-turn-starting reason would instead leave the Assistant's close
+/// deferred — same `Option`, same consequence). Segments of the continued
+/// tool loop still close; the deferred close keeps its own landing rule and
+/// receives the shell facts at the genuine close (same key, no
+/// shell-authored third end); replace/bootstrap mint nothing.
+#[test]
+fn b4_deferred_close_from_stop_gate_continuation_does_not_block_segments() {
+    logcap::install();
+    let root = TempDir::new().unwrap();
+    let sid = "cert-1b-b4";
+    let mut p0 = ConversationItem::user("research the chapters");
+    p0.set_prompt_index(0);
+    let mut native = vec![ConversationItem::system("sys"), p0];
+    let handle = spawn_capture(sid, Some("/tmp"), &native, Some(root.path()), None).unwrap();
+    let _ = wait_exact(&handle, 2);
+
+    // First exchange, then the model stops without tools: close deferred.
+    let c1 = call("c1");
+    let r1 = ConversationItem::tool_result("c1", "small");
+    let partial = ConversationItem::assistant("partial answer");
+    // Stop-gate continuation input.
+    let mut cont = ConversationItem::user_meta("continue the task");
+    if let ConversationItem::User(u) = &mut cont {
+        u.synthetic_reason = Some(SyntheticReason::GoalClassifierNudge);
+    }
+    for item in [&c1, &r1, &partial, &cont] {
+        handle.persist(item);
+    }
+    native.extend([c1, r1, partial, cont]);
+
+    // No flush / list from here: both would release the deferred close.
+    let c2 = call("c2");
+    let r2 = big_result("c2", SEGMENT_TOKENS_OVER);
+    handle.persist(&c2);
+    handle.persist(&r2);
+    native.extend([c2, r2]);
+    // Rows: preamble, the Assistant's close landed by the continuation
+    // (supersede rule), the segment, the open continued task. The
+    // pre-synthetic close is still deferred at this point.
+    let rows = wait_turn_rows(root.path(), sid, 4);
+    assert_eq!(
+        rows,
+        vec![
+            ("closed".into(), None, None),
+            ("closed".into(), None, None),
+            (
+                "closed".into(),
+                Some("completed".into()),
+                Some(grok_lhc_host::SEGMENT_END_REASON.into())
+            ),
+            ("open".into(), None, None),
+        ],
+        "segment closes while an item-mapped close is still deferred"
+    );
+
+    let c3 = call("c3");
+    let r3 = ConversationItem::tool_result("c3", "small");
+    handle.persist(&c3);
+    handle.persist(&r3);
+    native.extend([c3, r3]);
+    // Genuine native close: the deferred close lands with the facts.
+    handle.turn_end_facts(1, completed_facts());
+    handle.flush_blocking();
+    let ev = handle.list_events_blocking().unwrap();
+    let ends = turn_ends(&ev);
+    assert_eq!(
+        ends.len(),
+        3,
+        "Assistant close + one segment end + the deferred pre-synthetic close, no shell-authored end"
+    );
+    assert_eq!(segment_ends(&ev).len(), 1);
+    let genuine = ends
+        .iter()
+        .find(|e| e.turn_end_payload().unwrap().outcome_reason.as_deref() == Some("completed"))
+        .expect("deferred close landed with facts");
+    assert!(genuine.turn_end_payload().unwrap().started_at.is_some());
+    assert!(
+        genuine
+            .idempotency_key()
+            .ends_with(":turn_end:pre_synthetic"),
+        "the deferred item-mapped key, not shell-authored: {}",
+        genuine.idempotency_key()
+    );
+    assert!(genuine.event_order() > segment_ends(&ev)[0].event_order());
+    assert_eq!(
+        turn_rows(root.path(), sid),
+        vec![
+            ("closed".into(), None, None),
+            ("closed".into(), None, None),
+            (
+                "closed".into(),
+                Some("completed".into()),
+                Some(grok_lhc_host::SEGMENT_END_REASON.into())
+            ),
+            (
+                "closed".into(),
+                Some("completed".into()),
+                Some("completed".into())
+            ),
+            ("open".into(), None, None),
+        ]
+    );
+    let keys_before = keys(&ev);
+
+    handle.replace_history(&native);
+    handle.flush_blocking();
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        keys(&handle.list_events_blocking().unwrap()),
+        keys_before,
+        "re-map mints nothing"
+    );
+    handle.shutdown_blocking();
+    wait_registry_gone(sid);
+    let handle2 = spawn_capture(sid, Some("/tmp"), &native, Some(root.path()), None).unwrap();
+    handle2.flush_blocking();
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        keys(&handle2.list_events_blocking().unwrap()),
+        keys_before,
+        "bootstrap mints nothing"
+    );
+    assert!(logcap::lines_for(sid, "segment").is_empty());
+    handle2.shutdown_blocking();
+    wait_registry_gone(sid);
+}
+
 #[test]
 fn b3_compact_moves_inside_native_task_and_1a_holds_across_resume() {
     use grok_lhc_host::{
