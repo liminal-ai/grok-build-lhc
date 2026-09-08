@@ -91,7 +91,11 @@ Rules: hooks are 1–5 line additive insertions marked
 `scripts/check-lhc-hooks.sh` and this table change in the same commit as any
 hook; after the hook commit, `scripts/refresh-lhc-patch.sh` regenerates the
 patch from `patches/BASE` and the patch is committed on its own. Patch
-`0001` currently covers only the Chunk 1 hooks — do not claim it covers 4–9.
+`0001` is the whole fork delta over `crates/codegen/` and the root
+`Cargo.toml` against `patches/BASE` — every hook above plus the non-marker
+upstream-file changes that ride with them (test literals, the 1A checkpoint
+field, workspace entry): 48 paths at `72a61251`. It is not a list of marker
+insertions; what it covers is whatever differs under those pathspecs.
 
 Schema v5 G1 carve-out (hooks 7–9): `xai-chat-state` stashes the last model
 call's `TokenUsage` and passes it through a defaulted trait method so the LHC
