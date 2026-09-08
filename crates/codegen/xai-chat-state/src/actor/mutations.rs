@@ -193,7 +193,7 @@ impl ChatStateActor {
                 "History repair modified the conversation"
             );
             // Full replace: persists atomically and re-bases token estimates.
-            self.replace_conversation(items, false);
+            self.replace_conversation(items, false, None);
         } else {
             // Nothing changed — put the conversation back untouched.
             self.state.conversation = items;
@@ -652,6 +652,7 @@ impl ChatStateActor {
         &mut self,
         items: Vec<ConversationItem>,
         is_compaction: bool,
+        lhc_source_tip: Option<u64>,
     ) {
         self.snapshot_turn_slice();
         if is_compaction && let Some(cap) = &mut self.state.turn_capture {
@@ -660,7 +661,14 @@ impl ChatStateActor {
         // `harness_trace_buffer` / `harness_trace_turns` intentionally untouched:
         // the planner/verifier subagents ran, so their sealed trace turns survive
         // a conversation replace (same intent as the `TruncateToPromptIndex` arm).
-        self.persistence.replace_history(&items);
+        match lhc_source_tip {
+            // LHC write-back body: native persists it; capture is told it is
+            // installed rather than receiving it as canonical source.
+            Some(tip) => self
+                .persistence
+                .replace_history_for_lhc_writeback(&items, tip),
+            None => self.persistence.replace_history(&items),
+        }
         let base_estimate = super::state::estimate_conversation_tokens(&items);
         let estimated_tokens = self.reseed_total_tokens(base_estimate);
         self.state.conversation = items;
@@ -695,7 +703,7 @@ impl ChatStateActor {
         let changed =
             crate::conversation_util::replace_or_insert_system_head(&mut conversation, prompt);
         debug_assert!(changed, "head mismatch must produce a change");
-        self.replace_conversation(conversation, false);
+        self.replace_conversation(conversation, false, None);
         changed
     }
 

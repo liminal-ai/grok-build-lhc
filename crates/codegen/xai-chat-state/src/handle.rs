@@ -273,19 +273,36 @@ impl ChatStateHandle {
 
     /// Replace conversation history.
     pub fn replace_conversation(&self, items: Vec<ConversationItem>) {
-        self.send_replace(items, false);
+        self.send_replace(items, false, None);
     }
 
     /// Replace conversation history for compaction.
     /// Sets `compaction_occurred` on the active turn capture.
     pub fn replace_conversation_for_compaction(&self, items: Vec<ConversationItem>) {
-        self.send_replace(items, true);
+        self.send_replace(items, true, None);
     }
 
-    fn send_replace(&self, items: Vec<ConversationItem>, is_compaction: bool) {
+    /// Replace conversation history with LHC's generated write-back body
+    /// (compaction semantics). `source_tip` — the canonical event order the
+    /// body was generated from — travels to persistence unchanged.
+    pub fn replace_conversation_for_lhc_writeback(
+        &self,
+        items: Vec<ConversationItem>,
+        source_tip: u64,
+    ) {
+        self.send_replace(items, true, Some(source_tip));
+    }
+
+    fn send_replace(
+        &self,
+        items: Vec<ConversationItem>,
+        is_compaction: bool,
+        lhc_source_tip: Option<u64>,
+    ) {
         let _ = self.cmd_tx.send(ChatStateCommand::ReplaceConversation {
             items,
             is_compaction,
+            lhc_source_tip,
         });
     }
 

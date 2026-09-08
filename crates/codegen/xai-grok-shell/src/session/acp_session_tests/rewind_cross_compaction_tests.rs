@@ -65,6 +65,7 @@ fn write_compacted_session_fixture(session_dir: &std::path::Path, ckpt_id: &str)
         created_at: "2026-01-01T00:00:00Z".to_string(),
         original_user_info: Some("UI0".to_string()),
         reread_file_paths: vec![],
+        lhc_source_tip: None,
     };
     std::fs::write(
         session_dir.join(format!("compaction_checkpoints/{ckpt_id}.json")),
@@ -675,4 +676,37 @@ fn restore_lhc_env(
             None => std::env::remove_var("GROK_LHC_COMPACT_EXPERIMENTAL"),
         }
     }
+}
+
+/// LHC (slice 1A): `lhc_source_tip` marks an LHC-generated checkpoint body.
+/// Older / native files read as `None`; a marked file round-trips its tip.
+#[test]
+fn compaction_checkpoint_lhc_source_tip_is_optional_and_round_trips() {
+    let legacy = serde_json::json!({
+        "checkpoint_id": "ck-legacy",
+        "prompt_index_at_compaction": 3,
+        "compacted_history": [],
+        "schema_version": 1,
+        "created_at": "2026-09-08T00:00:00Z"
+    });
+    let file: CompactionCheckpointFile = serde_json::from_value(legacy).unwrap();
+    assert_eq!(
+        file.lhc_source_tip, None,
+        "pre-1A / native checkpoint is unmarked"
+    );
+
+    let marked = CompactionCheckpointFile {
+        checkpoint_id: "ck-lhc".into(),
+        prompt_index_at_compaction: 3,
+        compacted_history: vec![ConversationItem::system("sys")],
+        schema_version: 1,
+        created_at: "2026-09-08T00:00:00Z".into(),
+        original_user_info: None,
+        reread_file_paths: vec![],
+        lhc_source_tip: Some(41),
+    };
+    let json = serde_json::to_string(&marked).unwrap();
+    assert!(json.contains("\"lhc_source_tip\":41"));
+    let back: CompactionCheckpointFile = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.lhc_source_tip, Some(41));
 }

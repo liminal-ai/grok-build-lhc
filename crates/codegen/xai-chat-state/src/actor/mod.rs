@@ -245,8 +245,9 @@ impl ChatStateActor {
             ChatStateCommand::ReplaceConversation {
                 items,
                 is_compaction,
+                lhc_source_tip,
             } => {
-                self.replace_conversation(items, is_compaction);
+                self.replace_conversation(items, is_compaction, lhc_source_tip);
             }
             ChatStateCommand::RepairHistory {
                 dry_run,

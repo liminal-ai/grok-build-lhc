@@ -1298,6 +1298,13 @@ pub struct CompactionCheckpointFile {
     /// Informational: kept for debugging and for understanding replay.
     #[serde(default)]
     pub reread_file_paths: Vec<String>,
+    /// LHC write-back provenance (fork): the canonical event order the
+    /// LHC-generated `compacted_history` was built from. `None` for native
+    /// compaction and for files written before this field existed. When
+    /// present, a resumed session tells LHC capture that this body is
+    /// generated context, not canonical source.
+    #[serde(default)]
+    pub lhc_source_tip: Option<u64>,
 }
 
 /// A compaction segment to persist under `compaction/segment_NNN.md`.

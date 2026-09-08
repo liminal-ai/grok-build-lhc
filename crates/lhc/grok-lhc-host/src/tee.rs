@@ -16,9 +16,11 @@ use xai_chat_state::{ChatPersistence, HostAssistantIdentity, StrictAppendAck, St
 use xai_grok_sampling_types::{ConversationItem, TokenUsage};
 
 use crate::capture::{
-    CaptureHandle, RegistrySnapshot, lookup_session_snapshot, registry_generation, spawn_capture,
+    CaptureHandle, RegistrySnapshot, lookup_session_snapshot, registry_generation,
+    spawn_capture_resumed,
 };
 use crate::gating::is_enabled;
+use crate::generated_prefix::GeneratedPrefix;
 use crate::inference::LhcInferenceSampler;
 use crate::mapping::token_usage_to_provider_usage;
 
@@ -31,14 +33,22 @@ use crate::mapping::token_usage_to_provider_usage;
 ///
 /// Disabled persist path (steady state, any other session's state): one
 /// generation atomic compare; no registry mutex, no SQLite.
+///
+/// `generated`: on resume after an LHC write-back, the LHC-marked checkpoint's
+/// body and source tip (slice 1A) — the leading items of `bootstrap` capture
+/// must not record as canonical source.
 pub fn tee_chat_persistence(
     session_id: &str,
     cwd: &str,
     bootstrap: &[ConversationItem],
+    generated: Option<GeneratedPrefix>,
     inner: Box<dyn ChatPersistence>,
     sampler: Option<Arc<dyn LhcInferenceSampler>>,
 ) -> Box<dyn ChatPersistence> {
-    if is_enabled() && spawn_capture(session_id, Some(cwd), bootstrap, None, sampler).is_none() {
+    if is_enabled()
+        && spawn_capture_resumed(session_id, Some(cwd), bootstrap, generated, None, sampler)
+            .is_none()
+    {
         tracing::warn!(
             session_id,
             "LHC: capture worker failed to start; resolving tee still installed"
@@ -152,6 +162,15 @@ impl ChatPersistence for LhcTeePersistence {
 
     fn replace_history(&mut self, items: &[ConversationItem]) {
         self.with_handle(|h| h.replace_history(items));
+        self.inner.replace_history(items);
+    }
+
+    /// LHC write-back (slice 1A): native persists the generated body exactly
+    /// as any replace; capture is told the body is *installed*, with the tip
+    /// it was generated from, instead of receiving it as source. Every other
+    /// whole-history replace keeps mirroring above.
+    fn replace_history_for_lhc_writeback(&mut self, items: &[ConversationItem], source_tip: u64) {
+        self.with_handle(|h| h.writeback_installed(items, source_tip));
         self.inner.replace_history(items);
     }
 

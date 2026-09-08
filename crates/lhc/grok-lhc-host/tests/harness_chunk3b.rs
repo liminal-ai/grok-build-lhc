@@ -380,7 +380,7 @@ impl HarnessSession {
 
         let rt = rt();
         let (mock, _rx) = MockChatPersistence::new();
-        let tee = tee_chat_persistence(sid, "/tmp", &native, Box::new(mock), None);
+        let tee = tee_chat_persistence(sid, "/tmp", &native, None, Box::new(mock), None);
         assert!(
             capture_active(sid),
             "tee must register capture when GROK_LHC=1"
@@ -445,7 +445,9 @@ impl HarnessSession {
             let native_before = actor.get_conversation().await;
             let body = build_writeback_conversation(&native_before, &wb.view, &wb.kinds)
                 .expect("build_writeback_conversation");
-            actor.replace_conversation_for_compaction(body.clone());
+            // Production route (slice 1A): the tee installs the body on
+            // capture with the compact's source tip; nothing is submitted.
+            actor.replace_conversation_for_lhc_writeback(body.clone(), wb.source_tip);
             let after = actor.get_conversation().await;
             assert_eq!(
                 body_fingerprint(&after),
@@ -711,21 +713,27 @@ fn b4_lhc_ahead_of_native_replace_is_transient_on_harness_body() {
         })
         .unwrap_or_else(|| body[0].text_content());
 
-    // Apply write-back onto capture while actor still holds old native.
-    h.capture.replace_history(&body);
+    // Install the write-back on capture while the actor still holds old
+    // native (slice 1A: installed, not submitted); a retry is idempotent and
+    // the generated band never enters the canonical record.
     h.capture.flush_blocking();
     let once = wait_events(&h.capture, 1);
     let once_keys = keys(&once);
-    h.capture.replace_history(&body);
+    h.capture.writeback_installed(&body, wb.source_tip);
+    h.capture.writeback_installed(&body, wb.source_tip);
     h.capture.flush_blocking();
     thread::sleep(Duration::from_millis(150));
     let again = h.capture.list_events_blocking().unwrap();
-    assert_eq!(keys(&again), once_keys, "retry must not re-key");
+    assert_eq!(
+        keys(&again),
+        once_keys,
+        "install/retry must not record or re-key"
+    );
     let hits = again
         .iter()
         .filter(|e| e.prompt_or_note_text().is_some_and(|t| t.contains(&needle)))
         .count();
-    assert_eq!(hits, 1, "band/summary must not double-record");
+    assert_eq!(hits, 0, "generated band/summary must not be canonical");
 
     // Evidence checklist
     assert!(
@@ -914,7 +922,7 @@ fn b7_perf_on_vs_off_and_compaction_wall() {
     }
     let sid_off = "harness-b7-off";
     let (mock, _) = MockChatPersistence::new();
-    let mut tee_off = tee_chat_persistence(sid_off, "/tmp", &[], Box::new(mock), None);
+    let mut tee_off = tee_chat_persistence(sid_off, "/tmp", &[], None, Box::new(mock), None);
     let item = ConversationItem::user("perf");
     let t0 = Instant::now();
     for _ in 0..200 {
@@ -927,7 +935,7 @@ fn b7_perf_on_vs_off_and_compaction_wall() {
     set_use_deterministic_inference_for_test(true);
     let sid_on = "harness-b7-on";
     let (mock, _) = MockChatPersistence::new();
-    let mut tee_on = tee_chat_persistence(sid_on, "/tmp", &[], Box::new(mock), None);
+    let mut tee_on = tee_chat_persistence(sid_on, "/tmp", &[], None, Box::new(mock), None);
     let cap = lookup_session(sid_on).expect("on capture");
     let t1 = Instant::now();
     for _ in 0..200 {

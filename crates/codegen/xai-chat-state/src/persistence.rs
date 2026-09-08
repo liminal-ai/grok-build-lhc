@@ -98,6 +98,17 @@ pub trait ChatPersistence: Send + 'static {
     /// Replace the entire chat history (compaction / rewind).
     fn replace_history(&mut self, items: &[ConversationItem]);
 
+    /// LHC write-back: the host installs LHC's generated compacted body as
+    /// the native conversation. Native persistence is unchanged (this default
+    /// forwards to [`Self::replace_history`]); an LHC-aware backend must not
+    /// capture the body as canonical source. `source_tip` is the canonical
+    /// event order the body was generated from, carried unchanged from the
+    /// compact operation so the checkpoint and the capture side agree.
+    fn replace_history_for_lhc_writeback(&mut self, items: &[ConversationItem], source_tip: u64) {
+        let _ = source_tip;
+        self.replace_history(items);
+    }
+
     /// Destructive image-strip rewrite: back up the on-disk history, then
     /// replace it, acking the DISK outcome. A failed backup gates off the
     /// rewrite so recoverability never silently evaporates; backends without

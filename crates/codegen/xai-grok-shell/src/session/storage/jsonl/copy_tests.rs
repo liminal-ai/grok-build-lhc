@@ -457,6 +457,7 @@ async fn write_checkpoint_file(adapter: &JsonlStorageAdapter, info: &Info, id: &
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 original_user_info: None,
                 reread_file_paths: vec![],
+                lhc_source_tip: None,
             },
         )
         .await

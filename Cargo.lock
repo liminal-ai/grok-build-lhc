@@ -4841,6 +4841,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "xai-chat-state",
  "xai-grok-sampling-types",
 ]

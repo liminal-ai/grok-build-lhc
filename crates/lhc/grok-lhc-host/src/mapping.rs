@@ -356,7 +356,25 @@ pub fn map_history(
     items: &[ConversationItem],
     turn_end_facts: &TurnEndFacts,
 ) -> (Vec<MappedEvent>, OccurrenceTracker) {
-    let mut tracker = OccurrenceTracker::new();
+    map_history_from(
+        session_id,
+        generation,
+        items,
+        turn_end_facts,
+        OccurrenceTracker::new(),
+    )
+}
+
+/// [`map_history`] continuing from `tracker`. Keys a genuine remainder after
+/// an LHC-generated prefix from the frozen pre-write-back baseline (slice 1A,
+/// `generated_prefix`); a fresh tracker reproduces plain [`map_history`].
+pub fn map_history_from(
+    session_id: &str,
+    generation: u64,
+    items: &[ConversationItem],
+    turn_end_facts: &TurnEndFacts,
+    mut tracker: OccurrenceTracker,
+) -> (Vec<MappedEvent>, OccurrenceTracker) {
     let mut out = Vec::new();
     for item in items {
         out.extend(map_item(

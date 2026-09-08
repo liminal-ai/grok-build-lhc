@@ -13,6 +13,7 @@ mod capture;
 mod compact;
 mod equivalence;
 mod gating;
+mod generated_prefix;
 mod idempotency;
 mod inference;
 mod mapping;
@@ -28,8 +29,9 @@ mod writeback_gates;
 pub use capture::{
     CAPTURE_OPEN_WAIT, CAPTURE_QUEUE_CAP, CaptureHandle, CaptureOpenState, CaptureOpenWaitError,
     RegistrySnapshot, any_capture_active, is_session_registered, lookup_session,
-    lookup_session_snapshot, registry_generation, spawn_capture,
+    lookup_session_snapshot, registry_generation, spawn_capture, spawn_capture_resumed,
 };
+pub use generated_prefix::{GeneratedPrefix, WALK_STOPPED_EARLY};
 
 #[cfg(any(test, feature = "test-util"))]
 pub use capture::{
@@ -57,8 +59,9 @@ pub use inference::{
 pub use lhc::shared_tech::{InferenceRequestMessage, InferenceRequestRole};
 pub use mapping::{
     MappedEvent, TurnEndFacts, apply_turn_end_facts, attach_assistant_identity,
-    attach_provider_usage, format_system_time_iso8601_millis, level_label, map_history, map_item,
-    map_model_change, shell_turn_end_event, token_usage_to_provider_usage,
+    attach_provider_usage, format_system_time_iso8601_millis, level_label, map_history,
+    map_history_from, map_item, map_model_change, shell_turn_end_event,
+    token_usage_to_provider_usage,
 };
 pub use runtime_config::{
     ConfigSource, LhcFileConfig, ResolvedLhcConfig, Sourced, applied_config, apply_resolved_config,
@@ -267,6 +270,11 @@ async fn serve_request_context_inner(
 /// Result of a successful Replace-mode compact, ready for host write-back.
 #[derive(Debug)]
 pub struct ReplaceCompactWriteback {
+    /// Canonical event order the compacted view (and so the write-back body)
+    /// was generated from — the worker's latched tip at compact time. Carried
+    /// unchanged into the native checkpoint and the write-back replace so
+    /// capture skips exactly this body on re-map (slice 1A).
+    pub source_tip: u64,
     /// LHC compact receipt total (view tokens) — diagnostics only.
     pub receipt_total_tokens: i64,
     /// Full compact receipt (bands, degraded rungs, gaps) — reportable.
@@ -326,7 +334,7 @@ pub async fn replace_compact_for_writeback_with_cancel_signal(
         return Err("no_capture_handle".into());
     };
     compact::note_replace_call();
-    let receipt = handle
+    let (receipt, source_tip) = handle
         .compact_thread_cancellable(cancel.clone(), signal.clone())
         .await
         .map_err(|err| {
@@ -362,6 +370,7 @@ pub async fn replace_compact_for_writeback_with_cancel_signal(
         err
     })?;
     Ok(ReplaceCompactWriteback {
+        source_tip,
         receipt_total_tokens: receipt.total_tokens,
         receipt,
         view,
@@ -439,8 +448,14 @@ mod tests {
         let session_id = "disabled-path-test-session";
         // Resolving tee is installed even when off (Y1 mid-session attach),
         // but no worker / no SQLite — only the any_capture_active atomic.
-        let out =
-            tee_chat_persistence(session_id, "/tmp", &[], Box::new(NullChatPersistence), None);
+        let out = tee_chat_persistence(
+            session_id,
+            "/tmp",
+            &[],
+            None,
+            Box::new(NullChatPersistence),
+            None,
+        );
         assert!(
             !capture_active(session_id),
             "disabled path must not register a capture worker"
@@ -526,6 +541,7 @@ mod tests {
             "aa1-disabled-b",
             "/tmp",
             &[],
+            None,
             Box::new(NullChatPersistence),
             None,
         );
@@ -644,6 +660,7 @@ mod tests {
             "ab1-disabled-b",
             "/tmp",
             &[],
+            None,
             Box::new(NullChatPersistence),
             None,
         );

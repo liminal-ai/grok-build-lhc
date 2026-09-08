@@ -7,20 +7,21 @@ use std::time::Duration;
 
 use grok_lhc_host::{
     CaptureHandle, CaptureOpenState, CaptureOpenWaitError, CompactEventBridge, CompactMode,
-    ContextEngine, CountingLhcInferenceSampler, LhcFileConfig, LhcInferenceRequest,
-    MockLhcInferenceSampler, RUNTIME_NOTE_PREFIX, ServeDecision, SourceKindIndex,
-    apply_resolved_config, apply_serve_decision, body_has_tool_cycle, build_writeback_conversation,
-    capture_active, capture_archive_ready, capture_model_or_thinking_change,
-    clear_last_serve_outcome, clear_open_hold_for_test, compare_serve_equivalence,
-    decide_substitution, encode_session_id_for_path, equivalence_snapshot, execute_repair,
-    format_status_report, health_check, inference_sampler_registered, informational_hit_count,
-    is_enabled, last_serve_outcome, lookup_session, native_prompt_indices,
-    observe_serve_equivalence, paths_disagree, plan_repair, project_conversation_canonical,
-    replace_call_count, reset_compact_call_counters, reset_equivalence_counters,
-    resolve_compact_mode, resolve_lhc_config, serve_compared_turns, serve_fallback_turns,
-    serve_request_context, set_compact_mode_for_test, set_force_classify_list_failure,
-    set_open_hold_for_test, shutdown_session, spawn_capture, status_report, structural_hit_count,
-    tee_chat_persistence, thread_file_path, wait_capture_archive_ready,
+    ContextEngine, CountingLhcInferenceSampler, GeneratedPrefix, LhcFileConfig,
+    LhcInferenceRequest, MockLhcInferenceSampler, RUNTIME_NOTE_PREFIX, ServeDecision,
+    SourceKindIndex, WALK_STOPPED_EARLY, apply_resolved_config, apply_serve_decision,
+    body_has_tool_cycle, build_writeback_conversation, capture_active, capture_archive_ready,
+    capture_model_or_thinking_change, clear_last_serve_outcome, clear_open_hold_for_test,
+    compare_serve_equivalence, decide_substitution, encode_session_id_for_path,
+    equivalence_snapshot, execute_repair, format_status_report, health_check,
+    inference_sampler_registered, informational_hit_count, is_enabled, last_serve_outcome,
+    lookup_session, native_prompt_indices, observe_serve_equivalence, paths_disagree, plan_repair,
+    project_conversation_canonical, replace_call_count, reset_compact_call_counters,
+    reset_equivalence_counters, resolve_compact_mode, resolve_lhc_config, serve_compared_turns,
+    serve_fallback_turns, serve_request_context, set_compact_mode_for_test,
+    set_force_classify_list_failure, set_open_hold_for_test, shutdown_session, spawn_capture,
+    spawn_capture_resumed, status_report, structural_hit_count, tee_chat_persistence,
+    thread_file_path, wait_capture_archive_ready,
 };
 use lhc::intake_stream::{BatchEventOutcome, BatchSkipReason, EventRecord};
 use lhc::shared_tech::view::{
@@ -110,7 +111,7 @@ fn disabled_tee_is_passthrough_no_registry() {
         std::env::set_var("GROK_LHC_ROOT", root.path());
     }
     let sid = "cert-disabled";
-    let _p = tee_chat_persistence(sid, "/tmp", &[], Box::new(NullChatPersistence), None);
+    let _p = tee_chat_persistence(sid, "/tmp", &[], None, Box::new(NullChatPersistence), None);
     assert!(!capture_active(sid));
     match prev {
         Some(v) => unsafe { std::env::set_var("GROK_LHC", v) },
@@ -580,7 +581,7 @@ fn poisoned_lhc_disables_and_host_continues() {
     }
     let sid = "cert-poison";
     let (mock, mut rx) = xai_chat_state::MockChatPersistence::new();
-    let mut tee = tee_chat_persistence(sid, "/tmp", &[], Box::new(mock), None);
+    let mut tee = tee_chat_persistence(sid, "/tmp", &[], None, Box::new(mock), None);
     let handle = lookup_session(sid).unwrap();
     handle.poison_blocking();
     for i in 0..5 {
@@ -1034,6 +1035,7 @@ async fn tee_from_async_context_does_not_block_or_panic() {
                 sid,
                 "/tmp",
                 &[],
+                None,
                 Box::new(xai_chat_state::NullChatPersistence),
                 None,
             );
@@ -1066,6 +1068,7 @@ async fn tee_drop_from_async_context_does_not_block_or_panic() {
                 sid,
                 "/tmp",
                 &[],
+                None,
                 Box::new(xai_chat_state::NullChatPersistence),
                 None,
             );
@@ -1172,7 +1175,7 @@ fn refused_open_tee_stops_and_host_persists() {
 
     let (mock, mut rx) = xai_chat_state::MockChatPersistence::new();
     with_lhc_env(root.path(), || {
-        let mut tee = tee_chat_persistence(sid, "/tmp", &[], Box::new(mock), None);
+        let mut tee = tee_chat_persistence(sid, "/tmp", &[], None, Box::new(mock), None);
         // Probe the shared handle before/while open refuses.
         let probe = lookup_session(sid);
         wait_registry_gone(sid);
@@ -1221,7 +1224,7 @@ async fn tee_chat_persistence_methods_reach_inner_and_lhc() {
     tokio::time::timeout(Duration::from_secs(15), async {
         with_lhc_env(root.path(), || {
             let (mock, mut rx) = xai_chat_state::MockChatPersistence::new();
-            let mut tee = tee_chat_persistence(sid, "/tmp", &[], Box::new(mock), None);
+            let mut tee = tee_chat_persistence(sid, "/tmp", &[], None, Box::new(mock), None);
             for _ in 0..100 {
                 if capture_active(sid) {
                     break;
@@ -1489,58 +1492,49 @@ fn writeback_body_is_fixpoint_through_replace_history() {
     );
     assert_eq!(native_prompt_indices(&body1), vec![1, 2]);
 
+    // Production route (slice 1A): the body is installed, never submitted;
+    // installing it again (second compact, same view) records nothing.
     let handle = spawn_capture(sid, Some("/tmp"), &native, Some(root.path()), None).unwrap();
-    let _ = wait_events(&handle, 1);
+    let seeded = wait_events(&handle, 1);
+    let seeded_keys = keys(&seeded);
+    let tip = source_tip(&seeded);
+    handle.writeback_installed(&body1, tip);
     handle.replace_history(&body1);
-    handle.flush_blocking();
-    let once = wait_events(&handle, 1);
-    let once_keys = keys(&once);
+    handle.writeback_installed(&body2, tip);
     handle.replace_history(&body2);
     handle.flush_blocking();
     thread::sleep(Duration::from_millis(150));
     let again = handle.list_events_blocking().unwrap();
     assert_eq!(
         keys(&again),
-        once_keys,
-        "fixpoint body must not re-key on second replace"
+        seeded_keys,
+        "installed fixpoint body must never record or re-key"
     );
     handle.shutdown_blocking();
 }
 
-/// (1) Prune-shaped replace of a post-write-back body emits nothing.
-/// Would fail if prune-shaped replace started minting new keys for survivors.
+/// (1) The native tool-result prune (hard clear in place, same call id) of an
+/// installed write-back body emits nothing. Would fail if the in-place
+/// rewrite stopped the prefix walk and the body fell back to a full re-map.
 #[test]
-fn writeback_prune_shaped_replace_emits_nothing() {
+fn writeback_in_place_prune_after_install_emits_nothing() {
     let root = TempDir::new().unwrap();
     let sid = "cert-wb-prune";
     let (native, body) = writeback_fixture();
     let handle = spawn_capture(sid, Some("/tmp"), &native, Some(root.path()), None).unwrap();
-    let _seeded = wait_events(&handle, 1);
-    handle.replace_history(&body);
-    handle.flush_blocking();
-    let after_wb = wait_events(&handle, 1);
-    let before_keys = keys(&after_wb);
-    let before_len = after_wb.len();
+    let seeded = wait_events(&handle, 1);
+    let before_keys = keys(&seeded);
+    let before_len = seeded.len();
+    handle.writeback_installed(&body, source_tip(&seeded));
 
-    // Prune-shaped: drop band meta + earlier turns; keep system + live tail.
-    let pruned: Vec<_> = body
+    let idx = body
         .iter()
-        .filter(|i| match i {
-            ConversationItem::User(u) if u.synthetic_reason.is_none() => {
-                i.text_content().contains("live-2")
-            }
-            ConversationItem::Assistant(_) => i.text_content().contains("a2"),
-            ConversationItem::System(_) => true,
-            _ => false,
-        })
-        .cloned()
-        .collect();
-    assert!(
-        pruned.len() < body.len(),
-        "fixture must actually prune ({} vs {})",
-        pruned.len(),
-        body.len()
-    );
+        .position(|i| matches!(i, ConversationItem::ToolResult(_)))
+        .expect("fixture body carries the served tool result");
+    let mut pruned = body.clone();
+    if let ConversationItem::ToolResult(tr) = &body[idx] {
+        pruned[idx] = ConversationItem::tool_result(&tr.tool_call_id, "[cleared]");
+    }
     for _ in 0..3 {
         handle.replace_history(&pruned);
     }
@@ -1550,7 +1544,7 @@ fn writeback_prune_shaped_replace_emits_nothing() {
     assert_eq!(
         after.len(),
         before_len,
-        "prune-shaped write-back path must add zero events"
+        "in-place prune of the installed body must add zero events"
     );
     assert_eq!(keys(&after), before_keys);
     handle.shutdown_blocking();
@@ -1559,7 +1553,7 @@ fn writeback_prune_shaped_replace_emits_nothing() {
 /// (2) Genuine compact write-back records the band summary exactly once.
 /// Would fail on zero (summary lost) or twice (tee double-fire / re-key).
 #[test]
-fn writeback_genuine_compact_summary_records_exactly_once() {
+fn writeback_generated_band_never_enters_canonical_record() {
     let root = TempDir::new().unwrap();
     let sid = "cert-wb-summary-once";
     let (native, body) = writeback_fixture();
@@ -1567,30 +1561,27 @@ fn writeback_genuine_compact_summary_records_exactly_once() {
     let before = wait_events(&handle, 1);
     let before_keys = keys(&before);
 
-    handle.replace_history(&body);
+    // Install (production route), then genuine work through both live
+    // persist and a whole-history replace carrying the body + suffix.
+    handle.writeback_installed(&body, source_tip(&before));
+    let x = ConversationItem::user("after compact");
+    handle.persist(&x);
+    let mut with_suffix = body.clone();
+    with_suffix.push(x);
+    with_suffix.push(ConversationItem::user("and again"));
+    handle.replace_history(&with_suffix);
     handle.flush_blocking();
-    let after = wait_events(&handle, before.len() + 1);
+    let after = wait_events(&handle, before.len() + 2);
     let new_keys: BTreeSet<_> = keys(&after).difference(&before_keys).cloned().collect();
-    assert!(
-        !new_keys.is_empty(),
-        "genuine write-back must record something"
-    );
-    let summary_hits: Vec<_> = after
-        .iter()
-        .filter(|e| {
-            e.prompt_or_note_text()
-                .is_some_and(|t| t.contains(WB_BAND_SUMMARY_NEEDLE))
-        })
-        .collect();
     assert_eq!(
-        summary_hits.len(),
-        1,
-        "band summary must appear exactly once, got {}",
-        summary_hits.len()
+        new_keys.len(),
+        2,
+        "exactly the two genuine prompts, got {new_keys:?}"
     );
-    assert!(
-        new_keys.contains(summary_hits[0].idempotency_key()),
-        "summary must be among the newly recorded keys"
+    assert_eq!(
+        summary_count(&after),
+        0,
+        "generated band summary must not be canonical"
     );
     handle.shutdown_blocking();
 }
@@ -1603,14 +1594,13 @@ fn writeback_repeated_unchanged_body_records_nothing() {
     let sid = "cert-wb-repeat";
     let (native, body) = writeback_fixture();
     let handle = spawn_capture(sid, Some("/tmp"), &native, Some(root.path()), None).unwrap();
-    let _ = wait_events(&handle, 1);
-    handle.replace_history(&body);
-    handle.flush_blocking();
     let once = wait_events(&handle, 1);
     let once_keys = keys(&once);
     let once_len = once.len();
+    let tip = source_tip(&once);
 
     for _ in 0..4 {
+        handle.writeback_installed(&body, tip);
         handle.replace_history(&body);
     }
     handle.flush_blocking();
@@ -1621,10 +1611,10 @@ fn writeback_repeated_unchanged_body_records_nothing() {
     handle.shutdown_blocking();
 }
 
-/// (4) Crash mid-write-back must not double-record on retry.
-/// Arms a crash after **one novel (Recorded)** event of the replace is
-/// committed — not after the preserved system message (which is dedup-skipped).
-/// Would fail if a partial apply + retry minted a second summary key.
+/// (4) Crash mid-replace after install must not double-record on resume.
+/// The replace carries the installed body + a genuine suffix; the crash lands
+/// after one novel event. Resume with the marked body recovers the rest of the
+/// suffix exactly once; the band never enters the record.
 #[test]
 fn writeback_crash_mid_replace_no_double_on_retry() {
     let root = TempDir::new().unwrap();
@@ -1634,72 +1624,484 @@ fn writeback_crash_mid_replace_no_double_on_retry() {
     let seeded = wait_events(&handle, 1);
     let seeded_keys = keys(&seeded);
     let seeded_len = seeded.len();
+    let tip = source_tip(&seeded);
+    handle.writeback_installed(&body, tip);
 
-    // Partial apply: crash after the first *novel* event (band summary) lands.
+    let suffix = vec![
+        ConversationItem::user("x"),
+        ConversationItem::user("continue"),
+        ConversationItem::user("y"),
+    ];
+    let mut with_suffix = body.clone();
+    with_suffix.extend(suffix.iter().cloned());
+
+    // Partial apply: crash after the first *novel* event of the suffix.
     handle.arm_crash_mid_replace(1);
-    handle.replace_history(&body);
-    // Worker exits on mid-replace crash; wait for registry clear.
+    handle.replace_history(&with_suffix);
     wait_registry_gone(sid);
     thread::sleep(Duration::from_millis(200));
 
-    // Discriminating observation: mid-apply crash must have committed the
-    // novel band summary (not merely died before any new Recorded event).
     let probe = spawn_capture(sid, Some("/tmp"), &[], Some(root.path()), None).unwrap();
     thread::sleep(Duration::from_millis(100));
     let partial = probe.list_events_blocking().unwrap();
-    let summary_count = |ev: &[EventRecord]| {
-        ev.iter()
-            .filter(|e| {
-                e.prompt_or_note_text()
-                    .is_some_and(|t| t.contains(WB_BAND_SUMMARY_NEEDLE))
-            })
-            .count()
-    };
+    assert_eq!(
+        partial.len(),
+        seeded_len + 1,
+        "crash must land after one novel event"
+    );
     assert_eq!(
         summary_count(&partial),
-        1,
-        "mid-apply crash must leave exactly one novel band summary committed \
-         (arming after the dedup-skipped system message is a vacuous no-op)"
-    );
-    assert!(
-        partial.len() > seeded_len,
-        "partial apply must grow past bootstrap seed"
+        0,
+        "band must not be recorded before the crash"
     );
     probe.shutdown_blocking();
     wait_registry_gone(sid);
 
-    // Host already holds the write-back body; reopen and apply again.
-    let handle2 = spawn_capture(sid, Some("/tmp"), &body, Some(root.path()), None).unwrap();
+    // Resume: native holds body + suffix; the checkpoint marks the body.
+    let generated = GeneratedPrefix {
+        items: body.clone(),
+        source_tip: tip,
+    };
+    let handle2 = spawn_capture_resumed(
+        sid,
+        Some("/tmp"),
+        &with_suffix,
+        Some(generated.clone()),
+        Some(root.path()),
+        None,
+    )
+    .unwrap();
     handle2.flush_blocking();
-    let mut after_retry = wait_events(&handle2, seeded_len);
-    for _ in 0..40 {
-        thread::sleep(Duration::from_millis(50));
-        let cur = handle2.list_events_blocking().unwrap();
-        if cur.len() == after_retry.len() && cur.len() > seeded_len {
-            after_retry = cur;
-            break;
-        }
-        after_retry = cur;
-    }
+    let after_retry = wait_events(&handle2, seeded_len + suffix.len());
+    assert_eq!(after_retry.len(), seeded_len + suffix.len());
     assert_eq!(
         summary_count(&after_retry),
-        1,
-        "after crash+retry summary must appear exactly once"
+        0,
+        "band must not be recorded on resume"
     );
     let keys_once = keys(&after_retry);
     assert!(seeded_keys.is_subset(&keys_once));
 
-    handle2.replace_history(&body);
+    handle2.replace_history(&with_suffix);
     handle2.flush_blocking();
     thread::sleep(Duration::from_millis(150));
     let again = handle2.list_events_blocking().unwrap();
-    assert_eq!(
-        summary_count(&again),
-        1,
-        "second write-back must not double summary"
-    );
-    assert_eq!(keys(&again), keys_once);
+    assert_eq!(keys(&again), keys_once, "second replace must not re-key");
     handle2.shutdown_blocking();
+    wait_registry_gone(sid);
+
+    let handle3 = spawn_capture_resumed(
+        sid,
+        Some("/tmp"),
+        &with_suffix,
+        Some(generated),
+        Some(root.path()),
+        None,
+    )
+    .unwrap();
+    handle3.flush_blocking();
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        keys(&handle3.list_events_blocking().unwrap()),
+        keys_once,
+        "second resume must record nothing"
+    );
+    handle3.shutdown_blocking();
+}
+
+// ── Slice 1A: generated LHC context is not canonical input ─────────────
+
+/// Highest recorded event order — what the worker latches as `generation`
+/// and what the compact acks as the body's source tip.
+fn source_tip(events: &[EventRecord]) -> u64 {
+    events
+        .iter()
+        .map(|e| e.event_order())
+        .max()
+        .unwrap_or(0)
+        .max(0) as u64
+}
+
+fn summary_count(events: &[EventRecord]) -> usize {
+    events
+        .iter()
+        .filter(|e| {
+            e.prompt_or_note_text()
+                .is_some_and(|t| t.contains("[context"))
+        })
+        .count()
+}
+
+/// Source with a repeated real prompt `D` (ordinary: "continue" resends).
+fn repeated_prompt_native() -> (Vec<ConversationItem>, ConversationItem) {
+    let d = ConversationItem::user("continue");
+    let native = vec![
+        ConversationItem::system("sys"),
+        d.clone(),
+        ConversationItem::assistant("a0"),
+        d.clone(),
+        ConversationItem::assistant("a1"),
+    ];
+    (native, d)
+}
+
+/// An LHC-generated body: band + served tail with a tool round.
+fn generated_body() -> Vec<ConversationItem> {
+    vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user_meta("[context · brief] two continues, both answered"),
+        ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: "c1".into(),
+            name: "bash".into(),
+            arguments: "{\"cmd\":\"ls\"}".into(),
+        }]),
+        ConversationItem::tool_result("c1", "file_a"),
+        ConversationItem::assistant("a1"),
+    ]
+}
+
+/// Process-global capture of WARN/ERROR tracing lines (the capture worker
+/// logs from its own thread, so a thread-local subscriber would miss it).
+mod logcap {
+    use std::sync::{Mutex, OnceLock};
+
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+    fn lines() -> &'static Mutex<Vec<String>> {
+        static LINES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+        LINES.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    struct Line(String);
+    impl Visit for Line {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.push_str(&format!(" {}={:?}", field.name(), value));
+        }
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.push_str(&format!(" {}={}", field.name(), value));
+        }
+    }
+
+    struct Cap;
+    impl<S: tracing::Subscriber> Layer<S> for Cap {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            if *event.metadata().level() > tracing::Level::WARN {
+                return;
+            }
+            let mut line = Line(String::new());
+            event.record(&mut line);
+            lines().lock().unwrap().push(line.0);
+        }
+    }
+
+    pub fn install() {
+        static ONCE: OnceLock<()> = OnceLock::new();
+        ONCE.get_or_init(|| {
+            let _ = tracing::subscriber::set_global_default(Registry::default().with(Cap));
+        });
+    }
+
+    /// Captured WARN/ERROR lines mentioning both `session_id` and `needle`.
+    pub fn lines_for(session_id: &str, needle: &str) -> Vec<String> {
+        lines()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.contains(session_id) && l.contains(needle))
+            .cloned()
+            .collect()
+    }
+}
+
+/// A1 in-process: after the body is installed, whole-history replaces record
+/// only genuine changes — nothing for the body, the changed System head once,
+/// nothing for an in-place tool-result prune, and only the uncaptured part of
+/// a suffix whose repeated prompt `D` continues the source's occurrence count.
+#[test]
+fn a1_replace_after_install_records_only_genuine_changes() {
+    logcap::install();
+    let root = TempDir::new().unwrap();
+    let sid = "cert-1a-inprocess";
+    let (native, d) = repeated_prompt_native();
+    let handle = spawn_capture(sid, Some("/tmp"), &native, Some(root.path()), None).unwrap();
+    let seeded = wait_exact(&handle, 7);
+    let seeded_keys = keys(&seeded);
+    let tip = source_tip(&seeded);
+
+    let body = generated_body();
+    handle.writeback_installed(&body, tip);
+    handle.replace_history(&body);
+    handle.flush_blocking();
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        keys(&handle.list_events_blocking().unwrap()),
+        seeded_keys,
+        "installed body + replace with it records nothing"
+    );
+    assert!(
+        logcap::lines_for(sid, "source tip differs").is_empty(),
+        "in-process tip must equal the worker snapshot"
+    );
+
+    // Memory-reminder upsert rewrites the head in place: captured once.
+    let mut head = body.clone();
+    head[0] = ConversationItem::system("sys + memory reminder");
+    handle.replace_history(&head);
+    handle.replace_history(&head);
+    handle.flush_blocking();
+    let after_head = wait_events(&handle, 8);
+    let new_keys: BTreeSet<_> = keys(&after_head)
+        .difference(&seeded_keys)
+        .cloned()
+        .collect();
+    assert_eq!(
+        new_keys.len(),
+        1,
+        "changed head recorded once, got {new_keys:?}"
+    );
+    assert!(after_head.iter().any(|e| {
+        e.prompt_or_note_text()
+            .is_some_and(|t| t == "sys + memory reminder")
+    }));
+
+    // Hard clear of the body's tool result in place: nothing.
+    let mut pruned = head.clone();
+    pruned[3] = ConversationItem::tool_result("c1", "[cleared]");
+    handle.replace_history(&pruned);
+    handle.flush_blocking();
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        keys(&handle.list_events_blocking().unwrap()),
+        keys(&after_head)
+    );
+
+    // Live suffix X, D (D continues at occurrence 2), then a replace carrying
+    // body + X, D, Y: only Y is new.
+    let x = ConversationItem::user("x");
+    handle.persist(&x);
+    handle.persist(&d);
+    handle.flush_blocking();
+    let after_live = wait_events(&handle, 10);
+    let mut with_suffix = pruned.clone();
+    with_suffix.extend([x, d.clone(), ConversationItem::user("y")]);
+    handle.replace_history(&with_suffix);
+    handle.flush_blocking();
+    let after = wait_events(&handle, 11);
+    let new_keys: BTreeSet<_> = keys(&after)
+        .difference(&keys(&after_live))
+        .cloned()
+        .collect();
+    assert_eq!(new_keys.len(), 1, "only Y is new, got {new_keys:?}");
+    assert_eq!(summary_count(&after), 0, "band never canonical");
+    assert!(logcap::lines_for(sid, WALK_STOPPED_EARLY).is_empty());
+    handle.shutdown_blocking();
+}
+
+/// A1 resume: source D:0/D:1; body installed; live X and D:2 captured, Y not.
+/// Resume with the marked checkpoint records only Y; a second resume records
+/// nothing; an unmarked (native) checkpoint keeps today's bootstrap capture.
+#[test]
+fn a1_resume_from_marked_checkpoint_recovers_only_uncaptured_suffix() {
+    logcap::install();
+    let root = TempDir::new().unwrap();
+    let sid = "cert-1a-resume";
+    let (native, d) = repeated_prompt_native();
+    let body = generated_body();
+    let x = ConversationItem::user("x");
+    let y = ConversationItem::user("y");
+    let mut with_suffix = body.clone();
+    with_suffix.extend([x.clone(), d.clone(), y.clone()]);
+
+    let (tip, keys_before_crash) = {
+        let handle = spawn_capture(sid, Some("/tmp"), &native, Some(root.path()), None).unwrap();
+        let seeded = wait_exact(&handle, 7);
+        let tip = source_tip(&seeded);
+        handle.writeback_installed(&body, tip);
+        handle.persist(&x);
+        handle.persist(&d);
+        handle.flush_blocking();
+        let live = wait_exact(&handle, 9);
+        assert_eq!(summary_count(&live), 0);
+        handle.shutdown_blocking();
+        wait_registry_gone(sid);
+        (tip, keys(&live))
+    };
+
+    let generated = GeneratedPrefix {
+        items: body.clone(),
+        source_tip: tip,
+    };
+    let resumed = spawn_capture_resumed(
+        sid,
+        Some("/tmp"),
+        &with_suffix,
+        Some(generated.clone()),
+        Some(root.path()),
+        None,
+    )
+    .unwrap();
+    let after = wait_exact(&resumed, 10);
+    let new_keys: BTreeSet<_> = keys(&after)
+        .difference(&keys_before_crash)
+        .cloned()
+        .collect();
+    assert_eq!(
+        new_keys.len(),
+        1,
+        "first resume records only Y, got {new_keys:?}"
+    );
+    assert!(
+        after
+            .iter()
+            .any(|e| e.idempotency_key() == new_keys.iter().next().unwrap()
+                && e.prompt_or_note_text().as_deref() == Some("y"))
+    );
+    assert_eq!(summary_count(&after), 0);
+    assert!(logcap::lines_for(sid, WALK_STOPPED_EARLY).is_empty());
+    resumed.shutdown_blocking();
+    wait_registry_gone(sid);
+
+    let again = spawn_capture_resumed(
+        sid,
+        Some("/tmp"),
+        &with_suffix,
+        Some(generated),
+        Some(root.path()),
+        None,
+    )
+    .unwrap();
+    again.flush_blocking();
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(keys(&again.list_events_blocking().unwrap()), keys(&after));
+    again.shutdown_blocking();
+    wait_registry_gone(sid);
+
+    // Unmarked checkpoint (native compaction / pre-1A file): no generated
+    // prefix is passed, and bootstrap captures the body as it always did.
+    let unmarked = spawn_capture(sid, Some("/tmp"), &with_suffix, Some(root.path()), None).unwrap();
+    unmarked.flush_blocking();
+    let recaptured = wait_events(&unmarked, after.len() + 1);
+    assert!(recaptured.len() > after.len());
+    assert_eq!(
+        summary_count(&recaptured),
+        1,
+        "unmarked path keeps today's behaviour"
+    );
+    unmarked.shutdown_blocking();
+}
+
+/// A1: a deferred genuine completion (toolless Assistant awaiting shell
+/// facts) survives the install and closes with its facts, exactly once.
+#[test]
+fn a1_install_keeps_deferred_completion_for_its_facts() {
+    let root = TempDir::new().unwrap();
+    let sid = "cert-1a-deferred";
+    let (native, _) = repeated_prompt_native();
+    let handle = spawn_capture(sid, Some("/tmp"), &native, Some(root.path()), None).unwrap();
+    let seeded = wait_exact(&handle, 7);
+    let tip = source_tip(&seeded);
+    let turn_ends_before = seeded
+        .iter()
+        .filter(|e| e.event_kind().as_str() == "turn_end")
+        .count();
+
+    // No flush or list between the persist and the facts: `Flush` and
+    // `ListEvents` deliberately land a deferred close, which is exactly what
+    // the install must not do on its own. Had the install flushed the close
+    // empty, the facts would find nothing deferred and the shell-authored
+    // close would land as a *second* turn_end under another key.
+    handle.persist(&ConversationItem::user("q"));
+    handle.persist(&ConversationItem::assistant("final answer"));
+    handle.writeback_installed(&generated_body(), tip);
+    handle.turn_end_facts(
+        3,
+        grok_lhc_host::TurnEndFacts {
+            outcome: Some("completed"),
+            outcome_reason: Some("completed".into()),
+            started_at: None,
+            ended_at: None,
+        },
+    );
+    handle.flush_blocking();
+    let closed = wait_exact(&handle, 10);
+    let turn_ends: Vec<_> = closed
+        .iter()
+        .filter(|e| e.event_kind().as_str() == "turn_end")
+        .collect();
+    assert_eq!(
+        turn_ends.len(),
+        turn_ends_before + 1,
+        "exactly one close for the deferred completion"
+    );
+    let last = turn_ends
+        .last()
+        .unwrap()
+        .turn_end_payload()
+        .expect("payload");
+    assert_eq!(last.outcome.map(|o| o.as_str()), Some("completed"));
+    handle.shutdown_blocking();
+}
+
+/// C1: the inherited-prefix shape (index 0 differs) stops the walk, warns with
+/// the fixed prefix, and falls back to today's full re-map for that slice.
+#[test]
+fn c1_inherited_prefix_shape_warns_and_falls_back() {
+    logcap::install();
+    let root = TempDir::new().unwrap();
+    let sid = "cert-1a-c1-inherited";
+    let (native, _) = repeated_prompt_native();
+    let handle = spawn_capture(sid, Some("/tmp"), &native, Some(root.path()), None).unwrap();
+    let seeded = wait_exact(&handle, 7);
+    let tip = source_tip(&seeded);
+    let body = generated_body();
+    handle.writeback_installed(&body, tip);
+
+    let mut forked = body.clone();
+    forked[0] = ConversationItem::user("inherited parent head");
+    handle.replace_history(&forked);
+    handle.flush_blocking();
+    let after = wait_events(&handle, 8);
+    assert_eq!(
+        summary_count(&after),
+        1,
+        "fallback re-map records the body once"
+    );
+    let warns = logcap::lines_for(sid, WALK_STOPPED_EARLY);
+    assert_eq!(warns.len(), 1, "exactly one early-stop warn, got {warns:?}");
+    assert!(warns[0].contains("index=0") && warns[0].contains("digest_mismatch"));
+    handle.shutdown_blocking();
+}
+
+/// C1: an image-strip / removal inside the generated body stops the walk
+/// mid-way, warns with index and cause, and falls back to the full re-map.
+#[test]
+fn c1_image_strip_shape_warns_and_falls_back() {
+    logcap::install();
+    let root = TempDir::new().unwrap();
+    let sid = "cert-1a-c1-strip";
+    let (native, _) = repeated_prompt_native();
+    let handle = spawn_capture(sid, Some("/tmp"), &native, Some(root.path()), None).unwrap();
+    let seeded = wait_exact(&handle, 7);
+    let tip = source_tip(&seeded);
+    let body = generated_body();
+    handle.writeback_installed(&body, tip);
+
+    let mut stripped = body.clone();
+    stripped.remove(2);
+    handle.replace_history(&stripped);
+    handle.flush_blocking();
+    let after = wait_events(&handle, 8);
+    assert_eq!(
+        summary_count(&after),
+        1,
+        "fallback re-map records the body once"
+    );
+    let warns = logcap::lines_for(sid, WALK_STOPPED_EARLY);
+    assert_eq!(warns.len(), 1, "exactly one early-stop warn, got {warns:?}");
+    assert!(warns[0].contains("index=2") && warns[0].contains("digest_mismatch"));
+    handle.shutdown_blocking();
 }
 
 /// Q4 — live-tail kinds round-trip: `runtime_note`, `user_prompt`,
@@ -3553,7 +3955,8 @@ fn chunk2_async_guard_out_of_thread_watchdog() {
     let root_path = root.path().to_path_buf();
     thread::spawn(move || {
         with_lhc_env(&root_path, || {
-            let tee = tee_chat_persistence(sid, "/tmp", &[], Box::new(NullChatPersistence), None);
+            let tee =
+                tee_chat_persistence(sid, "/tmp", &[], None, Box::new(NullChatPersistence), None);
             for _ in 0..100 {
                 if capture_active(sid) {
                     break;
@@ -4228,7 +4631,7 @@ fn chunk3a_tee_mid_session_on_from_spawned_off() {
     let sid = "chunk3a-probe-a";
     let (mock, _rx) = xai_chat_state::MockChatPersistence::new();
     // Spawn-off: resolving tee installed, no worker.
-    let mut tee = tee_chat_persistence(sid, "/tmp", &[], Box::new(mock), None);
+    let mut tee = tee_chat_persistence(sid, "/tmp", &[], None, Box::new(mock), None);
     assert!(!capture_active(sid));
     tee.persist_message(&ConversationItem::user("before-on"));
     tee.flush();
@@ -4285,6 +4688,7 @@ fn chunk3a_tee_off_then_on_keeps_capturing() {
         sid,
         "/tmp",
         &[ConversationItem::user("boot")],
+        None,
         Box::new(mock),
         None,
     );

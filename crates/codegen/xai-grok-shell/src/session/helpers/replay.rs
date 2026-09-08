@@ -769,6 +769,7 @@ mod tests {
             created_at: "2024-01-01T00:00:00Z".to_string(),
             original_user_info: None,
             reread_file_paths: vec![],
+            lhc_source_tip: None,
         };
         let bytes = serde_json::to_vec_pretty(&file).unwrap();
         std::fs::write(dir.join(format!("{checkpoint_id}.json")), bytes).unwrap();

@@ -14,13 +14,15 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 use xai_grok_sampling_types::ConversationItem;
 
+use crate::generated_prefix::{GeneratedPrefix, InstalledPrefix, PrefixWalk, WALK_STOPPED_EARLY};
 use crate::idempotency::{ITEM_KEY_GENERATION, OccurrenceTracker};
 use crate::inference::{
     LhcInferenceSampler, register_inference_sampler, unregister_inference_sampler,
 };
 use crate::mapping::{
     MappedEvent, TurnEndFacts, apply_turn_end_facts, attach_assistant_identity,
-    attach_provider_usage, map_history, map_item, map_model_change, shell_turn_end_event,
+    attach_provider_usage, map_history, map_history_from, map_item, map_model_change,
+    shell_turn_end_event,
 };
 use crate::session::LhcSession;
 
@@ -55,6 +57,9 @@ enum CaptureCmd {
         facts: TurnEndFacts,
     },
     ReplaceHistory(Vec<ConversationItem>),
+    /// LHC write-back body installed natively (slice 1A): remember it, submit
+    /// nothing. Later re-maps skip it — see `generated_prefix`.
+    WritebackInstalled(GeneratedPrefix),
     ModelChange {
         previous_model: String,
         new_model: String,
@@ -83,8 +88,10 @@ enum CaptureCmd {
         >,
     ),
     PreviewCompact(oneshot::Sender<Result<lhc::shared_tech::view::PreviewCompactOutcome, String>>),
+    /// Replace-mode compact. Acks the receipt with the worker's latched tip at
+    /// compact time — the canonical event order the view was generated from.
     Compact {
-        ack: oneshot::Sender<Result<lhc::shared_tech::view::CompactReceipt, String>>,
+        ack: oneshot::Sender<Result<(lhc::shared_tech::view::CompactReceipt, u64), String>>,
         cancel: CancellationToken,
         /// Live port abort signal (same turn-abort as `cancel`).
         signal: CompactAbortSignal,
@@ -276,6 +283,37 @@ impl CaptureHandle {
         }
     }
 
+    /// LHC write-back body installed as native history (slice 1A). Nothing is
+    /// submitted; the worker remembers the body and `source_tip` so re-maps
+    /// skip it. A dropped command is as serious as a dropped replace: the next
+    /// re-map would record the generated body, so the baseline is poisoned.
+    pub fn writeback_installed(&self, items: &[ConversationItem], source_tip: u64) {
+        let generated = GeneratedPrefix {
+            items: items.to_vec(),
+            source_tip,
+        };
+        match self
+            .inner
+            .tx
+            .try_send(CaptureCmd::WritebackInstalled(generated))
+        {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.inner.baseline_poisoned.store(true, Ordering::SeqCst);
+                let n = self.note_drop("writeback_installed");
+                error!(
+                    session_id = %self.inner.session_id,
+                    dropped = n,
+                    "LHC: dropped writeback_installed — generated body may be recaptured on next re-map"
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.inner.baseline_poisoned.store(true, Ordering::SeqCst);
+                self.note_drop("writeback_installed_closed");
+            }
+        }
+    }
+
     pub fn model_change(
         &self,
         previous_model: &str,
@@ -381,14 +419,17 @@ impl CaptureHandle {
     pub async fn compact_thread(&self) -> Result<lhc::shared_tech::view::CompactReceipt, String> {
         self.compact_thread_cancellable(CancellationToken::new(), CompactAbortSignal::new())
             .await
+            .map(|(receipt, _source_tip)| receipt)
     }
 
     /// Compact with a cancel token + live port abort signal.
+    /// Returns the receipt and the source tip (worker's latched event order at
+    /// compact time) the resulting view was generated from.
     pub async fn compact_thread_cancellable(
         &self,
         cancel: CancellationToken,
         signal: CompactAbortSignal,
-    ) -> Result<lhc::shared_tech::view::CompactReceipt, String> {
+    ) -> Result<(lhc::shared_tech::view::CompactReceipt, u64), String> {
         let (tx, rx) = oneshot::channel();
         self.inner
             .tx
@@ -928,6 +969,21 @@ pub fn spawn_capture(
     root: Option<&Path>,
     sampler: Option<Arc<dyn LhcInferenceSampler>>,
 ) -> Option<CaptureHandle> {
+    spawn_capture_resumed(session_id, cwd, bootstrap, None, root, sampler)
+}
+
+/// [`spawn_capture`] for a session resumed after an LHC write-back (slice 1A):
+/// `generated` is the LHC-marked checkpoint's body and source tip. The leading
+/// items of `bootstrap` matching it are skipped; the genuine remainder is keyed
+/// from the frozen baseline at `source_tip`.
+pub fn spawn_capture_resumed(
+    session_id: &str,
+    cwd: Option<&str>,
+    bootstrap: &[ConversationItem],
+    generated: Option<GeneratedPrefix>,
+    root: Option<&Path>,
+    sampler: Option<Arc<dyn LhcInferenceSampler>>,
+) -> Option<CaptureHandle> {
     let session_id_owned = session_id.to_string();
     let cwd_owned = cwd.map(|c| c.to_string());
     let bootstrap = bootstrap.to_vec();
@@ -1019,6 +1075,7 @@ pub fn spawn_capture(
 
                 let mut session = session;
                 // Tip is tracked on the session; item keys always use ITEM_KEY_GENERATION.
+                let mut installed: Option<InstalledPrefix> = generated.map(InstalledPrefix::new);
 
                 // Tracker already seeded from LHC events. Bootstrap submit
                 // uses a local map (stable keys) then merge_monotonic.
@@ -1031,13 +1088,14 @@ pub fn spawn_capture(
                         );
                     }
                 } else {
-                    let (events, local) = map_history(
+                    let events = remap_slice(
+                        &mut session,
+                        &mut tracker,
+                        &mut installed,
                         &session_id_for_worker,
-                        ITEM_KEY_GENERATION,
                         &bootstrap,
-                        &TurnEndFacts::default(),
-                    );
-                    tracker.merge_monotonic(&local);
+                    )
+                    .await;
                     let inputs: Vec<_> = events.into_iter().map(|e| e.input).collect();
                     match session.submit_events(&inputs).await {
                         Ok(batch) => {
@@ -1098,6 +1156,7 @@ pub fn spawn_capture(
                                         &baseline_for_worker,
                                         dropped_for_worker.as_ref(),
                                         &mut deferred_turn_end,
+                                        &mut installed,
                                         #[cfg(any(test, feature = "test-util"))]
                                         &mut crash_rx,
                                         #[cfg(any(test, feature = "test-util"))]
@@ -1132,6 +1191,7 @@ pub fn spawn_capture(
                                 &baseline_for_worker,
                                 dropped_for_worker.as_ref(),
                                 &mut deferred_turn_end,
+                                &mut installed,
                                 #[cfg(any(test, feature = "test-util"))]
                                 &mut crash_rx,
                                 #[cfg(any(test, feature = "test-util"))]
@@ -1161,6 +1221,7 @@ pub fn spawn_capture(
                                         &baseline_for_worker,
                                         dropped_for_worker.as_ref(),
                                         &mut deferred_turn_end,
+                                        &mut installed,
                                         #[cfg(any(test, feature = "test-util"))]
                                         &mut crash_rx,
                                         #[cfg(any(test, feature = "test-util"))]
@@ -1226,6 +1287,88 @@ pub fn spawn_capture(
 
 /// Process one command. Returns true if the worker should exit (crash).
 #[allow(clippy::too_many_arguments)] // test-util crash arms add optional params
+/// Whole-history re-map (bootstrap / `ReplaceHistory`). With an installed
+/// LHC-generated prefix (slice 1A), skip it and key the genuine remainder from
+/// the frozen pre-write-back baseline; otherwise — and on any early stop, with
+/// the C1 warning — map the whole slice from a fresh tracker as before. LHC
+/// dedup is the diff either way.
+async fn remap_slice(
+    sess: &mut LhcSession,
+    tracker: &mut OccurrenceTracker,
+    installed: &mut Option<InstalledPrefix>,
+    session_id: &str,
+    items: &[ConversationItem],
+) -> Vec<MappedEvent> {
+    let facts = TurnEndFacts::default();
+    let full = || map_history(session_id, ITEM_KEY_GENERATION, items, &facts);
+    let (events, local) = match installed.as_mut() {
+        None => full(),
+        Some(prefix) => match prefix.walk(items) {
+            PrefixWalk::Stopped { index, cause } => {
+                warn!(
+                    session_id,
+                    index,
+                    cause,
+                    generated_len = prefix.len(),
+                    native_len = items.len(),
+                    "{}",
+                    WALK_STOPPED_EARLY
+                );
+                // Today's behaviour for this session until the next write-back.
+                *installed = None;
+                full()
+            }
+            PrefixWalk::Covered {
+                remap_head,
+                remainder,
+            } => match prefix.frozen_seed(sess).await {
+                Err(err) => {
+                    error!(
+                        session_id,
+                        %err,
+                        "LHC: frozen baseline read failed; full re-map of this slice"
+                    );
+                    full()
+                }
+                Ok(seed) => {
+                    let mut out = Vec::new();
+                    let mut seed = seed;
+                    if remap_head {
+                        let (ev, t) = map_history_from(
+                            session_id,
+                            ITEM_KEY_GENERATION,
+                            &items[..1],
+                            &facts,
+                            seed,
+                        );
+                        out.extend(ev);
+                        seed = t;
+                    }
+                    let (ev, local) = map_history_from(
+                        session_id,
+                        ITEM_KEY_GENERATION,
+                        &items[remainder..],
+                        &facts,
+                        seed,
+                    );
+                    out.extend(ev);
+                    debug!(
+                        session_id,
+                        skipped = remainder,
+                        remap_head,
+                        remainder = items.len().saturating_sub(remainder),
+                        source_tip = prefix.source_tip(),
+                        "LHC: re-map skipped installed LHC write-back body"
+                    );
+                    (out, local)
+                }
+            },
+        },
+    };
+    tracker.merge_monotonic(&local);
+    events
+}
+
 async fn process_cmd(
     cmd: CaptureCmd,
     session: &mut Option<LhcSession>,
@@ -1234,6 +1377,7 @@ async fn process_cmd(
     baseline_poisoned: &AtomicBool,
     dropped: &AtomicU64,
     deferred_turn_end: &mut Option<MappedEvent>,
+    installed: &mut Option<InstalledPrefix>,
     #[cfg(any(test, feature = "test-util"))] crash_rx: &mut watch::Receiver<bool>,
     #[cfg(any(test, feature = "test-util"))] crash_mid_replace_after: &AtomicUsize,
 ) -> bool {
@@ -1340,14 +1484,9 @@ async fn process_cmd(
             // Submit the slice; LHC dedup is the diff. Local map mints the
             // same keys survivors already have; merge_monotonic keeps rewind
             // occurrence high-water marks. Empty facts: history re-map has
-            // no live turn-boundary signal (scout §4.4).
-            let (events, local) = map_history(
-                session_id,
-                ITEM_KEY_GENERATION,
-                &items,
-                &TurnEndFacts::default(),
-            );
-            tracker.merge_monotonic(&local);
+            // no live turn-boundary signal (scout §4.4). An installed LHC
+            // write-back body is skipped (slice 1A).
+            let events = remap_slice(sess, tracker, installed, session_id, &items).await;
             #[cfg(any(test, feature = "test-util"))]
             {
                 let n = crash_mid_replace_after.swap(0, Ordering::SeqCst);
@@ -1452,12 +1591,39 @@ async fn process_cmd(
             let _ = ack.send(sess.preview_compact().await);
             false
         }
+        CaptureCmd::WritebackInstalled(generated) => {
+            // The carried tip governs; the worker's own tip is only checked.
+            // They differ when something was captured between compact and
+            // write-back, which the ordered hook-5 path does not do.
+            if sess.generation == generated.source_tip {
+                debug!(
+                    session_id,
+                    source_tip = generated.source_tip,
+                    items = generated.items.len(),
+                    "LHC: write-back body installed; not canonical source"
+                );
+            } else {
+                warn!(
+                    session_id,
+                    source_tip = generated.source_tip,
+                    worker_tip = sess.generation,
+                    "LHC: write-back source tip differs from worker tip; carried tip governs"
+                );
+            }
+            // No submit, and a deferred close stays deferred for its facts.
+            *installed = Some(InstalledPrefix::new(generated));
+            false
+        }
         CaptureCmd::Compact {
             ack,
             cancel,
             signal,
         } => {
-            let _ = ack.send(sess.compact(cancel, signal).await);
+            let outcome = sess
+                .compact(cancel, signal)
+                .await
+                .map(|receipt| (receipt, sess.generation));
+            let _ = ack.send(outcome);
             false
         }
         CaptureCmd::DrainSettled(ack) => {

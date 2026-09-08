@@ -15,7 +15,8 @@ use std::time::Duration;
 use lhc::intake_stream::EventRecord;
 use xai_grok_sampling_types::ConversationItem;
 
-use crate::capture::{CaptureHandle, spawn_capture};
+use crate::capture::{CaptureHandle, spawn_capture, spawn_capture_resumed};
+use crate::generated_prefix::GeneratedPrefix;
 use crate::tee::capture_active;
 
 fn wait_events(handle: &CaptureHandle, min: usize) -> Vec<EventRecord> {
@@ -81,7 +82,60 @@ fn band_needle(body: &[ConversationItem]) -> Option<String> {
     })
 }
 
+fn needle_count(events: &[EventRecord], needle: Option<&String>) -> usize {
+    let Some(needle) = needle else {
+        return 0;
+    };
+    events
+        .iter()
+        .filter(|e| {
+            e.prompt_or_note_text()
+                .is_some_and(|t| t.contains(needle.as_str()))
+        })
+        .count()
+}
+
+/// The canonical tip a freshly bootstrapped gate session was generated from:
+/// its highest recorded event order (what the worker latches as `generation`).
+fn source_tip(events: &[EventRecord]) -> u64 {
+    events
+        .iter()
+        .map(|e| e.event_order())
+        .max()
+        .unwrap_or(0)
+        .max(0) as u64
+}
+
+/// Genuine work appended after the write-back: a prompt, the same prompt
+/// again (repeated real prompts are ordinary), and a closing reply.
+fn genuine_suffix() -> Vec<ConversationItem> {
+    vec![
+        ConversationItem::user("after write-back: continue"),
+        ConversationItem::user("after write-back: continue"),
+        ConversationItem::assistant("continued"),
+    ]
+}
+
+/// A production-shaped in-place prune of the body: the first ToolResult is
+/// hard-cleared under its own call id. `None` when the body carries no tool
+/// result (the prune gate then rewrites the System head instead).
+fn pruned_in_place(body: &[ConversationItem]) -> Option<Vec<ConversationItem>> {
+    let idx = body
+        .iter()
+        .position(|i| matches!(i, ConversationItem::ToolResult(_)))?;
+    let mut pruned = body.to_vec();
+    if let ConversationItem::ToolResult(tr) = &body[idx] {
+        pruned[idx] = ConversationItem::tool_result(&tr.tool_call_id, "[cleared]");
+    }
+    Some(pruned)
+}
+
 /// Run the five hard write-back gates against `body` (sync / blocking RPCs).
+///
+/// Production route (slice 1A): the body is *installed* (`writeback_installed`
+/// with the source tip), never submitted as source; genuine whole-history
+/// replaces after it re-map through the installed prefix. Each gate opens its
+/// own session on `native` and derives the tip from that session's record.
 ///
 /// **Do not call from an async Tokio test** — use
 /// [`run_five_gates_on_body_async`]. `label` is printed so readers can tell
@@ -95,124 +149,121 @@ pub fn run_five_gates_on_body(
 ) {
     eprintln!("=== write-back hard gates on {label} ===");
     let band_needle = band_needle(body);
+    let needle = band_needle.as_ref();
 
-    // (1) fixpoint
+    // (1) install fixpoint: installing the body, again, and replacing with it
+    // records nothing and re-keys nothing.
     {
         let sid = format!("{sid_prefix}-fixpoint");
         let handle = spawn_capture(&sid, Some("/tmp"), native, Some(root), None).unwrap();
-        let _ = wait_events(&handle, 1);
-        handle.replace_history(body);
-        handle.flush_blocking();
-        let once = wait_events(&handle, 1);
-        let once_keys = keys(&once);
+        let seeded = wait_events(&handle, 1);
+        let seeded_keys = keys(&seeded);
+        let tip = source_tip(&seeded);
+        handle.writeback_installed(body, tip);
+        handle.writeback_installed(body, tip);
         handle.replace_history(body);
         handle.flush_blocking();
         thread::sleep(Duration::from_millis(150));
         let again = handle.list_events_blocking().unwrap();
         assert_eq!(
             keys(&again),
-            once_keys,
-            "gate fixpoint ({label}): second replace re-keyed"
+            seeded_keys,
+            "gate fixpoint ({label}): install/replace of the body changed keys"
         );
         handle.shutdown_blocking();
         wait_registry_gone(&sid);
         eprintln!("gate fixpoint ({label}): PASS");
     }
 
-    // (2) prune-shaped emits nothing
+    // (2) in-place prune / head rewrite after install records only the
+    // changed head (never the body).
     {
         let sid = format!("{sid_prefix}-prune");
         let handle = spawn_capture(&sid, Some("/tmp"), native, Some(root), None).unwrap();
-        let _ = wait_events(&handle, 1);
-        handle.replace_history(body);
-        handle.flush_blocking();
-        let after_wb = wait_events(&handle, 1);
-        let before_keys = keys(&after_wb);
-        let before_len = after_wb.len();
-        let mut pruned: Vec<_> = body
-            .iter()
-            .filter(|i| matches!(i, ConversationItem::System(_)))
-            .cloned()
-            .collect();
-        // The tail sample skips the system prefix already copied above: at the
-        // v13 pin a small thread under tight params can compact to
-        // [system, one band], and re-adding the system item would be a second
-        // occurrence — a genuinely new event, not a prune.
-        pruned.extend(
-            body.iter()
-                .filter(|i| !matches!(i, ConversationItem::System(_)))
-                .rev()
-                .take(2)
-                .cloned(),
-        );
-        assert!(pruned.len() < body.len() || body.len() <= 3);
+        let seeded = wait_events(&handle, 1);
+        let before_keys = keys(&seeded);
+        let tip = source_tip(&seeded);
+        handle.writeback_installed(body, tip);
+        let (rewritten, expected_new) = match pruned_in_place(body) {
+            Some(pruned) => (pruned, 0usize),
+            None => {
+                let mut head = body.to_vec();
+                head[0] = ConversationItem::system("sys + memory reminder (gate)");
+                (head, 1usize)
+            }
+        };
         for _ in 0..3 {
-            handle.replace_history(&pruned);
+            handle.replace_history(&rewritten);
         }
         handle.flush_blocking();
         thread::sleep(Duration::from_millis(150));
         let after = handle.list_events_blocking().unwrap();
+        let new_keys: BTreeSet<_> = keys(&after).difference(&before_keys).cloned().collect();
         assert_eq!(
-            after.len(),
-            before_len,
-            "gate prune ({label}): emitted events"
+            new_keys.len(),
+            expected_new,
+            "gate prune ({label}): in-place rewrite recorded {} events",
+            new_keys.len()
         );
         assert_eq!(
-            keys(&after),
-            before_keys,
-            "gate prune ({label}): key set changed"
+            needle_count(&after, needle),
+            0,
+            "gate prune ({label}): band entered the record"
         );
         handle.shutdown_blocking();
         wait_registry_gone(&sid);
         eprintln!("gate prune ({label}): PASS");
     }
 
-    // (3) summary / novel content exactly once
+    // (3) generated band never enters the canonical record; genuine suffix
+    // after it does, exactly once, through a whole-history replace.
     {
         let sid = format!("{sid_prefix}-summary");
         let handle = spawn_capture(&sid, Some("/tmp"), native, Some(root), None).unwrap();
         let before = wait_events(&handle, 1);
         let before_keys = keys(&before);
-        handle.replace_history(body);
+        let tip = source_tip(&before);
+        handle.writeback_installed(body, tip);
+        let mut with_suffix = body.to_vec();
+        with_suffix.extend(genuine_suffix());
+        handle.replace_history(&with_suffix);
         handle.flush_blocking();
         let after = wait_events(&handle, before.len() + 1);
         let new_keys: BTreeSet<_> = keys(&after).difference(&before_keys).cloned().collect();
-        assert!(
-            !new_keys.is_empty(),
-            "gate summary ({label}): write-back recorded nothing"
+        assert_eq!(
+            new_keys.len(),
+            genuine_suffix().len() + 1,
+            "gate summary ({label}): expected the suffix (+ its turn_end) only, got {new_keys:?}"
         );
-        if let Some(needle) = &band_needle {
-            let hits = after
-                .iter()
-                .filter(|e| {
-                    e.prompt_or_note_text()
-                        .is_some_and(|t| t.contains(needle.as_str()))
-                })
-                .count();
-            assert_eq!(hits, 1, "gate summary ({label}): needle count {hits}");
-        }
+        assert_eq!(
+            needle_count(&after, needle),
+            0,
+            "gate summary ({label}): generated band recorded as source"
+        );
         handle.shutdown_blocking();
         wait_registry_gone(&sid);
         eprintln!("gate summary ({label}): PASS");
     }
 
-    // (4) repeated unchanged nothing
+    // (4) repeated unchanged: repeated installs and body replaces record nothing.
     {
         let sid = format!("{sid_prefix}-repeat");
         let handle = spawn_capture(&sid, Some("/tmp"), native, Some(root), None).unwrap();
-        let _ = wait_events(&handle, 1);
-        handle.replace_history(body);
-        handle.flush_blocking();
         let once = wait_events(&handle, 1);
         let once_keys = keys(&once);
-        let once_len = once.len();
+        let tip = source_tip(&once);
         for _ in 0..4 {
+            handle.writeback_installed(body, tip);
             handle.replace_history(body);
         }
         handle.flush_blocking();
         thread::sleep(Duration::from_millis(150));
         let again = handle.list_events_blocking().unwrap();
-        assert_eq!(again.len(), once_len, "gate repeat ({label}): length grew");
+        assert_eq!(
+            again.len(),
+            once.len(),
+            "gate repeat ({label}): length grew"
+        );
         assert_eq!(
             keys(&again),
             once_keys,
@@ -223,14 +274,20 @@ pub fn run_five_gates_on_body(
         eprintln!("gate repeat ({label}): PASS");
     }
 
-    // (5) crash mid-replace no double
+    // (5) crash mid-replace, resume with the marked body: the uncaptured
+    // suffix is recovered, the captured suffix dedups, nothing doubles, and
+    // the band still never enters the record.
     {
         let sid = format!("{sid_prefix}-crash");
         let handle = spawn_capture(&sid, Some("/tmp"), native, Some(root), None).unwrap();
         let seeded = wait_events(&handle, 1);
         let seeded_len = seeded.len();
+        let tip = source_tip(&seeded);
+        handle.writeback_installed(body, tip);
+        let mut with_suffix = body.to_vec();
+        with_suffix.extend(genuine_suffix());
         handle.arm_crash_mid_replace(1);
-        handle.replace_history(body);
+        handle.replace_history(&with_suffix);
         wait_registry_gone(sid.as_str());
         thread::sleep(Duration::from_millis(200));
         let probe = spawn_capture(&sid, Some("/tmp"), &[], Some(root), None).unwrap();
@@ -240,34 +297,70 @@ pub fn run_five_gates_on_body(
             partial.len() > seeded_len,
             "gate crash ({label}): partial apply did not grow past seed"
         );
+        assert_eq!(
+            needle_count(&partial, needle),
+            0,
+            "gate crash ({label}): band recorded before the crash"
+        );
         probe.shutdown_blocking();
         wait_registry_gone(&sid);
-        let handle2 = spawn_capture(&sid, Some("/tmp"), body, Some(root), None).unwrap();
+        // Resume: native holds body + suffix; the checkpoint marks the body.
+        let generated = GeneratedPrefix {
+            items: body.to_vec(),
+            source_tip: tip,
+        };
+        let handle2 = spawn_capture_resumed(
+            &sid,
+            Some("/tmp"),
+            &with_suffix,
+            Some(generated.clone()),
+            Some(root),
+            None,
+        )
+        .unwrap();
         handle2.flush_blocking();
-        let mut after_retry = wait_events(&handle2, seeded_len);
-        for _ in 0..40 {
-            thread::sleep(Duration::from_millis(50));
-            let cur = handle2.list_events_blocking().unwrap();
-            if cur.len() == after_retry.len() && cur.len() > seeded_len {
-                after_retry = cur;
-                break;
-            }
-            after_retry = cur;
-        }
-        if let Some(needle) = &band_needle {
-            let count = after_retry
-                .iter()
-                .filter(|e| {
-                    e.prompt_or_note_text()
-                        .is_some_and(|t| t.contains(needle.as_str()))
-                })
-                .count();
-            assert_eq!(
-                count, 1,
-                "gate crash ({label}): double-recorded after retry"
-            );
-        }
+        let after_retry = wait_events(&handle2, seeded_len + genuine_suffix().len() + 1);
+        let keys_once = keys(&after_retry);
+        assert_eq!(
+            after_retry.len(),
+            seeded_len + genuine_suffix().len() + 1,
+            "gate crash ({label}): suffix (+ turn_end) not recovered exactly once"
+        );
+        assert_eq!(
+            needle_count(&after_retry, needle),
+            0,
+            "gate crash ({label}): band recorded on resume"
+        );
+        handle2.replace_history(&with_suffix);
+        handle2.flush_blocking();
+        thread::sleep(Duration::from_millis(150));
+        let again = handle2.list_events_blocking().unwrap();
+        assert_eq!(
+            keys(&again),
+            keys_once,
+            "gate crash ({label}): re-keyed after resume"
+        );
         handle2.shutdown_blocking();
+        wait_registry_gone(&sid);
+        // Second resume records nothing.
+        let handle3 = spawn_capture_resumed(
+            &sid,
+            Some("/tmp"),
+            &with_suffix,
+            Some(generated),
+            Some(root),
+            None,
+        )
+        .unwrap();
+        handle3.flush_blocking();
+        thread::sleep(Duration::from_millis(150));
+        let third = handle3.list_events_blocking().unwrap();
+        assert_eq!(
+            keys(&third),
+            keys_once,
+            "gate crash ({label}): second resume recorded"
+        );
+        handle3.shutdown_blocking();
         wait_registry_gone(&sid);
         eprintln!("gate crash ({label}): PASS");
     }
@@ -276,7 +369,8 @@ pub fn run_five_gates_on_body(
 
 /// Async-safe five hard gates — safe to call from `#[tokio::test]`.
 ///
-/// Uses awaitable capture RPCs only (never `blocking_send` / `blocking_recv`).
+/// Same gates as [`run_five_gates_on_body`] over awaitable capture RPCs only
+/// (never `blocking_send` / `blocking_recv`).
 pub async fn run_five_gates_on_body_async(
     sid_prefix: &str,
     native: &[ConversationItem],
@@ -286,102 +380,94 @@ pub async fn run_five_gates_on_body_async(
 ) {
     eprintln!("=== write-back hard gates (async) on {label} ===");
     let band_needle = band_needle(body);
+    let needle = band_needle.as_ref();
 
-    // (1) fixpoint
+    // (1) install fixpoint
     {
         let sid = format!("{sid_prefix}-fixpoint");
         let handle = spawn_capture(&sid, Some("/tmp"), native, Some(root), None).unwrap();
-        let _ = wait_events_async(&handle, 1).await;
-        handle.replace_history(body);
-        handle.flush().await.expect("flush");
-        let once = wait_events_async(&handle, 1).await;
-        let once_keys = keys(&once);
+        let seeded = wait_events_async(&handle, 1).await;
+        let seeded_keys = keys(&seeded);
+        let tip = source_tip(&seeded);
+        handle.writeback_installed(body, tip);
+        handle.writeback_installed(body, tip);
         handle.replace_history(body);
         handle.flush().await.expect("flush");
         tokio::time::sleep(Duration::from_millis(150)).await;
         let again = handle.list_events().await.unwrap();
         assert_eq!(
             keys(&again),
-            once_keys,
-            "gate fixpoint ({label}): second replace re-keyed"
+            seeded_keys,
+            "gate fixpoint ({label}): install/replace of the body changed keys"
         );
         handle.shutdown().await.expect("shutdown");
         wait_registry_gone_async(&sid).await;
         eprintln!("gate fixpoint ({label}): PASS");
     }
 
-    // (2) prune-shaped emits nothing
+    // (2) in-place prune / head rewrite
     {
         let sid = format!("{sid_prefix}-prune");
         let handle = spawn_capture(&sid, Some("/tmp"), native, Some(root), None).unwrap();
-        let _ = wait_events_async(&handle, 1).await;
-        handle.replace_history(body);
-        handle.flush().await.expect("flush");
-        let after_wb = wait_events_async(&handle, 1).await;
-        let before_keys = keys(&after_wb);
-        let before_len = after_wb.len();
-        let mut pruned: Vec<_> = body
-            .iter()
-            .filter(|i| matches!(i, ConversationItem::System(_)))
-            .cloned()
-            .collect();
-        // The tail sample skips the system prefix already copied above: at the
-        // v13 pin a small thread under tight params can compact to
-        // [system, one band], and re-adding the system item would be a second
-        // occurrence — a genuinely new event, not a prune.
-        pruned.extend(
-            body.iter()
-                .filter(|i| !matches!(i, ConversationItem::System(_)))
-                .rev()
-                .take(2)
-                .cloned(),
-        );
-        assert!(pruned.len() < body.len() || body.len() <= 3);
+        let seeded = wait_events_async(&handle, 1).await;
+        let before_keys = keys(&seeded);
+        let tip = source_tip(&seeded);
+        handle.writeback_installed(body, tip);
+        let (rewritten, expected_new) = match pruned_in_place(body) {
+            Some(pruned) => (pruned, 0usize),
+            None => {
+                let mut head = body.to_vec();
+                head[0] = ConversationItem::system("sys + memory reminder (gate)");
+                (head, 1usize)
+            }
+        };
         for _ in 0..3 {
-            handle.replace_history(&pruned);
+            handle.replace_history(&rewritten);
         }
         handle.flush().await.expect("flush");
         tokio::time::sleep(Duration::from_millis(150)).await;
         let after = handle.list_events().await.unwrap();
+        let new_keys: BTreeSet<_> = keys(&after).difference(&before_keys).cloned().collect();
         assert_eq!(
-            after.len(),
-            before_len,
-            "gate prune ({label}): emitted events"
+            new_keys.len(),
+            expected_new,
+            "gate prune ({label}): in-place rewrite recorded {} events",
+            new_keys.len()
         );
         assert_eq!(
-            keys(&after),
-            before_keys,
-            "gate prune ({label}): key set changed"
+            needle_count(&after, needle),
+            0,
+            "gate prune ({label}): band recorded"
         );
         handle.shutdown().await.expect("shutdown");
         wait_registry_gone_async(&sid).await;
         eprintln!("gate prune ({label}): PASS");
     }
 
-    // (3) summary / novel content exactly once
+    // (3) band never canonical; suffix exactly once
     {
         let sid = format!("{sid_prefix}-summary");
         let handle = spawn_capture(&sid, Some("/tmp"), native, Some(root), None).unwrap();
         let before = wait_events_async(&handle, 1).await;
         let before_keys = keys(&before);
-        handle.replace_history(body);
+        let tip = source_tip(&before);
+        handle.writeback_installed(body, tip);
+        let mut with_suffix = body.to_vec();
+        with_suffix.extend(genuine_suffix());
+        handle.replace_history(&with_suffix);
         handle.flush().await.expect("flush");
         let after = wait_events_async(&handle, before.len() + 1).await;
         let new_keys: BTreeSet<_> = keys(&after).difference(&before_keys).cloned().collect();
-        assert!(
-            !new_keys.is_empty(),
-            "gate summary ({label}): write-back recorded nothing"
+        assert_eq!(
+            new_keys.len(),
+            genuine_suffix().len() + 1,
+            "gate summary ({label}): expected the suffix (+ its turn_end) only, got {new_keys:?}"
         );
-        if let Some(needle) = &band_needle {
-            let hits = after
-                .iter()
-                .filter(|e| {
-                    e.prompt_or_note_text()
-                        .is_some_and(|t| t.contains(needle.as_str()))
-                })
-                .count();
-            assert_eq!(hits, 1, "gate summary ({label}): needle count {hits}");
-        }
+        assert_eq!(
+            needle_count(&after, needle),
+            0,
+            "gate summary ({label}): generated band recorded as source"
+        );
         handle.shutdown().await.expect("shutdown");
         wait_registry_gone_async(&sid).await;
         eprintln!("gate summary ({label}): PASS");
@@ -391,19 +477,21 @@ pub async fn run_five_gates_on_body_async(
     {
         let sid = format!("{sid_prefix}-repeat");
         let handle = spawn_capture(&sid, Some("/tmp"), native, Some(root), None).unwrap();
-        let _ = wait_events_async(&handle, 1).await;
-        handle.replace_history(body);
-        handle.flush().await.expect("flush");
         let once = wait_events_async(&handle, 1).await;
         let once_keys = keys(&once);
-        let once_len = once.len();
+        let tip = source_tip(&once);
         for _ in 0..4 {
+            handle.writeback_installed(body, tip);
             handle.replace_history(body);
         }
         handle.flush().await.expect("flush");
         tokio::time::sleep(Duration::from_millis(150)).await;
         let again = handle.list_events().await.unwrap();
-        assert_eq!(again.len(), once_len, "gate repeat ({label}): length grew");
+        assert_eq!(
+            again.len(),
+            once.len(),
+            "gate repeat ({label}): length grew"
+        );
         assert_eq!(
             keys(&again),
             once_keys,
@@ -414,14 +502,18 @@ pub async fn run_five_gates_on_body_async(
         eprintln!("gate repeat ({label}): PASS");
     }
 
-    // (5) crash mid-replace no double
+    // (5) crash mid-replace, resume with the marked body
     {
         let sid = format!("{sid_prefix}-crash");
         let handle = spawn_capture(&sid, Some("/tmp"), native, Some(root), None).unwrap();
         let seeded = wait_events_async(&handle, 1).await;
         let seeded_len = seeded.len();
+        let tip = source_tip(&seeded);
+        handle.writeback_installed(body, tip);
+        let mut with_suffix = body.to_vec();
+        with_suffix.extend(genuine_suffix());
         handle.arm_crash_mid_replace(1);
-        handle.replace_history(body);
+        handle.replace_history(&with_suffix);
         wait_registry_gone_async(sid.as_str()).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
         let probe = spawn_capture(&sid, Some("/tmp"), &[], Some(root), None).unwrap();
@@ -431,34 +523,69 @@ pub async fn run_five_gates_on_body_async(
             partial.len() > seeded_len,
             "gate crash ({label}): partial apply did not grow past seed"
         );
+        assert_eq!(
+            needle_count(&partial, needle),
+            0,
+            "gate crash ({label}): band before crash"
+        );
         probe.shutdown().await.expect("shutdown");
         wait_registry_gone_async(&sid).await;
-        let handle2 = spawn_capture(&sid, Some("/tmp"), body, Some(root), None).unwrap();
+        let generated = GeneratedPrefix {
+            items: body.to_vec(),
+            source_tip: tip,
+        };
+        let handle2 = spawn_capture_resumed(
+            &sid,
+            Some("/tmp"),
+            &with_suffix,
+            Some(generated.clone()),
+            Some(root),
+            None,
+        )
+        .unwrap();
         handle2.flush().await.expect("flush");
-        let mut after_retry = wait_events_async(&handle2, seeded_len).await;
-        for _ in 0..40 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            let cur = handle2.list_events().await.unwrap();
-            if cur.len() == after_retry.len() && cur.len() > seeded_len {
-                after_retry = cur;
-                break;
-            }
-            after_retry = cur;
-        }
-        if let Some(needle) = &band_needle {
-            let count = after_retry
-                .iter()
-                .filter(|e| {
-                    e.prompt_or_note_text()
-                        .is_some_and(|t| t.contains(needle.as_str()))
-                })
-                .count();
-            assert_eq!(
-                count, 1,
-                "gate crash ({label}): double-recorded after retry"
-            );
-        }
+        let after_retry =
+            wait_events_async(&handle2, seeded_len + genuine_suffix().len() + 1).await;
+        let keys_once = keys(&after_retry);
+        assert_eq!(
+            after_retry.len(),
+            seeded_len + genuine_suffix().len() + 1,
+            "gate crash ({label}): suffix (+ turn_end) not recovered exactly once"
+        );
+        assert_eq!(
+            needle_count(&after_retry, needle),
+            0,
+            "gate crash ({label}): band on resume"
+        );
+        handle2.replace_history(&with_suffix);
+        handle2.flush().await.expect("flush");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let again = handle2.list_events().await.unwrap();
+        assert_eq!(
+            keys(&again),
+            keys_once,
+            "gate crash ({label}): re-keyed after resume"
+        );
         handle2.shutdown().await.expect("shutdown");
+        wait_registry_gone_async(&sid).await;
+        let handle3 = spawn_capture_resumed(
+            &sid,
+            Some("/tmp"),
+            &with_suffix,
+            Some(generated),
+            Some(root),
+            None,
+        )
+        .unwrap();
+        handle3.flush().await.expect("flush");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let third = handle3.list_events().await.unwrap();
+        assert_eq!(
+            keys(&third),
+            keys_once,
+            "gate crash ({label}): second resume recorded"
+        );
+        handle3.shutdown().await.expect("shutdown");
         wait_registry_gone_async(&sid).await;
         eprintln!("gate crash ({label}): PASS");
     }

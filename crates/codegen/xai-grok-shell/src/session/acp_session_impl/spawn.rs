@@ -69,6 +69,40 @@ fn configured_memory_retrieval_mode(
 /// A subagent with an active pacer (`pacer_max_attempts > 0`) paces 429s itself, so the sampler retry is disabled.
 /// With the pacer off, the subagent falls back to the sampler retry, so disabling the pacer is a true rollback rather than zero 429 handling.
 /// Main sessions always keep the sampler retry.
+/// LHC (slice 1A): the latest compaction checkpoint, when LHC-marked
+/// (`lhc_source_tip` present), gives capture the generated body and the tip it
+/// was built from. Native or pre-1A checkpoints yield `None` and bootstrap
+/// captures as before. The checkpoint file is the same one cross-compaction
+/// rewind reads (`compaction_checkpoints/{id}.json`).
+fn lhc_generated_prefix_from_checkpoint(
+    session_dir: &std::path::Path,
+) -> Option<grok_lhc_host::GeneratedPrefix> {
+    let updates_path = session_dir.join("updates.jsonl");
+    let info = crate::session::helpers::replay::find_latest_compaction_checkpoint(&updates_path)
+        .ok()
+        .flatten()?;
+    let path = session_dir.join(&info.checkpoint_file);
+    let file: crate::extensions::notification::CompactionCheckpointFile = match std::fs::read(&path)
+        .map_err(|e| e.to_string())
+        .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()))
+    {
+        Ok(file) => file,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                %err,
+                "LHC: compaction checkpoint unreadable; bootstrap without generated prefix"
+            );
+            return None;
+        }
+    };
+    let source_tip = file.lhc_source_tip?;
+    Some(grok_lhc_host::GeneratedPrefix {
+        items: file.compacted_history,
+        source_tip,
+    })
+}
+
 fn subagent_sampler_rate_limit_threshold(is_subagent: bool, pacer_max_attempts: u32) -> u32 {
     if is_subagent && pacer_max_attempts > 0 {
         xai_grok_sampler::RATE_LIMIT_RETRY_DISABLED
@@ -560,6 +594,12 @@ pub(crate) async fn spawn_session_actor(
     let chat_persistence = Box::new(super::chat_persistence::ChannelChatPersistence::new(
         persistence.tx.clone(),
     ));
+    // LHC (slice 1A): an LHC-marked compaction checkpoint tells capture which
+    // leading items of `conversation` are LHC-generated context (not canonical
+    // source) and the canonical tip they were generated from.
+    let lhc_generated_prefix = lhc_generated_prefix_from_checkpoint(
+        &crate::session::persistence::session_dir(&session_info),
+    );
     let chat_state_handle = xai_chat_state::ChatStateActor::spawn_with_pruning(
         conversation.clone(),
         chat_state_sampling_config,
@@ -569,6 +609,7 @@ pub(crate) async fn spawn_session_actor(
             session_info.id.0.as_ref(),
             session_info.cwd.as_ref(),
             &conversation,
+            lhc_generated_prefix,
             chat_persistence,
             Some(
                 crate::session::lhc_inference::ShellLhcInferenceSampler::new(

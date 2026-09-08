@@ -1790,6 +1790,7 @@ impl SessionActor {
             prompt_index_at_compaction,
             auto_continue,
             original_user_info,
+            None,
         );
         let prefix_len = if self
             .compaction
@@ -2059,11 +2060,14 @@ impl SessionActor {
             }),
             _ => None,
         });
+        // LHC-generated body: the checkpoint carries the source tip so a
+        // resumed session does not recapture the body as canonical source.
         self.persist_compaction_checkpoint(
             &items,
             prompt_index_at_compaction,
             None,
             original_user_info,
+            Some(writeback.source_tip),
         );
         let context_window = self
             .chat_state_handle
@@ -2093,7 +2097,7 @@ impl SessionActor {
         };
         let new_len = items.len();
         self.chat_state_handle
-            .replace_conversation_for_compaction(items);
+            .replace_conversation_for_lhc_writeback(items, writeback.source_tip);
         if self.startup_hints.inherited_prefix_len.is_some() {
             let post_replace_tokens = self.chat_state_handle.get_total_tokens().await;
             if xai_token_estimation::exceeds_threshold(
@@ -2468,6 +2472,7 @@ impl SessionActor {
         prompt_index_at_compaction: usize,
         auto_continue: Option<crate::extensions::notification::AutoContinueInfo>,
         original_user_info: Option<String>,
+        lhc_source_tip: Option<u64>,
     ) {
         use crate::extensions::notification::{
             CompactionCheckpointFile, CompactionCheckpointInfo, SessionUpdate as XaiSessionUpdate,
@@ -2483,6 +2488,7 @@ impl SessionActor {
             created_at: created_at.clone(),
             original_user_info,
             reread_file_paths: vec![],
+            lhc_source_tip,
         };
         if self
             .notifications

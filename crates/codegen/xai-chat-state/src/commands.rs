@@ -157,6 +157,11 @@ pub enum ChatStateCommand {
     ReplaceConversation {
         items: Vec<ConversationItem>,
         is_compaction: bool,
+        /// `Some` when `items` is LHC's generated write-back body: the
+        /// canonical event order it was generated from. Routes persistence to
+        /// `replace_history_for_lhc_writeback` so capture does not record the
+        /// body as source. `None` for every other replacement.
+        lhc_source_tip: Option<u64>,
     },
 
     /// Out-of-band history repair (`x.ai/session/repair`): run
@@ -492,6 +497,7 @@ mod tests {
         let _ = ChatStateCommand::ReplaceConversation {
             items: vec![],
             is_compaction: false,
+            lhc_source_tip: None,
         };
         let _ = ChatStateCommand::CachePromptText {
             text: "prompt".to_string(),
