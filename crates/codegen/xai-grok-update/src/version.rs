@@ -44,7 +44,7 @@ pub(crate) fn cli_base_urls() -> Vec<String> {
 
 /// Parsed, not prefix-matched: `http://127.0.0.1:9@evil.com` starts with a
 /// loopback prefix but its host is `evil.com` (userinfo trick).
-fn is_loopback_base(base: &str) -> bool {
+pub(crate) fn is_loopback_base(base: &str) -> bool {
     let Ok(u) = url::Url::parse(base) else {
         return false;
     };
@@ -366,6 +366,10 @@ async fn fetch_gcs_channel_pointer(channel: &str, base_url: &str) -> Result<Stri
 /// Auto-update, for example, should only cache after a successful install or when no update is needed.
 pub async fn fetch_latest_version(installer: &str, config: &UpdateConfig) -> Result<String> {
     match installer {
+        // Fork builds discover their own releases; the shared `[cli].installer` never picks the source.
+        crate::lhc_release::INSTALLER_LHC_MANAGED | crate::lhc_release::INSTALLER_LHC_UNMANAGED => {
+            crate::lhc_release::fetch_latest_release().await
+        }
         "npm" => fetch_npm_version(&config.channel, config.npm_registry.as_deref()).await,
         "gh-release" => fetch_gh_release_version(&config.channel).await,
         _ => fetch_gcs_version(&config.channel).await,
@@ -377,7 +381,7 @@ pub async fn fetch_latest_version(installer: &str, config: &UpdateConfig) -> Res
 ///
 /// `stable_version` records the current stable channel pointer so that `channel_label()` can derive `[alpha]` vs `[stable]` without network I/O.
 pub async fn write_version_cache(version: &str, stable_version: Option<&str>) {
-    let version_path = grok_home().join("version.json");
+    let version_path = version_cache_path();
     let now = time::OffsetDateTime::now_utc();
     let json = GrokVersion::new(
         version.to_string(),
@@ -416,14 +420,27 @@ pub async fn write_version_cache(version: &str, stable_version: Option<&str>) {
 /// - `"gh-release"`: uses `gh release list` against GitHub Releases.
 pub async fn get_latest_version(installer: &str, config: &UpdateConfig) -> Result<String> {
     let version = fetch_latest_version(installer, config).await?;
+    if installer == crate::lhc_release::INSTALLER_LHC_UNMANAGED {
+        // An unmanaged LHC build owns no store, so it caches nothing (never `~/.grok/version.json`).
+        return Ok(version);
+    }
     let stable_ptr = try_fetch_stable_pointer().await;
     write_version_cache(&version, stable_ptr.as_deref()).await;
     Ok(version)
 }
 
+/// The update cache: store-owned for a managed LHC install (`<store>/version.json`),
+/// the shared `~/.grok/version.json` otherwise (stock layout, tests).
+fn version_cache_path() -> std::path::PathBuf {
+    match crate::lhc_release::managed_install() {
+        Some(managed) => managed.version_cache_path(),
+        None => grok_home().join("version.json"),
+    }
+}
+
 /// True if `version.json` exists and is within TTL.
 pub async fn is_version_cache_fresh() -> bool {
-    let version_path = grok_home().join("version.json");
+    let version_path = version_cache_path();
     let now = time::OffsetDateTime::now_utc();
     if let Ok(version_str) = fs::read_to_string(&version_path).await
         && let Ok(version) = serde_json::from_str::<GrokVersion>(&version_str)
@@ -510,7 +527,7 @@ pub(crate) async fn try_fetch_stable_pointer() -> Option<String> {
 ///
 /// Returns `None` if the file doesn't exist, can't be parsed, or has no `stable_version` field (e.g. written by an older binary).
 pub fn cached_stable_version() -> Option<String> {
-    let version_path = grok_home().join("version.json");
+    let version_path = version_cache_path();
     let content = std::fs::read_to_string(&version_path).ok()?;
     let gv: GrokVersion = serde_json::from_str(&content).ok()?;
     gv.stable_version

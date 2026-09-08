@@ -1881,6 +1881,11 @@ fn write_version(writer: &mut impl std::io::Write, channel_label: &str) -> std::
     writer.write_all(version_text(channel_label).as_bytes())
 }
 fn dispatch_version_if_requested(args: &PagerArgs) -> bool {
+    // Fork: `--lhc-version` prints the embedded fork release; `--version` is unchanged.
+    if args.lhc_version {
+        println!("{}", xai_grok_update::lhc_release::LHC_RELEASE_VERSION);
+        return true;
+    }
     if !args.version {
         return false;
     }
@@ -2107,6 +2112,8 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                     let payload = serde_json::json!({
                         "currentVersion": env!("VERSION_WITH_COMMIT"),
                         "channel": xai_grok_update::channel_name().unwrap_or("unknown"),
+                        // Fork release identity (grok-build-lhc); the native version above is the upstream base.
+                        "lhcRelease": xai_grok_update::lhc_release::LHC_RELEASE_VERSION,
                     });
                     println!("{}", serde_json::to_string(&payload)?);
                 } else {
@@ -2498,12 +2505,17 @@ fn stdio_auto_update_enabled(
 /// canonicalized; any failure reports unmanaged and skips the update. The
 /// npm shim hardcodes `~/.grok`, so a custom `GROK_HOME` skips here too.
 fn is_managed_install(exe: Option<std::path::PathBuf>, grok_home: &std::path::Path) -> bool {
-    if grok_home.as_os_str().is_empty() {
-        return false;
-    }
     let Some(exe) = exe else {
         return false;
     };
+    // Fork: a grok-build-lhc managed store adopts a staged update on respawn exactly like
+    // the stock layout below, so the stdio background update is eligible for it too.
+    if xai_grok_update::lhc_release::managed_install_for_exe(&exe).is_some() {
+        return true;
+    }
+    if grok_home.as_os_str().is_empty() {
+        return false;
+    }
     let managed = xai_grok_config::grok_application_in(grok_home);
     match (dunce::canonicalize(&exe), dunce::canonicalize(&managed)) {
         (Ok(exe), Ok(managed)) => exe == managed,
@@ -2979,6 +2991,65 @@ mod tests {
         std::fs::write(&pinned, b"binary").unwrap();
         assert!(!is_managed_install(Some(pinned), &home));
         let _ = std::fs::remove_dir_all(&home);
+    }
+    /// Fork: a grok-build-lhc managed store counts as managed for the stdio gate; a bare
+    /// copy of the binary (no marker/receipts) does not, and the stock rule is unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn is_managed_install_recognizes_the_lhc_store_layout() {
+        let root =
+            std::env::temp_dir().join(format!("grok-pager-lhc-store-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("grok-lhc");
+        let bin = store.join("versions").join("1.0.16").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("grok"), b"binary").unwrap();
+        let home = root.join("dotgrok");
+        std::fs::create_dir_all(home.join("bin")).unwrap();
+        assert!(
+            !is_managed_install(Some(bin.join("grok")), &home),
+            "no marker/receipts yet"
+        );
+        std::fs::write(store.join(".grok-lhc-managed"), b"managed\n").unwrap();
+        std::fs::write(store.join("installed-name"), b"grok-lhc\n").unwrap();
+        std::fs::write(store.join("installed-version"), b"1.0.16\n").unwrap();
+        assert!(is_managed_install(Some(bin.join("grok")), &home));
+        std::os::unix::fs::symlink(store.join("versions/1.0.16"), store.join("current")).unwrap();
+        std::fs::create_dir_all(root.join("prefix/bin")).unwrap();
+        std::os::unix::fs::symlink(
+            store.join("current/bin/grok"),
+            root.join("prefix/bin/grok-lhc"),
+        )
+        .unwrap();
+        assert!(is_managed_install(
+            Some(root.join("prefix/bin/grok-lhc")),
+            &home
+        ));
+        let copied = root.join("grok-copy");
+        std::fs::write(&copied, b"binary").unwrap();
+        assert!(!is_managed_install(Some(copied), &home));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn lhc_version_flag_parses_and_prints_the_fork_release() {
+        let args = PagerArgs::try_parse_from(["grok", "--lhc-version"]).unwrap();
+        assert!(args.lhc_version);
+        assert!(!args.version);
+        let plain = PagerArgs::try_parse_from(["grok", "--version"]).unwrap();
+        assert!(!plain.lhc_version);
+        // Native text stays the upstream base; the fork identity is a separate value with that base.
+        let text = version_text("");
+        assert!(
+            text.starts_with(&format!("grok {}", xai_grok_version::VERSION)),
+            "{text}"
+        );
+        assert_eq!(
+            xai_grok_update::lhc_release::lhc_release_base(
+                xai_grok_update::lhc_release::LHC_RELEASE_VERSION
+            )
+            .as_deref(),
+            Some(xai_grok_version::VERSION)
+        );
     }
     /// Pins the gate composition; a dropped conjunct fails its named case.
     #[test]

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release SemVer"
+        description: "Fork release (<base> or <base>-lhc.<n>), matching the candidate"
         required: true
         type: string
       candidate_run_id:
@@ -77,6 +77,7 @@ jobs:
           from pathlib import Path
           manifest = json.loads(Path("candidate/release-manifest.json").read_text())
           assert manifest["release_version"] == os.environ["VERSION"]
+          assert manifest["upstream_version"] == os.environ["VERSION"].split("-lhc.")[0]
           assert manifest["candidate_run_id"] == os.environ["CANDIDATE_RUN_ID"]
           assert manifest["source_commit"] == os.environ["SOURCE_SHA"]
           assert manifest["published_platforms"] == ["linux-x86_64"]
@@ -116,8 +117,14 @@ jobs:
           SMOKE_RUN_ID: ${{ inputs.smoke_run_id }}
         run: |
           schema="$(python3 -c 'import json; print(json.load(open("candidate/release-manifest.json"))["lhc_thread_schema"])')"
+          upstream="$(python3 -c 'import json; print(json.load(open("candidate/release-manifest.json"))["upstream_version"])')"
           cat > RELEASE_NOTES.md <<EOF
           ## Grok-LHC v${VERSION}
+
+          Fork release ${VERSION} of upstream Grok ${upstream} (\`grok --version\`
+          reports the upstream base; \`grok --lhc-version\` reports ${VERSION}).
+          Install or update with the bundled \`install.sh\` (\`--download\`), which
+          keeps a managed store separate from any stock Grok install.
 
           This release publishes one prebuilt Linux x86-64 binary. The exact
           candidate bytes passed Daytona install, identity, default-on LHC

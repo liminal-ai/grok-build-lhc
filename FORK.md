@@ -537,8 +537,9 @@ implausibly large, upstream reset. Do not merge. Instead:
 
 1. Fresh clone of new upstream; branch `lhc` from its tip.
 2. Copy `crates/lhc/` (or re-add the submodule + adapter), `patches/`,
-   `scripts/` (tripwire + patch refresh), `FORK.md` from the old tree — these
-   are fork-owned, upstream never touches them.
+   `scripts/` (tripwire, patch refresh, release), `lhc-release/` (fork
+   release identity), `lhc-docs/`, `.github/workflows/`, `FORK.md` from the
+   old tree — these are fork-owned, upstream never touches them.
 3. `git apply --3way patches/0001-lhc-touchpoints.patch` — one state diff
    from `patches/BASE` (model changed 2026-08-06; see patches/README.md).
 4. `scripts/check-lhc-hooks.sh` — green means the fork is whole.
@@ -577,8 +578,24 @@ Chunk 1 means the first real upstream sync already has a proven fallback.)
   evidence and checks out that exact SHA. `SOURCE_REV` and `patches/BASE` are
   recorded separately because they identify the xAI monorepo source and the
   public-git recovery base, respectively.
-- Current prebuilt asset: `grok-{ver}-linux-x86_64`, plus the checksummed
-  installer, manifest, and `SHA256SUMS`.
+- **Release identity (slice 3, 2026-09-08):** the native `grok --version` is the
+  upstream base (`GROK_VERSION` = the workspace version, `1.0.16` at BASE
+  `72a61251`); it feeds protocol headers, server version policy, the leader, and
+  every stock semver consumer unchanged. The fork's own release identity is
+  `lhc-release/VERSION` (`<base>` = fork revision 0, `<base>-lhc.<n>` for a
+  repair of the same base), embedded as
+  `xai_grok_update::lhc_release::LHC_RELEASE_VERSION`, printed by
+  `grok --lhc-version` and as `lhcRelease` in `grok version --json`, and used
+  only for fork release discovery, the tag/asset/manifest, and the store's
+  `installed-version` receipt. Ordering is the source tuple plus the fork
+  revision (`parse_lhc_release`). The candidate workflow asserts the pair
+  (input == `lhc-release/VERSION`, base == `xai-grok-version`'s version) and
+  `make_manifest.py` records both (`release_version`, `upstream_version`,
+  `fork_revision`).
+- Assets: `grok-<release>-<os>-<arch>` with os `linux|darwin|windows`, arch
+  `x86_64|aarch64` (C3 convention); one `SHA256SUMS` and one
+  `release-manifest.json` list every published asset, plus the installer.
+  Currently published: `linux-x86_64` only (three-platform lane is slice 5).
 - `release-manifest.json`'s `lhc_thread_schema` is **derived** by
   `make_manifest.py` from the vendored SDK's `CURRENT_THREAD_SCHEMA_VERSION`
   (never hand-maintained; it was a literal `6` until v0.3.0). The Daytona
@@ -589,10 +606,34 @@ Chunk 1 means the first real upstream sync already has a proven fallback.)
   build or publish a release. Promotion refuses an existing tag/release.
 - Smoke needs secret `DAYTONA_API_KEY`; promotion uses the protected
   `production` environment.
-- Updater: `GH_RELEASE_REPO = liminal-ai/grok-build-lhc`; UI says
-  **grok-build-lhc**. Auto-update defaults **off** until the user opts in.
-  Resolution needs `[cli] installer = "gh-release"` in `~/.grok/config.toml`
-  (stock writes `"internal"`, which would read xAI's channel pointer).
+- **Native install/update ownership (slice 3):** the fork binary classifies
+  itself by layout, never by the shared `[cli].installer` key. It is
+  *managed* only when its executable is `<store>/versions/<release>/bin/grok`
+  and the store carries `.grok-lhc-managed`, `installed-name`,
+  `installed-version` (`lhc_release::managed_install_for_exe`, the one
+  detection helper). Managed: explicit `grok update` and — only with
+  `[cli] auto_update = true` (`None`/`false` mean off, C1) — the TUI and
+  `agent stdio` background updates fetch the latest fork release from the
+  unauthenticated GitHub API, launch the **embedded** `install.sh --download
+  --install-root <store>` (name and prefix from receipts), keep the update
+  cache at `<store>/version.json`, and restart from `<store>/current/bin/grok`.
+  Unmanaged (source build, copied file): `grok update` prints installer
+  guidance and does nothing; no stock npm/CDN/`~/.grok/bin` fallthrough.
+  Windows: managed detection works but the update path returns guidance until
+  the PowerShell installer exists (C2, slice 5). Stock's updater code is
+  retained untouched and unreachable from the fork binary; the fork never
+  writes `[cli].installer`, `auto_update`, `~/.grok/version.json`,
+  `~/.grok/bin`, or `~/.grok/downloads`. `GROK_INSTALLER` (tests) still
+  overrides classification.
+- **0.3.1 transition (documented, not automatic):** the installed 0.3.1 store
+  has `installed-name = grok` and no `installed-prefix`; its updater cannot see
+  aligned releases. Transition = one installer rerun against the existing store
+  with the actual prefix, which keeps the name and link and records the prefix:
+  `sh install.sh --download --install-root ~/.local/share/grok-lhc --prefix ~/.local`.
+  The shared `~/.grok/config.toml` still says `installer = "gh-release"` from
+  slice 4; correcting it for stock is a deliberate, documented step in a later
+  rollout, never written by LHC code. `~/.grok/bin/grok-stock` is a copied
+  file, not a stock-managed install.
 - **Local install on Lee's box (2026-09-04, v0.3.0 candidate bytes):**
   `~/.local/bin/grok` → `~/.local/share/grok-lhc/current/bin/grok` (the
   release installer's managed store), and `~/.local/bin/grok-lhc` is a

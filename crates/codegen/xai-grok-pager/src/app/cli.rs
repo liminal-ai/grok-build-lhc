@@ -422,6 +422,9 @@ pub struct PagerArgs {
     /// Print version
     #[arg(short = 'v', short_alias = 'V', long = "version", action = ArgAction::SetTrue)]
     pub version: bool,
+    /// Print the grok-build-lhc fork release identity (`--version` stays the upstream base).
+    #[arg(long = "lhc-version", action = ArgAction::SetTrue)]
+    pub lhc_version: bool,
     /// Working directory.
     #[arg(long)]
     pub cwd: Option<PathBuf>,

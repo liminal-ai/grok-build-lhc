@@ -2433,3 +2433,170 @@ fn npm_entry_is_recognized_by_the_binary_location() {
     assert!(super::is_under_node_modules(&resolved));
     assert!(!super::is_under_node_modules(&root.join("home/bin/grok")));
 }
+
+// ---- grok-build-lhc fork: managed-store update ownership ----------------------------
+
+#[test]
+fn lhc_needs_update_orders_fork_releases_and_leaves_stock_rules_alone() {
+    use crate::lhc_release::{INSTALLER_LHC_MANAGED, INSTALLER_LHC_UNMANAGED};
+    // Fork kinds: source tuple + fork revision, channel ignored, never a downgrade.
+    assert_eq!(
+        needs_update_for(
+            INSTALLER_LHC_MANAGED,
+            "1.0.16",
+            "1.0.16-lhc.1",
+            "stable",
+            false
+        ),
+        Some(true)
+    );
+    assert_eq!(
+        needs_update_for(
+            INSTALLER_LHC_MANAGED,
+            "1.0.16-lhc.1",
+            "1.0.16",
+            "stable",
+            true
+        ),
+        Some(false)
+    );
+    assert_eq!(
+        needs_update_for(
+            INSTALLER_LHC_MANAGED,
+            "1.0.16-lhc.1",
+            "1.0.16-lhc.1",
+            "alpha",
+            false
+        ),
+        Some(false)
+    );
+    assert_eq!(
+        needs_update_for(
+            INSTALLER_LHC_MANAGED,
+            "1.0.16-lhc.3",
+            "1.0.17",
+            "weird",
+            false
+        ),
+        Some(true)
+    );
+    assert_eq!(
+        needs_update_for(INSTALLER_LHC_UNMANAGED, "0.3.1", "1.0.16", "stable", false),
+        Some(true)
+    );
+    assert_eq!(
+        needs_update_for(
+            INSTALLER_LHC_MANAGED,
+            "1.0.16",
+            "1.0.16-alpha.1",
+            "stable",
+            false
+        ),
+        None
+    );
+    // Stock kinds: exactly upstream's semver rule (a pre-release target is rejected on stable).
+    assert_eq!(
+        needs_update_for("internal", "1.0.16", "1.0.16-lhc.1", "stable", false),
+        Some(false)
+    );
+    assert_eq!(
+        needs_update_for("npm", "1.0.15", "1.0.16", "stable", false),
+        needs_update("1.0.15", "1.0.16", "stable", false)
+    );
+}
+
+/// C1: managed LHC background updates need an explicit opt-in; unmanaged never; stock unchanged.
+#[test]
+fn lhc_background_updates_are_opt_in() {
+    use crate::lhc_release::{INSTALLER_LHC_MANAGED, INSTALLER_LHC_UNMANAGED};
+    assert!(lhc_background_updates_allowed_for(
+        INSTALLER_LHC_MANAGED,
+        Some(true)
+    ));
+    assert!(!lhc_background_updates_allowed_for(
+        INSTALLER_LHC_MANAGED,
+        None
+    ));
+    assert!(!lhc_background_updates_allowed_for(
+        INSTALLER_LHC_MANAGED,
+        Some(false)
+    ));
+    for auto in [None, Some(true), Some(false)] {
+        assert!(!lhc_background_updates_allowed_for(
+            INSTALLER_LHC_UNMANAGED,
+            auto
+        ));
+        assert!(lhc_background_updates_allowed_for("internal", auto));
+        assert!(lhc_background_updates_allowed_for("npm", auto));
+    }
+}
+
+#[test]
+fn lhc_hints_and_helpers_never_route_to_stock_paths() {
+    use crate::lhc_release::{INSTALLER_LHC_MANAGED, INSTALLER_LHC_UNMANAGED};
+    for kind in [INSTALLER_LHC_MANAGED, INSTALLER_LHC_UNMANAGED] {
+        let hint = reinstall_hint(kind, "stable");
+        assert!(hint.contains("install.sh --download"), "{hint}");
+        assert!(
+            !hint.contains("x.ai/cli/install") && !hint.contains("gh release"),
+            "{hint}"
+        );
+        assert!(
+            !installer_manages_bin_entrypoints(kind),
+            "the fork never heals ~/.grok/bin"
+        );
+        assert!(!installer_allows_downgrade(kind));
+        assert!(is_lhc_installer(kind));
+    }
+    assert!(!is_lhc_installer("internal"));
+    assert_eq!(disk_version_for_installer(INSTALLER_LHC_UNMANAGED), None);
+}
+
+/// Restart resolves the store's activated binary, not `~/.grok/bin/grok`.
+#[test]
+fn lhc_managed_restart_uses_the_store_current_binary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("grok-lhc");
+    std::fs::create_dir_all(store.join("current").join("bin")).unwrap();
+    let managed = crate::lhc_release::LhcManagedInstall {
+        store: store.clone(),
+        release: "1.0.16".into(),
+        name: "grok".into(),
+    };
+    assert_eq!(
+        managed_restart_exe(&managed),
+        None,
+        "missing current binary falls back"
+    );
+    let bin = if cfg!(windows) { "grok.exe" } else { "grok" };
+    std::fs::write(store.join("current").join("bin").join(bin), b"bin").unwrap();
+    assert_eq!(
+        managed_restart_exe(&managed),
+        Some(store.join("current").join("bin").join(bin))
+    );
+}
+
+/// An LHC build outside a managed store never falls through to npm/CDN or `~/.grok/bin`.
+#[tokio::test]
+#[serial_test::serial]
+async fn lhc_unmanaged_build_gets_guidance_not_a_stock_install() {
+    let err = install_lhc_managed(Some("1.0.16-lhc.1")).await.unwrap_err();
+    assert!(err.to_string().contains("install.sh --download"), "{err}");
+    let update_config = UpdateConfig {
+        proxy_base_url: String::new(),
+        auth_scope: String::new(),
+        deployment_key: None,
+        alpha_test_key: None,
+        channel: "stable".into(),
+        npm_registry: None,
+    };
+    let err = run_install_script(
+        crate::lhc_release::INSTALLER_LHC_UNMANAGED,
+        Some("1.0.16-lhc.1"),
+        &update_config,
+        CliUpdateTrigger::UserCommand,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("install.sh --download"), "{err}");
+}

@@ -39,30 +39,62 @@ rustup show              # confirm toolchain
 
 ## 3. Install from GitHub Releases (preferred)
 
-When a release exists on
-[liminal-ai/grok-build-lhc releases](https://github.com/liminal-ai/grok-build-lhc/releases):
+Releases live at
+[liminal-ai/grok-build-lhc releases](https://github.com/liminal-ai/grok-build-lhc/releases).
+Each release is a fork release of an upstream Grok base: `grok --version`
+prints the upstream base (for example `grok 1.0.16`), `grok --lhc-version`
+prints the fork release (`1.0.16` for fork revision 0, `1.0.16-lhc.2` for a
+repair of the same base).
+
+The one installer owns download, checksums, the managed store, receipts, and
+activation. It never touches `~/.grok`, so a stock `grok` can stay installed
+side by side:
 
 ```bash
-VERSION=0.2.0   # set to the release you want
-mkdir -p "grok-lhc-v${VERSION}"
-gh release download "v${VERSION}" --repo liminal-ai/grok-build-lhc \
-  --dir "grok-lhc-v${VERSION}"
-sh "grok-lhc-v${VERSION}/install.sh" --version "$VERSION" \
-  --asset-dir "grok-lhc-v${VERSION}"
+curl -fsSL https://github.com/liminal-ai/grok-build-lhc/releases/latest/download/install.sh -o install.sh
+sh install.sh --download                 # latest release, host platform
+# sh install.sh --download --version 1.0.16-lhc.2
 ```
 
-| Platform | Asset pattern |
-|---|---|
-| Linux x86_64 | `grok-*-linux-x86_64` |
-| macOS Apple Silicon | source compatibility maintained; no current prebuilt |
-| Windows x86_64 | source compatibility maintained; no current prebuilt |
+Defaults: command **`grok-lhc`** at `~/.local/bin/grok-lhc`, managed store
+`~/.local/share/grok-lhc` (`versions/<release>/bin/grok`, `current`, receipts
+`installed-name`, `installed-version`, `installed-prefix`). Choose otherwise
+explicitly: `--name grok-memory`, `--prefix /opt/grok-lhc`,
+`--install-root DIR`. Re-running the installer against an existing store keeps
+its recorded name and prefix. `--uninstall` removes the command and the store
+and preserves configuration and LHC archives. A downloaded candidate directory
+works offline with `--asset-dir DIR` (release lane).
 
-Installs as **`grok`**. This is the **liminal-ai LHC fork**, not official xAI.
-Do **not** update with `curl \| https://x.ai/cli/install.sh` — that replaces
-the fork with stock Grok.
+| Platform | Asset | Status |
+|---|---|---|
+| Linux x86_64 | `grok-<release>-linux-x86_64` | published |
+| macOS Apple Silicon | `grok-<release>-darwin-aarch64` | installer selects it; first prebuilt asset is the release slice |
+| Windows x86_64 | `grok-<release>-windows-x86_64.exe` | same store contract; PowerShell installer and managed update arrive with the release slice |
 
-After install, `grok update` (when you enable auto-update or run it manually)
-pulls from **this repo’s** GitHub Releases and prints **grok-build-lhc**.
+This is the **liminal-ai LHC fork**, not official xAI. Do **not** update with
+`curl … https://x.ai/cli/install.sh` — that replaces the fork with stock Grok.
+
+### Updating
+
+A managed install updates itself from this repo's GitHub Releases (no `gh`
+needed): `grok update` (explicit, always available) or `grok update --check`.
+Background/automatic updates are **opt-in**: set `[cli] auto_update = true`
+in `~/.grok/config.toml`; unset or `false` means off. The updater reads and
+writes only its own store (`<store>/version.json` cache, receipts, versions)
+and relaunches `<store>/current/bin/grok`. It never writes the shared
+`[cli].installer` key, `~/.grok/bin`, `~/.grok/downloads`, or
+`~/.grok/version.json`, so a stock install's own updater is unaffected. A
+build that is not running from a managed store (source build, copied file)
+prints these install instructions instead.
+
+**Existing 0.3.1 installs** (`installed-name = grok`, no prefix receipt)
+cannot update themselves to an aligned release. Run the installer once
+against the existing store with its real prefix; the command name and links
+are kept and the prefix is recorded:
+
+```bash
+sh install.sh --download --install-root ~/.local/share/grok-lhc --prefix ~/.local
+```
 
 Maintainers cut releases through three manual stages: **Grok LHC candidate**
 builds one immutable Linux bundle, **Grok LHC Linux smoke** qualifies those

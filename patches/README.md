@@ -69,8 +69,10 @@ hand-maintained (dropped five touchpoints after Chunk 2; dropped the root
 - `crates/lhc/**` — fork-owned; the drill re-adds that directory wholesale
   (submodule + adapter), so patching it would be redundant and enormous.
 - `Cargo.lock` — regenerate with `cargo check` after applying.
-- `FORK.md`, `patches/`, `scripts/**`, `lhc-docs/**`, `.github/workflows/**`,
-  `.gitignore`, `.gitmodules` — fork-owned, copied whole in recovery.
+- `FORK.md`, `patches/`, `scripts/**`, `lhc-docs/**`, `lhc-release/**`,
+  `.github/workflows/**`, `.gitignore`, `.gitmodules` — fork-owned, copied
+  whole in recovery. (`crates/codegen/xai-grok-update/src/lhc_release.rs` is a
+  fork-owned *new file inside an upstream crate*, so it rides in the patch.)
 - Root `README.md` — only the fork banner differs; re-asserted by hand at
   every sync (FORK.md "Sync drill" step 3), not patched.
 

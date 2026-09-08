@@ -10,6 +10,7 @@ use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::io::AsyncWriteExt;
 
+use crate::lhc_release::{INSTALLER_LHC_MANAGED, INSTALLER_LHC_UNMANAGED};
 use crate::version::{
     UpdateConfig, fetch_latest_version, get_installed_grok_version, get_latest_version,
     is_version_cache_fresh, try_fetch_stable_pointer, write_version_cache,
@@ -51,6 +52,10 @@ fn manual_install_cmd(channel: &str) -> String {
 
 fn reinstall_hint(installer: &str, channel: &str) -> String {
     match installer {
+        // Fork builds: the one shell installer owns install and update.
+        INSTALLER_LHC_MANAGED | INSTALLER_LHC_UNMANAGED => {
+            crate::lhc_release::managed_installer_guidance()
+        }
         "npm" => "Please reinstall via npm:\n  npm i -g @xai-official/grok".to_string(),
         "gh-release" => format!(
             "Please reinstall **grok-build-lhc** via GitHub Releases:\n  {}",
@@ -233,7 +238,8 @@ pub async fn check_update_status(update_config: &UpdateConfig) -> UpdateStatus {
         Ok(latest) => match plan_for(&config::VersionPolicy::resolve(), latest) {
             UpdatePlan::Install { target, .. } => {
                 let mut error = None;
-                let update_available = match needs_update(
+                let update_available = match needs_update_for(
+                    inst,
                     &current_version,
                     &target,
                     &channel,
@@ -384,6 +390,9 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
     let Some(installer) = get_installer().await else {
         return Ok(outcome);
     };
+    if !lhc_background_updates_allowed(installer).await {
+        return Ok(outcome);
+    }
     heal_managed_install(installer).await;
     let allow_downgrade = installer_allows_downgrade(installer);
     let policy = config::VersionPolicy::resolve();
@@ -395,7 +404,8 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
 
     let effective_current =
         disk_version_for_installer(installer).unwrap_or_else(get_installed_grok_version);
-    if needs_update(
+    if needs_update_for(
+        installer,
         &effective_current,
         &target,
         &update_config.channel,
@@ -439,6 +449,8 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
 /// Unknown installers are treated like npm (no trustworthy disk version).
 fn disk_version_for_installer(installer: &str) -> Option<String> {
     match installer {
+        // The store's `installed-version` receipt is the managed LHC disk truth.
+        INSTALLER_LHC_MANAGED => crate::lhc_release::managed_install().map(|m| m.release),
         "internal" | "gh-release" => crate::version::installed_on_disk_version(),
         _ => None,
     }
@@ -466,6 +478,12 @@ fn env_installer() -> Option<&'static str> {
 }
 
 pub async fn get_installer() -> Option<&'static str> {
+    // Fork: this binary is always an LHC build. Without an explicit `GROK_INSTALLER`
+    // override (tests) it classifies itself by its managed store and never by the
+    // shared `[cli].installer` key, so stock's selection is neither read nor written.
+    if std::env::var_os("GROK_INSTALLER").is_none() {
+        return Some(crate::lhc_release::installer_kind());
+    }
     if let Some(i) = env_installer() {
         return Some(i);
     }
@@ -491,6 +509,21 @@ fn path_resolves_to_npm_entry() -> bool {
 
 fn is_under_node_modules(exe: &std::path::Path) -> bool {
     exe.components().any(|c| c.as_os_str() == "node_modules")
+}
+
+/// Installer-aware staleness: a managed LHC store orders fork releases
+/// (`<base>[-lhc.<n>]`, no channels, no downgrade); everything else is upstream's semver rule.
+fn needs_update_for(
+    installer: &str,
+    current: &str,
+    target: &str,
+    channel: &str,
+    allow_downgrade: bool,
+) -> Option<bool> {
+    if installer == INSTALLER_LHC_MANAGED || installer == INSTALLER_LHC_UNMANAGED {
+        return crate::lhc_release::lhc_release_is_newer(target, current);
+    }
+    needs_update(current, target, channel, allow_downgrade)
 }
 
 fn needs_update(current: &str, target: &str, channel: &str, allow_downgrade: bool) -> Option<bool> {
@@ -570,6 +603,9 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
     let Some(installer) = get_installer().await else {
         return BackgroundUpdateCheck::none();
     };
+    if !lhc_background_updates_allowed(installer).await {
+        return BackgroundUpdateCheck::none();
+    }
 
     heal_managed_install(installer).await;
 
@@ -592,7 +628,8 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
     };
 
     let allow_downgrade = installer_allows_downgrade(installer);
-    if !needs_update(
+    if !needs_update_for(
+        installer,
         &current_version,
         &target_version,
         &update_config.channel,
@@ -659,6 +696,10 @@ pub async fn run_update_if_available(
         return Ok(false);
     };
 
+    if !lhc_background_updates_allowed(inst).await {
+        return Ok(false);
+    }
+
     heal_managed_install(inst).await;
 
     if is_version_cache_fresh().await {
@@ -672,9 +713,11 @@ pub async fn run_update_if_available(
     }
 
     // Resolve effective auto_update: None defaults to true (first-run).
+    // Fork: a managed LHC store got here only with `Some(true)` (see `lhc_background_updates_allowed`).
     let auto_update = current_config.cli.auto_update.unwrap_or(true);
 
-    if current_config.cli.auto_update.is_none()
+    if !is_lhc_installer(inst)
+        && current_config.cli.auto_update.is_none()
         && let Err(e) = config::update_config(|st| {
             if st.cli.auto_update.is_none() {
                 st.cli.auto_update = Some(true);
@@ -694,7 +737,8 @@ pub async fn run_update_if_available(
         Ok(UpdatePlan::Install { target, .. }) => target,
         Ok(UpdatePlan::Skip { .. } | UpdatePlan::Unavailable { .. }) | Err(_) => return Ok(false),
     };
-    if !needs_update(
+    if !needs_update_for(
+        inst,
         &current_version,
         &latest_version,
         &update_config.channel,
@@ -839,6 +883,11 @@ async fn run_update_subcommand(
 /// `current_exe()` resolves symlinks via `/proc/self/exe` (see proc(5)), so it returns the old versioned target after a symlink swap.
 /// Prefer `~/.grok/bin/grok` which always points to the latest version.
 fn resolve_restart_exe() -> Result<std::path::PathBuf> {
+    // Fork: a managed LHC install restarts from its own store, never from `~/.grok/bin/grok`
+    // (which may be a stock install living side by side).
+    if let Some(exe) = crate::lhc_release::managed_install().and_then(|m| managed_restart_exe(&m)) {
+        return Ok(exe);
+    }
     let canonical = grok_application();
     if canonical.exists() {
         return Ok(canonical);
@@ -902,6 +951,11 @@ pub async fn run_install_script(
         )
         .map(|()| None),
         "gh-release" => install_gh_release(target).await.map(|()| None),
+        INSTALLER_LHC_MANAGED => install_lhc_managed(target).await.map(Some),
+        INSTALLER_LHC_UNMANAGED => Err(anyhow::anyhow!(
+            "{}",
+            crate::lhc_release::managed_installer_guidance()
+        )),
         _ => install_internal(target, update_config).await.map(Some),
     };
     // Measured before the success-only cache sweep, so the sweep cannot inflate success durations
@@ -936,6 +990,59 @@ pub async fn run_install_script(
             reinstall_hint(installer, &update_config.channel)
         )
     })
+}
+
+fn is_lhc_installer(installer: &str) -> bool {
+    installer == INSTALLER_LHC_MANAGED || installer == INSTALLER_LHC_UNMANAGED
+}
+
+/// Background/automatic updates for the fork are opt-in: a managed LHC store runs them
+/// only with `[cli] auto_update = true` (`None` and `false` both mean off; explicit
+/// `grok update` is unaffected), and an unmanaged LHC build never runs them.
+/// Stock kinds keep upstream's rules.
+async fn lhc_background_updates_allowed(installer: &str) -> bool {
+    if !is_lhc_installer(installer) {
+        return true;
+    }
+    lhc_background_updates_allowed_for(installer, config::load_config().await.cli.auto_update)
+}
+
+/// Pure form of [`lhc_background_updates_allowed`] (C1: `None` means off for the fork).
+fn lhc_background_updates_allowed_for(installer: &str, auto_update: Option<bool>) -> bool {
+    match installer {
+        INSTALLER_LHC_MANAGED => auto_update == Some(true),
+        INSTALLER_LHC_UNMANAGED => false,
+        _ => true,
+    }
+}
+
+/// The binary a managed LHC install relaunches after an update: the store's activated
+/// binary, or `None` when it is missing (caller falls back to upstream's rule).
+fn managed_restart_exe(
+    managed: &crate::lhc_release::LhcManagedInstall,
+) -> Option<std::path::PathBuf> {
+    let current = managed.current_bin();
+    current.exists().then_some(current)
+}
+
+/// Install `target` (or the latest fork release) into the running executable's managed
+/// store by launching the embedded shell installer. Returns the activated release.
+async fn install_lhc_managed(target: Option<&str>) -> Result<String> {
+    let Some(managed) = crate::lhc_release::managed_install() else {
+        anyhow::bail!("{}", crate::lhc_release::managed_installer_guidance());
+    };
+    let release = match target {
+        Some(v) => v.to_string(),
+        None => crate::lhc_release::fetch_latest_release().await?,
+    };
+    eprintln!(
+        "  Installing grok-build-lhc {} into {} (command `{}`)...",
+        release,
+        managed.store.display(),
+        managed.name
+    );
+    crate::lhc_release::run_managed_installer(&managed, &release).await?;
+    Ok(release)
 }
 
 /// Detect the platform (os, arch) to download binaries for.
@@ -2600,9 +2707,13 @@ pub async fn run_update(
             return Ok(None);
         }
     };
-    // Persist installer if not already saved
+    if installer == INSTALLER_LHC_UNMANAGED {
+        eprintln!("{}", crate::lhc_release::managed_installer_guidance());
+        return Ok(None);
+    }
+    // Persist installer if not already saved (stock kinds only: the fork never writes the shared key)
     let cfg = config::load_config().await;
-    if cfg.cli.installer.is_none() {
+    if !is_lhc_installer(installer) && cfg.cli.installer.is_none() {
         let _ = config::update_config(|st| {
             st.cli.installer = Some(installer.to_string());
         })
@@ -2626,10 +2737,11 @@ pub async fn run_update(
         eprintln!();
         run_install_script(installer, Some(version), update_config, trigger).await?;
         refresh_deployment_config().await;
-        if let Err(e) = config::update_config(|st| {
-            st.cli.auto_update = Some(false);
-        })
-        .await
+        if !is_lhc_installer(installer)
+            && let Err(e) = config::update_config(|st| {
+                st.cli.auto_update = Some(false);
+            })
+            .await
         {
             tracing::warn!("Failed to persist auto_update=false for pinned install: {e}");
         }
@@ -2684,7 +2796,8 @@ pub async fn run_update(
         disk_version_for_installer(installer).unwrap_or_else(|| current_version.clone());
 
     if !force {
-        match needs_update(
+        match needs_update_for(
+            installer,
             &effective_current,
             &install_target,
             &update_config.channel,
@@ -2734,7 +2847,8 @@ pub async fn run_update(
     }
 
     let target_version = if force
-        && !needs_update(
+        && !needs_update_for(
+            installer,
             &effective_current,
             &install_target,
             &update_config.channel,

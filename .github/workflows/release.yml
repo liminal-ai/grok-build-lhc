@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "SemVer without the v prefix"
+        description: "Fork release without the v prefix: <upstream base> (fork revision 0) or <base>-lhc.<n>; must equal lhc-release/VERSION"
         required: true
         type: string
       candidate_sha:
@@ -38,9 +38,13 @@ jobs:
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}
         run: |
           set -euo pipefail
-          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-lhc\.[0-9]+)?$ ]]
           [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          # Identity pair: the fork release is built on the native upstream base and is the embedded identity.
+          test "$(tr -d '[:space:]' < lhc-release/VERSION)" = "$VERSION"
+          upstream="$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/codegen/xai-grok-version/Cargo.toml | head -n 1)"
+          test "${VERSION%%-lhc.*}" = "$upstream"
           test -s SOURCE_REV
           test -s patches/BASE
           test -f crates/lhc/vendor/long-horizon-context/packages/lhc-rs/Cargo.toml
@@ -78,14 +82,20 @@ jobs:
       - uses: facebook/install-dotslash@1e4e7b3e07eaca387acb98f1d4720e0bee8dbb6a # v2
       - name: Build and identify release binary
         env:
-          GROK_VERSION: ${{ inputs.version }}
+          LHC_RELEASE: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          cargo build --locked -p xai-grok-pager-bin --release
-          install -m 0755 target/release/xai-grok-pager "grok-${GROK_VERSION}-linux-x86_64"
-          strip "grok-${GROK_VERSION}-linux-x86_64"
-          "./grok-${GROK_VERSION}-linux-x86_64" --version | grep -F "grok ${GROK_VERSION}"
-          "./grok-${GROK_VERSION}-linux-x86_64" --help >/dev/null
+          # Native GROK_VERSION is the upstream base; the fork release is embedded from lhc-release/VERSION.
+          upstream="$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/codegen/xai-grok-version/Cargo.toml | head -n 1)"
+          test "${LHC_RELEASE%%-lhc.*}" = "$upstream"
+          test "$(tr -d '[:space:]' < lhc-release/VERSION)" = "$LHC_RELEASE"
+          GROK_VERSION="$upstream" cargo build --locked -p xai-grok-pager-bin --release
+          asset="grok-${LHC_RELEASE}-linux-x86_64"
+          install -m 0755 target/release/xai-grok-pager "$asset"
+          strip "$asset"
+          "./$asset" --version | grep -F "grok ${upstream}"
+          test "$("./$asset" --lhc-version)" = "$LHC_RELEASE"
+          "./$asset" --help >/dev/null
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: grok-lhc-linux-x86_64
@@ -114,9 +124,11 @@ jobs:
         run: |
           set -euo pipefail
           install -m 0755 scripts/grok-lhc-release/install.sh candidate/install.sh
+          upstream="$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/codegen/xai-grok-version/Cargo.toml | head -n 1)"
           python3 scripts/grok-lhc-release/make_manifest.py \
             --dist candidate \
             --version "$VERSION" \
+            --upstream-version "$upstream" \
             --source-commit "$(git rev-parse HEAD)" \
             --source-revision "$(tr -d '[:space:]' < SOURCE_REV)" \
             --upstream-commit "$(tr -d '[:space:]' < patches/BASE)" \
