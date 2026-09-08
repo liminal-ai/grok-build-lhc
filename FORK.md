@@ -601,16 +601,35 @@ Chunk 1 means the first real upstream sync already has a proven fallback.)
 
 ## Known limitations (live cert 2026-09-04, follow-ups — not blockers)
 
-- **Turn parts are not wired in the adapter.** `CompactOpts.compact_point_upper_bound`
-  is `None` and no host step index is recorded, so a compact that fires
-  mid-turn (hook 5 in the sampling loop) cannot move the LHC compact point
-  into the open turn. The write-back body is bands + the whole open turn
-  verbatim; native does not shrink until the turn closes, and the native
-  trigger re-fires on every later model call in that turn (7 write-backs in
-  one 8-read turn at a 150k debug window). The turn still completes and the
-  record stays one turn; the first call after the turn closes compacts
-  normally. (The "each re-records the turn's tool calls" symptom seen on
-  2026-09-04 was the write-back recapture below, fixed in slice 1A.)
+- **Long native tasks are segmented LHC-side — slice 1B (2026-09-08, commit
+  `589edcdf`), superseding the turn-parts gap.** Turn parts stay unwired
+  (`compact_point_upper_bound` is `None`, no step index; the earlier symptom
+  "native does not shrink until the turn closes, 7 write-backs in one 8-read
+  turn" was this plus the 1A recapture). Instead, at the next complete tool
+  exchange after the open canonical turn reaches half the full-fidelity budget
+  of the live compact policy (`continuation` profile, lower_bound × full% / 2 =
+  18,000 tokens today, read at each candidate), the capture worker appends an
+  ordinary host-authored `turn_end` (`outcome: completed`, `outcomeReason:
+  grok_lhc_segment`, keyed `…:{digest}:{occ}:segment_end` from the closing
+  tool result, no timestamps). The native task continues unchanged; nothing is
+  served, waited on, summarized or restarted, and the shell never learns about
+  segments. A segment closes only with no outstanding tool call (parallel
+  calls included), only when the closing result was newly recorded (replay,
+  bootstrap and replace re-map never mint ends), and never while an
+  item-mapped completion is still deferred; the genuine native close keeps its
+  shell facts and releases abandoned calls. Live (isolated, 150k debug window,
+  `LIVE` rows in the campaign `HANDOFF-1B.md`): 24 reads in one session, 12
+  segments of ~21k tokens, three mid-task compacts (121k→54k, 122k→56k,
+  124k→57k tokens) with the compact point at a segment boundary inside the
+  running task, no re-reads after compact or resume, 24/24 facts recalled.
+  Known and accepted effects (steward scope review R3): a middle segment
+  holding only tool traffic compresses to an empty detailed-band entry (no
+  synthetic summary is added); an indivisible exchange larger than the
+  threshold closes its segment above it; a cancel arriving right after a
+  segment end lands its facts on an empty open turn (event recorded, no turn
+  row); older huge turns are not split retrospectively. F3 stands (below):
+  the threshold follows the same policy, so a wrong lower target for a window
+  gives a proportionally wrong threshold.
 - **LHC's own write-back was re-recorded as canonical input — FIXED in slice
   1A (2026-09-08, commits `e8a6389c`, `32689991`).** Hook 5 installed the
   generated body through `replace_history`, the tee mirrored it into capture,
