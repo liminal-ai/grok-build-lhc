@@ -52,10 +52,10 @@ fn manual_install_cmd(channel: &str) -> String {
 
 fn reinstall_hint(installer: &str, channel: &str) -> String {
     match installer {
-        // Fork builds: the one shell installer owns install and update.
-        INSTALLER_LHC_MANAGED | INSTALLER_LHC_UNMANAGED => {
-            crate::lhc_release::managed_installer_guidance()
-        }
+        // Fork builds: the one release installer owns install and update. A
+        // managed install that failed to update is still managed.
+        INSTALLER_LHC_MANAGED => crate::lhc_release::managed_update_failure_guidance(),
+        INSTALLER_LHC_UNMANAGED => crate::lhc_release::managed_installer_guidance(),
         "npm" => "Please reinstall via npm:\n  npm i -g @xai-official/grok".to_string(),
         "gh-release" => format!(
             "Please reinstall **grok-build-lhc** via GitHub Releases:\n  {}",

@@ -248,6 +248,18 @@ pub fn managed_installer_guidance() -> String {
     )
 }
 
+/// What to tell a user whose managed install's update did not complete: the store
+/// still runs the previous release, so retry or rerun the release installer.
+pub fn managed_update_failure_guidance() -> String {
+    format!(
+        "The managed grok-build-lhc update did not complete; the installed release is unchanged.\n\
+         Retry with `grok update`, or rerun the fork installer against this install (never the official x.ai install script):\n  \
+         {}\n\
+         See {LHC_INSTALL_DOCS_URL}",
+        manual_installer_command()
+    )
+}
+
 /// This platform's one-line bootstrap of the fork installer.
 pub fn manual_installer_command() -> String {
     if cfg!(windows) {
@@ -380,16 +392,33 @@ pub async fn run_managed_installer(managed: &LhcManagedInstall, release: &str) -
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    // Windows PowerShell must not inherit a PowerShell 7 module path: when this
+    // process was started (however indirectly) from pwsh, `PSModulePath` lists
+    // pwsh's Core-only modules ahead of the Windows PowerShell ones, and 5.1 then
+    // cannot autoload script-module commands such as `Get-FileHash`. pwsh scrubs
+    // the variable only for a powershell.exe it starts itself, never through an
+    // intermediary like this binary. With the variable unset, Windows PowerShell
+    // rebuilds its default module path.
+    if cfg!(windows) {
+        cmd.env_remove("PSModulePath");
+    }
     let output = cmd.output().await;
     let _ = tokio::fs::remove_file(&script).await;
     let output = output.with_context(|| format!("cannot run the fork installer with {program}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
+        // The installer's whole stderr: PowerShell reports the failing command on
+        // its first line and only the error id on its last.
+        let stderr = stderr.trim();
         anyhow::bail!(
-            "fork installer failed ({}): {}",
+            "fork installer failed ({}):\n{}",
             output.status,
-            stderr.trim().lines().last().unwrap_or("no output")
+            if stderr.is_empty() {
+                "no output"
+            } else {
+                stderr
+            }
         );
     }
     for line in stdout.lines() {
@@ -663,6 +692,52 @@ mod tests {
         );
     }
 
+    /// A failing installer's whole stderr reaches the error, not only its last line.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_update_reports_the_installer_stderr_in_full() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let tmp = tempfile::tempdir().unwrap();
+        let store = fake_store(tmp.path(), "1.0.16", "grok");
+        std::os::unix::fs::symlink(store.join("versions/1.0.16"), store.join("current")).unwrap();
+        let release = "1.0.16-lhc.1";
+        let installer = b"#!/bin/sh\necho 'first: the failing command' >&2\necho 'last: only an error id' >&2\nexit 3\n".to_vec();
+        let server = MockServer::start().await;
+        for (name, bytes) in [
+            (
+                "SHA256SUMS",
+                format!("{}  {INSTALLER_ASSET}\n", sha256_hex(&installer)).into_bytes(),
+            ),
+            (INSTALLER_ASSET, installer.clone()),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/download/v{release}/{name}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                .mount(&server)
+                .await;
+        }
+        // SAFETY: serial test; the variable is removed before returning.
+        unsafe { std::env::set_var(LHC_RELEASE_BASE_ENV, server.uri()) };
+        let managed = managed_install_for_exe(&store.join("versions/1.0.16/bin/grok")).unwrap();
+        let result = run_managed_installer(&managed, release).await;
+        unsafe { std::env::remove_var(LHC_RELEASE_BASE_ENV) };
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("fork installer failed (exit status: 3)"),
+            "{err}"
+        );
+        assert!(err.contains("first: the failing command"), "{err}");
+        assert!(err.contains("last: only an error id"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(store.join("installed-version"))
+                .unwrap()
+                .trim(),
+            "1.0.16"
+        );
+    }
+
     /// A release whose installer does not match its own sums is refused before anything
     /// runs; the store is untouched.
     #[cfg(unix)]
@@ -707,7 +782,11 @@ mod tests {
 
     #[test]
     fn guidance_never_points_at_official_install() {
-        for text in [managed_installer_guidance(), manual_installer_command()] {
+        for text in [
+            managed_installer_guidance(),
+            managed_update_failure_guidance(),
+            manual_installer_command(),
+        ] {
             assert!(text.contains("liminal-ai/grok-build-lhc"), "{text}");
             assert!(text.contains(INSTALLER_ASSET), "{text}");
             assert!(!text.contains("x.ai/cli/install"), "{text}");

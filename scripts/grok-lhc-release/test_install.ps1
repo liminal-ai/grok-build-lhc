@@ -124,7 +124,20 @@ try {
     Start-Sleep -Seconds 2
     $env:GROK_LHC_RELEASE_BASE = "http://127.0.0.1:$port"
     $dlStore = Join-Path $root "dl-store"
-    Install @{ Download = $true; Prefix = $prefix; InstallRoot = $dlStore }
+    # Download mode runs under Windows PowerShell (powershell.exe), the interpreter the
+    # binary's native update uses, with the same flags. pwsh gives a powershell.exe it
+    # starts a Windows-PowerShell-only module path, which is what the binary now
+    # produces by unsetting PSModulePath; the indirect boundary itself (cmd.exe ->
+    # grok.exe -> powershell.exe) is proven by candidate_check.ps1's native update.
+    $engine = (& powershell -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.Major' | Out-String).Trim()
+    Check ($engine -eq "5") "download mode interpreter is Windows PowerShell 5 (got $engine)"
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $dlOut = (& powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $installer -Download -Prefix $prefix -InstallRoot $dlStore 2>&1 | Out-String)
+        $dlCode = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $previous }
+    Check ($dlCode -eq 0) "download mode under Windows PowerShell exits 0`n$dlOut"
     Check ((Receipt $dlStore "installed-version") -eq "1.0.16-lhc.2") "download mode resolved latest = 1.0.16-lhc.2"
     Check (Test-Path (Join-Path $prefix "bin\grok-lhc.cmd")) "download mode installed the default command"
     Expect { Install @{ Download = $true; Version = "9.9.9"; InstallRoot = (Join-Path $root "m") } } "missing release refuses"

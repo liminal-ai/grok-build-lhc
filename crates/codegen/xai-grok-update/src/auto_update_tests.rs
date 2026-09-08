@@ -2537,6 +2537,18 @@ fn lhc_hints_and_helpers_never_route_to_stock_paths() {
     for kind in [INSTALLER_LHC_MANAGED, INSTALLER_LHC_UNMANAGED] {
         let hint = reinstall_hint(kind, "stable");
         assert!(hint.contains("install.sh --download"), "{hint}");
+        // Only an unmanaged build is told it is unmanaged; a managed build whose
+        // update failed is told the installed release is unchanged.
+        assert_eq!(
+            hint.contains("not running from a managed store"),
+            kind == INSTALLER_LHC_UNMANAGED,
+            "{hint}"
+        );
+        assert_eq!(
+            hint.contains("installed release is unchanged"),
+            kind == INSTALLER_LHC_MANAGED,
+            "{hint}"
+        );
         assert!(
             !hint.contains("x.ai/cli/install") && !hint.contains("gh release"),
             "{hint}"
