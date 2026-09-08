@@ -5,6 +5,7 @@ version = "0.1.220-alpha.4"
 edition.workspace = true
 
 [dependencies]
+sha2 = { workspace = true }
 dunce = { workspace = true }
 anyhow = { workspace = true }
 futures = { workspace = true }
@@ -30,7 +31,14 @@ zstd = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = { workspace = true }
 
+[features]
+# Fork (test-only seam): lets tests route the updater through upstream's stock
+# installer kinds via `GROK_INSTALLER` and pin the managed-store lookup via
+# `GROK_LHC_TEST_EXE`. Never enabled in a shipping build.
+lhc-test-seams = []
+
 [dev-dependencies]
+xai-grok-update = { path = ".", features = ["lhc-test-seams"] }
 semver = { workspace = true }
 serde_json = { workspace = true }
 serial_test = { workspace = true }

@@ -49,9 +49,9 @@ pub const INSTALLER_LHC_MANAGED: &str = "lhc-managed";
 /// Installer kind for an LHC build that is not running from a managed store.
 pub const INSTALLER_LHC_UNMANAGED: &str = "lhc-unmanaged";
 
-/// The one shell installer, embedded so the running build installs a release
-/// with the installer it was qualified with (no unverified script download).
-pub const INSTALLER_SCRIPT: &str = include_str!("../../../../scripts/grok-lhc-release/install.sh");
+/// Name of the installer asset every fork release publishes next to its binaries,
+/// listed in that release's `SHA256SUMS`.
+pub const INSTALLER_ASSET: &str = "install.sh";
 
 /// Parse `<major>.<minor>.<patch>[-lhc.<revision>]`; a bare base is revision 0.
 /// Anything else (stock pre-releases, garbage) is `None`.
@@ -162,8 +162,17 @@ pub fn managed_install_for_exe(exe: &Path) -> Option<LhcManagedInstall> {
     })
 }
 
+/// Test-only seam (`lhc-test-seams`): the executable path the crate's tests present as
+/// "the running binary" so decision paths can be driven from a fake managed store.
+pub const LHC_TEST_EXE_ENV: &str = "GROK_LHC_TEST_EXE";
+
 /// The managed store of the running executable, if any.
 pub fn managed_install() -> Option<LhcManagedInstall> {
+    if cfg!(feature = "lhc-test-seams")
+        && let Some(exe) = std::env::var_os(LHC_TEST_EXE_ENV)
+    {
+        return managed_install_for_exe(Path::new(&exe));
+    }
     managed_install_for_exe(&std::env::current_exe().ok()?)
 }
 
@@ -238,15 +247,75 @@ pub fn windows_update_guidance() -> String {
     )
 }
 
-/// Run the embedded installer against the managed store for `release`.
-/// Name and prefix come from the store's receipts; nothing under `~/.grok` is
-/// touched. Windows returns guidance instead of invoking a script that does
-/// not exist yet.
+fn release_download_base(release: &str) -> String {
+    match release_base_override() {
+        Some(base) => format!("{base}/download/v{release}"),
+        None => format!("{LHC_RELEASE_DOWNLOAD_BASE}/v{release}"),
+    }
+}
+
+fn release_client() -> Result<reqwest::Client> {
+    xai_grok_extra_ca::build_reqwest_client(|b| {
+        b.timeout(std::time::Duration::from_secs(60))
+            .user_agent(format!("grok-lhc/{LHC_RELEASE_VERSION}"))
+    })
+    .context("cannot build the release download client")
+}
+
+async fn fetch_release_asset(client: &reqwest::Client, base: &str, name: &str) -> Result<Vec<u8>> {
+    let url = format!("{base}/{name}");
+    let bytes = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("download failed: {url}"))?
+        .error_for_status()
+        .with_context(|| format!("download failed: {url}"))?
+        .bytes()
+        .await
+        .with_context(|| format!("download failed: {url}"))?;
+    Ok(bytes.to_vec())
+}
+
+/// The recorded digest of `name` in a release's `SHA256SUMS` (`<hex>  <name>` lines).
+pub fn recorded_sha256<'a>(sums: &'a str, name: &str) -> Option<&'a str> {
+    sums.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let digest = parts.next()?;
+        let entry = parts.next()?.trim_start_matches('*');
+        (entry == name && parts.next().is_none()).then_some(digest)
+    })
+}
+
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+/// Install `release` into `managed`'s store with **that release's own installer**:
+/// `install.sh` and `SHA256SUMS` are fetched from the release, the installer is
+/// verified against the sums (the same file it will verify the binary with), and it
+/// runs in download mode against the store. Name and prefix come from the store's
+/// receipts. The Codex shape: installer behavior ships with the release it installs.
 pub async fn run_managed_installer(managed: &LhcManagedInstall, release: &str) -> Result<()> {
     if cfg!(windows) {
         anyhow::bail!("{}", windows_update_guidance());
     }
     parse_lhc_release(release).with_context(|| format!("not a fork release: {release}"))?;
+    let base = release_download_base(release);
+    let client = release_client()?;
+    let sums = fetch_release_asset(&client, &base, "SHA256SUMS").await?;
+    let sums = String::from_utf8(sums).context("SHA256SUMS is not UTF-8")?;
+    let installer = fetch_release_asset(&client, &base, INSTALLER_ASSET).await?;
+    let expected = recorded_sha256(&sums, INSTALLER_ASSET).with_context(|| {
+        format!("release {release} does not list {INSTALLER_ASSET} in SHA256SUMS")
+    })?;
+    let actual = sha256_hex(&installer);
+    if !actual.eq_ignore_ascii_case(expected) {
+        anyhow::bail!(
+            "installer checksum mismatch for release {release}: expected {expected}, got {actual}"
+        );
+    }
     let script = std::env::temp_dir().join(format!(
         "grok-lhc-install-{}-{}.sh",
         std::process::id(),
@@ -255,7 +324,7 @@ pub async fn run_managed_installer(managed: &LhcManagedInstall, release: &str) -
             .map(|d| d.as_millis())
             .unwrap_or(0)
     ));
-    tokio::fs::write(&script, INSTALLER_SCRIPT)
+    tokio::fs::write(&script, &installer)
         .await
         .with_context(|| format!("cannot stage installer at {}", script.display()))?;
     let mut cmd = tokio::process::Command::new("sh");
@@ -411,13 +480,14 @@ mod tests {
         }
     }
 
-    /// Rust launches the embedded installer against the store: download mode over a
-    /// loopback server, checksums, receipts (name/prefix reused), activation, old
-    /// versions kept. Nothing outside the store and the recorded prefix is written.
+    /// Rust fetches the target release's installer, verifies it against that release's
+    /// sums, and runs it against the store: download mode over a loopback server,
+    /// checksums, receipts (name/prefix reused), activation, old versions kept.
+    /// Nothing outside the store and the recorded prefix is written.
     #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial]
-    async fn managed_update_runs_the_embedded_installer_against_the_store() {
+    async fn managed_update_runs_the_release_installer_against_the_store() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         if host_platform() == "unsupported" {
@@ -444,7 +514,16 @@ mod tests {
         let release = "1.0.16-lhc.1";
         let asset_name = format!("grok-{release}-{}", host_platform());
         let body = b"#!/bin/sh\nprintf 'updated\\n'\n".to_vec();
-        let digest = format!("{}  {asset_name}\n", sha256_hex(&body));
+        let installer = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../scripts/grok-lhc-release/install.sh"),
+        )
+        .unwrap();
+        let digest = format!(
+            "{}  {asset_name}\n{}  {INSTALLER_ASSET}\n",
+            sha256_hex(&body),
+            sha256_hex(&installer)
+        );
         let manifest =
             format!("{{\"product\": \"grok-lhc\", \"release_version\": \"{release}\"}}\n");
         let server = MockServer::start().await;
@@ -460,6 +539,7 @@ mod tests {
             ("SHA256SUMS", digest.into_bytes()),
             ("release-manifest.json", manifest.into_bytes()),
             (asset_name.as_str(), body.clone()),
+            (INSTALLER_ASSET, installer.clone()),
         ] {
             Mock::given(method("GET"))
                 .and(path(format!("/download/v{release}/{name}")))
@@ -525,21 +605,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recorded_sha256_reads_sums_lines() {
+        let sums = "aa  grok-1.0.16-linux-x86_64\nbb  install.sh\ncc *grok-1.0.16-darwin-arm64\n";
+        assert_eq!(recorded_sha256(sums, "install.sh"), Some("bb"));
+        assert_eq!(
+            recorded_sha256(sums, "grok-1.0.16-darwin-arm64"),
+            Some("cc")
+        );
+        assert_eq!(recorded_sha256(sums, "missing"), None);
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    /// A release whose installer does not match its own sums is refused before anything
+    /// runs; the store is untouched.
     #[cfg(unix)]
-    fn sha256_hex(bytes: &[u8]) -> String {
-        let mut child = std::process::Command::new("sha256sum")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        std::io::Write::write_all(child.stdin.as_mut().unwrap(), bytes).unwrap();
-        let out = child.wait_with_output().unwrap();
-        String::from_utf8(out.stdout)
-            .unwrap()
-            .split_whitespace()
-            .next()
-            .unwrap()
-            .to_string()
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_update_refuses_an_installer_that_fails_its_release_sums() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let tmp = tempfile::tempdir().unwrap();
+        let store = fake_store(tmp.path(), "1.0.16", "grok");
+        std::os::unix::fs::symlink(store.join("versions/1.0.16"), store.join("current")).unwrap();
+        let release = "1.0.16-lhc.1";
+        let server = MockServer::start().await;
+        for (name, bytes) in [
+            (
+                "SHA256SUMS",
+                format!("{}  {INSTALLER_ASSET}\n", sha256_hex(b"other")).into_bytes(),
+            ),
+            (INSTALLER_ASSET, b"#!/bin/sh\ntouch \"$0.ran\"\n".to_vec()),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/download/v{release}/{name}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                .mount(&server)
+                .await;
+        }
+        // SAFETY: serial test; the variable is removed before returning.
+        unsafe { std::env::set_var(LHC_RELEASE_BASE_ENV, server.uri()) };
+        let managed = managed_install_for_exe(&store.join("versions/1.0.16/bin/grok")).unwrap();
+        let result = run_managed_installer(&managed, release).await;
+        unsafe { std::env::remove_var(LHC_RELEASE_BASE_ENV) };
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("installer checksum mismatch"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(store.join("installed-version"))
+                .unwrap()
+                .trim(),
+            "1.0.16"
+        );
+        assert!(!store.join("versions").join(release).exists());
     }
 
     #[test]

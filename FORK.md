@@ -614,17 +614,27 @@ Chunk 1 means the first real upstream sync already has a proven fallback.)
   detection helper). Managed: explicit `grok update` and — only with
   `[cli] auto_update = true` (`None`/`false` mean off, C1) — the TUI and
   `agent stdio` background updates fetch the latest fork release from the
-  unauthenticated GitHub API, launch the **embedded** `install.sh --download
-  --install-root <store>` (name and prefix from receipts), keep the update
-  cache at `<store>/version.json`, and restart from `<store>/current/bin/grok`.
+  unauthenticated GitHub API, fetch **that release's** `install.sh` and
+  `SHA256SUMS`, verify the installer against the sums, and run it as
+  `install.sh --download --version <release> --install-root <store>` (name and
+  prefix from receipts; installer behavior ships with the release it installs,
+  the Codex shape), keep the update cache at `<store>/version.json`, and
+  restart from `<store>/current/bin/grok` (always the store, even if the file
+  is missing at that instant: the exec fails and reports, never falls through
+  to `~/.grok/bin/grok`). Update decisions (`update --check`, explicit update,
+  background/leader converge) compare the fork release identity: running =
+  `LHC_RELEASE_VERSION`, on disk = the store's `installed-version`.
   Unmanaged (source build, copied file): `grok update` prints installer
   guidance and does nothing; no stock npm/CDN/`~/.grok/bin` fallthrough.
   Windows: managed detection works but the update path returns guidance until
   the PowerShell installer exists (C2, slice 5). Stock's updater code is
   retained untouched and unreachable from the fork binary; the fork never
   writes `[cli].installer`, `auto_update`, `~/.grok/version.json`,
-  `~/.grok/bin`, or `~/.grok/downloads`. `GROK_INSTALLER` (tests) still
-  overrides classification.
+  `~/.grok/bin`, or `~/.grok/downloads`. No environment variable
+  (`GROK_INSTALLER`, `GROK_MANAGED_BY_*`) reclassifies a shipping fork binary;
+  upstream's stock classification is compiled in only under the crate's
+  `lhc-test-seams` feature (enabled by its own dev-dependency) so the retained
+  upstream updater tests keep running through it.
 - **0.3.1 transition (documented, not automatic):** the installed 0.3.1 store
   has `installed-name = grok` and no `installed-prefix`; its updater cannot see
   aligned releases. Transition = one installer rerun against the existing store

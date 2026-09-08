@@ -405,8 +405,8 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
         return Ok(outcome);
     };
 
-    let effective_current = disk_version_for_installer(installer)
-        .unwrap_or_else(|| running_version_for(installer));
+    let effective_current =
+        disk_version_for_installer(installer).unwrap_or_else(|| running_version_for(installer));
     if needs_update_for(
         installer,
         &effective_current,
@@ -432,13 +432,18 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
 
     // Relaunch when the running binary differs from what's on disk in the channel's update direction
     // This covers binaries installed by other processes, not just the install above
-    let running = get_installed_grok_version();
+    let running = running_version_for(installer);
     if let Some(disk_now) =
         disk_version_for_installer(installer).or_else(|| outcome.installed.clone())
     {
-        outcome.relaunch_needed =
-            needs_update(&running, &disk_now, &update_config.channel, allow_downgrade)
-                .unwrap_or(false);
+        outcome.relaunch_needed = needs_update_for(
+            installer,
+            &running,
+            &disk_now,
+            &update_config.channel,
+            allow_downgrade,
+        )
+        .unwrap_or(false);
     }
     Ok(outcome)
 }
@@ -481,10 +486,13 @@ fn env_installer() -> Option<&'static str> {
 }
 
 pub async fn get_installer() -> Option<&'static str> {
-    // Fork: this binary is always an LHC build. Without an explicit `GROK_INSTALLER`
-    // override (tests) it classifies itself by its managed store and never by the
-    // shared `[cli].installer` key, so stock's selection is neither read nor written.
-    if std::env::var_os("GROK_INSTALLER").is_none() {
+    // Fork: this binary is always an LHC build. It classifies itself by its managed
+    // store and never by `GROK_INSTALLER`, `GROK_MANAGED_BY_*`, or the shared
+    // `[cli].installer` key, so stock's selection is neither read nor written and no
+    // environment can route it to npm/CDN/gh-release destinations. Upstream's
+    // classification below stays reachable only for the crate's own tests
+    // (`lhc-test-seams`), which exercise the stock decision paths through it.
+    if !cfg!(feature = "lhc-test-seams") || std::env::var_os("GROK_INSTALLER").is_none() {
         return Some(crate::lhc_release::installer_kind());
     }
     if let Some(i) = env_installer() {
@@ -888,8 +896,8 @@ async fn run_update_subcommand(
 fn resolve_restart_exe() -> Result<std::path::PathBuf> {
     // Fork: a managed LHC install restarts from its own store, never from `~/.grok/bin/grok`
     // (which may be a stock install living side by side).
-    if let Some(exe) = crate::lhc_release::managed_install().and_then(|m| managed_restart_exe(&m)) {
-        return Ok(exe);
+    if let Some(managed) = crate::lhc_release::managed_install() {
+        return Ok(managed_restart_exe(&managed));
     }
     let canonical = grok_application();
     if canonical.exists() {
@@ -942,8 +950,8 @@ pub async fn run_install_script(
     trigger: CliUpdateTrigger,
 ) -> Result<()> {
     // What's on disk is being replaced, not this (possibly stale) process's version; npm has no trustworthy disk version, so it falls back
-    let from_version = disk_version_for_installer(installer)
-        .unwrap_or_else(|| running_version_for(installer));
+    let from_version =
+        disk_version_for_installer(installer).unwrap_or_else(|| running_version_for(installer));
     let started = Instant::now();
     // Internal reports the version it actually activated; npm/gh-release resolve their own artifact, so the requested target stands in
     let result: Result<Option<String>> = match installer {
@@ -1031,16 +1039,14 @@ fn lhc_background_updates_allowed_for(installer: &str, auto_update: Option<bool>
 }
 
 /// The binary a managed LHC install relaunches after an update: the store's activated
-/// binary, or `None` when it is missing (caller falls back to upstream's rule).
-fn managed_restart_exe(
-    managed: &crate::lhc_release::LhcManagedInstall,
-) -> Option<std::path::PathBuf> {
-    let current = managed.current_bin();
-    current.exists().then_some(current)
+/// binary. Always the store, even if the path is missing at that instant; the exec
+/// then fails and reports it, rather than switching products to `~/.grok/bin/grok`.
+fn managed_restart_exe(managed: &crate::lhc_release::LhcManagedInstall) -> std::path::PathBuf {
+    managed.current_bin()
 }
 
 /// Install `target` (or the latest fork release) into the running executable's managed
-/// store by launching the embedded shell installer. Returns the activated release.
+/// store by launching that release's own installer. Returns the activated release.
 async fn install_lhc_managed(target: Option<&str>) -> Result<String> {
     let Some(managed) = crate::lhc_release::managed_install() else {
         anyhow::bail!("{}", crate::lhc_release::managed_installer_guidance());
