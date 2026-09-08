@@ -6708,7 +6708,7 @@ index 7a391e7e..92807bc7 100644
              &install_target,
              &update_config.channel,
 diff --git a/crates/codegen/xai-grok-update/src/auto_update_tests.rs b/crates/codegen/xai-grok-update/src/auto_update_tests.rs
-index 8b7c58cf..f505be06 100644
+index 8b7c58cf..86439b41 100644
 --- a/crates/codegen/xai-grok-update/src/auto_update_tests.rs
 +++ b/crates/codegen/xai-grok-update/src/auto_update_tests.rs
 @@ -934,76 +934,70 @@ fn test_reinstall_hint_gh_release_mentions_gh_command() {
@@ -6824,7 +6824,7 @@ index 8b7c58cf..f505be06 100644
          );
      }
  }
-@@ -2439,3 +2433,456 @@ fn npm_entry_is_recognized_by_the_binary_location() {
+@@ -2439,3 +2433,464 @@ fn npm_entry_is_recognized_by_the_binary_location() {
      assert!(super::is_under_node_modules(&resolved));
      assert!(!super::is_under_node_modules(&root.join("home/bin/grok")));
  }
@@ -7027,6 +7027,14 @@ index 8b7c58cf..f505be06 100644
 +#[cfg(unix)]
 +mod lhc_decisions {
 +    use super::*;
++
++    /// The next fork revision of `release`, derived from its parsed tuple so the tests stay
++    /// valid after a normal release bump (`1.0.16` → `1.0.16-lhc.1`, `1.0.16-lhc.1` → `-lhc.2`).
++    fn next_fork_revision(release: &str) -> String {
++        let (major, minor, patch, revision) =
++            crate::lhc_release::parse_lhc_release(release).expect("embedded release parses");
++        format!("{major}.{minor}.{patch}-lhc.{}", revision + 1)
++    }
 +    use crate::lhc_release::{
 +        INSTALLER_ASSET, INSTALLER_LHC_MANAGED, LHC_RELEASE_BASE_ENV, LHC_TEST_EXE_ENV, sha256_hex,
 +    };
@@ -7190,7 +7198,7 @@ index 8b7c58cf..f505be06 100644
 +        assert_eq!(status.error, None);
 +        drop(fx);
 +
-+        let later = format!("{base}-lhc.1");
++        let later = next_fork_revision(base);
 +        let fx = Fixture::new(base, &later).await;
 +        let status = check_update_status(&update_config()).await;
 +        assert_eq!(status.current_version, base);
@@ -7207,7 +7215,7 @@ index 8b7c58cf..f505be06 100644
 +    #[serial_test::serial]
 +    async fn converge_uses_the_store_receipt_and_installs_only_a_later_revision() {
 +        let base = crate::lhc_release::LHC_RELEASE_VERSION;
-+        let later = format!("{base}-lhc.1");
++        let later = next_fork_revision(base);
 +        let fx = Fixture::new(&later, &later).await;
 +        let outcome = ensure_latest_on_disk(&update_config()).await.unwrap();
 +        assert_eq!(
@@ -7245,7 +7253,7 @@ index 8b7c58cf..f505be06 100644
 +    #[serial_test::serial]
 +    async fn explicit_update_at_the_same_fork_revision_reinstalls_nothing() {
 +        let base = crate::lhc_release::LHC_RELEASE_VERSION;
-+        let later = format!("{base}-lhc.1");
++        let later = next_fork_revision(base);
 +        let fx = Fixture::new(&later, &later).await;
 +        let mut cfg = update_config();
 +        let result = run_update(false, None, None, &mut cfg, CliUpdateTrigger::UserCommand)
