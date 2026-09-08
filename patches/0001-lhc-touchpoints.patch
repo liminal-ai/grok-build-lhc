@@ -7303,7 +7303,7 @@ index 8b7c58cf..1c1368f5 100644
 +}
 diff --git a/crates/codegen/xai-grok-update/src/lhc_release.rs b/crates/codegen/xai-grok-update/src/lhc_release.rs
 new file mode 100644
-index 00000000..a64c160f
+index 00000000..904ff9be
 --- /dev/null
 +++ b/crates/codegen/xai-grok-update/src/lhc_release.rs
 @@ -0,0 +1,836 @@
@@ -7348,7 +7348,7 @@ index 00000000..a64c160f
 +    "https://github.com/liminal-ai/grok-build-lhc/releases/latest/download/install.ps1";
 +/// Install documentation.
 +pub const LHC_INSTALL_DOCS_URL: &str =
-+    "https://github.com/liminal-ai/grok-build-lhc/blob/lhc/lhc-docs/INSTALL.md";
++    "https://github.com/liminal-ai/grok-build-lhc/blob/main/lhc-docs/INSTALL.md";
 +
 +/// Loopback-only test transport: `<base>/latest` answers the latest-release
 +/// JSON and `<base>/download/v<release>/<asset>` serves assets. The installer
