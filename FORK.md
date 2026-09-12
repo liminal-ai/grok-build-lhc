@@ -544,7 +544,7 @@ implausibly large, upstream reset. Do not merge. Instead:
 3. `git apply --3way patches/0001-lhc-touchpoints.patch` — one state diff
    from `patches/BASE` (model changed 2026-08-06; see patches/README.md).
 4. `scripts/check-lhc-hooks.sh` — green means the fork is whole.
-5. Force-update `origin/lhc`; keep the old tree until green.
+5. Force-update `origin/main`; keep the old tree until green.
 
 **Rehearsed 2026-07-25 at Chunk 1** (fork `9ea06ea`), against the raw upstream
 tip `6e38642` — a tree with no `crates/lhc/` at all. `git am` applied cleanly;
@@ -565,6 +565,11 @@ Chunk 1 means the first real upstream sync already has a proven fallback.)
 
 ## Releases
 
+- **Release standard (2026-09-12):** qualification runs on the exact commit
+  that is promoted, not an earlier candidate; at least one live model turn on
+  the shipped artifact before promotion (fixture-only burn-ins do not count);
+  a bug fix ships only after the bug was reproduced on the pre-fix build, and
+  the release record cites the reproduction.
 - Candidate: [`.github/workflows/release.yml`](.github/workflows/release.yml)
 - Linux smoke: [`.github/workflows/release-smoke.yml`](.github/workflows/release-smoke.yml)
 - Protected promotion: [`.github/workflows/release-promote.yml`](.github/workflows/release-promote.yml)
@@ -660,7 +665,9 @@ Chunk 1 means the first real upstream sync already has a proven fallback.)
   Windows: same path through `install.ps1` since slice 5. Stock's updater code is
   retained untouched and unreachable from the fork binary; the fork never
   writes `[cli].installer`, `auto_update`, `~/.grok/version.json`,
-  `~/.grok/bin`, or `~/.grok/downloads`. No environment variable
+  `~/.grok/bin`, or `~/.grok/downloads`. One exception: after a successful
+  update it deletes `~/.grok/models_cache.json` (upstream's model-list cache,
+  refetched on next launch). No environment variable
   (`GROK_INSTALLER`, `GROK_MANAGED_BY_*`) reclassifies a shipping fork binary;
   upstream's stock classification is compiled in only under the crate's
   `lhc-test-seams` feature (enabled by its own dev-dependency) so the retained
