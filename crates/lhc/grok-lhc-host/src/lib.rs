@@ -30,6 +30,7 @@ pub use capture::{
     CAPTURE_OPEN_WAIT, CAPTURE_QUEUE_CAP, CaptureHandle, CaptureOpenState, CaptureOpenWaitError,
     RegistrySnapshot, any_capture_active, is_session_registered, lookup_session,
     lookup_session_snapshot, registry_generation, spawn_capture, spawn_capture_resumed,
+    spawn_capture_with_serving_model,
 };
 pub use generated_prefix::{GeneratedPrefix, WALK_STOPPED_EARLY};
 
@@ -47,6 +48,8 @@ pub use equivalence::{
     equivalence_armed, equivalence_snapshot, normalize_whitespace, observe_serve_equivalence,
     project_conversation_canonical,
 };
+#[cfg(any(test, feature = "test-util"))]
+pub use gating::env_lock;
 pub use gating::{is_enabled, lhc_root};
 pub use inference::{
     CountingLhcInferenceSampler, DEFAULT_LHC_INFERENCE_MODEL, LHC_INFERENCE_THINKING_LEVEL,
@@ -88,7 +91,8 @@ pub use status::{
     plan_repair, status_report,
 };
 pub use tee::{
-    capture_active, capture_archive_ready, tee_chat_persistence, wait_capture_archive_ready,
+    capture_active, capture_archive_ready, tee_chat_persistence,
+    tee_chat_persistence_with_serving_model, wait_capture_archive_ready,
 };
 pub use tools::{
     GET_MESSAGES_DESCRIPTION, GET_MESSAGES_TOOL_NAME, GET_TURNS_DESCRIPTION, GET_TURNS_TOOL_NAME,
@@ -105,7 +109,7 @@ pub async fn session_open_for_test(
     session_id: &str,
     root: &std::path::Path,
 ) -> Option<session::LhcSession> {
-    session::LhcSession::open(session_id, None, Some(root))
+    session::LhcSession::open(session_id, None, Some(root), None)
         .await
         .map(|(s, _)| s)
 }
@@ -124,9 +128,6 @@ pub use writeback_gates::{run_five_gates_on_body, run_five_gates_on_body_async};
 
 #[cfg(any(test, feature = "test-util"))]
 pub use compact::{replace_call_count, reset_compact_call_counters, set_compact_mode_for_test};
-
-#[cfg(any(test, feature = "test-util"))]
-pub use gating::env_lock;
 
 #[cfg(any(test, feature = "test-util"))]
 pub use equivalence::{
@@ -358,6 +359,9 @@ pub async fn replace_compact_for_writeback_with_cancel_signal(
     }
     tracing::info!(
         session_id,
+        view_id = %receipt.view_id,
+        compact_point = receipt.compact_point,
+        tail_tokens = receipt.tail_tokens,
         receipt_total = receipt.total_tokens,
         "LHC compact replace: compact complete"
     );

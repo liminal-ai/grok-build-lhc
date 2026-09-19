@@ -129,6 +129,7 @@ impl ShellLhcInferenceSampler {
             x_grok_deployment_id: None,
             x_grok_user_id: None,
             trace: None,
+            traceparent: None,
             prompt_cache_key: None,
             reasoning_effort: Some(self.thinking_level()),
             json_schema: None,
@@ -183,6 +184,7 @@ fn classify_sampling_error(err: &SamplingError) -> LhcInferenceErrorKind {
         SamplingError::Http(_)
         | SamplingError::Api { .. }
         | SamplingError::InvalidConfiguration(_)
+        | SamplingError::MtlsConfiguration(_)
         | SamplingError::Serialization(_)
         | SamplingError::EventStreamError(_)
         | SamplingError::StreamError { .. }

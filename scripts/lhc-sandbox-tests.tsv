@@ -1,0 +1,38 @@
+# count: 34
+# Grok sandbox-path inventory. Hosted runner (workflow_dispatch) executes this
+# set with SANDBOX_E2E_REQUIRE_ENFORCEMENT=1. Local build-box cannot bwrap
+# (apparmor_restrict_unprivileged_userns=1). No build-box sysctl.
+xai-grok-shell	config::tests::required_bwrap_routes_fail_closed
+xai-grok-shell	config::tests::optional_bwrap_routes_can_degrade
+xai-grok-shell	session::persistence::resumed_sandbox_profile_tests::explicit_id_returns_persisted_profile
+xai-grok-shell	session::persistence::resumed_sandbox_profile_tests::explicit_id_without_persisted_profile_is_none
+xai-grok-shell	session::persistence::resumed_sandbox_profile_tests::explicit_remote_id_resolves_local_child_profile
+xai-grok-shell	session::persistence::resumed_sandbox_profile_tests::empty_or_missing_id_and_no_cwd_is_none
+xai-grok-shell	session::persistence::resumed_sandbox_profile_tests::most_recent_cwd_picks_latest_session_profile
+xai-grok-shell	session::persistence::resumed_sandbox_profile_tests::most_recent_cwd_skips_corrupt_summary
+xai-grok-shell	session::persistence::resumed_sandbox_profile_tests::most_recent_cwd_skips_raced_not_found
+xai-grok-shell	session::persistence::resumed_sandbox_profile_tests::most_recent_cwd_propagates_non_not_found_io_errors
+xai-grok-shell	session::persistence::resumed_sandbox_profile_tests::most_recent_cwd_prefers_last_active_at_over_updated_at
+xai-grok-shell	session::persistence::resumed_sandbox_profile_tests::most_recent_cwd_skips_hidden_session
+xai-grok-shell	session::persistence::resumed_sandbox_profile_tests::most_recent_cwd_skips_headless_session
+xai-grok-shell	session::persistence::resumed_sandbox_profile_tests::most_recent_cwd_with_no_sessions_is_none
+xai-grok-sandbox::integration_test	test_profile_capability_set_construction
+xai-grok-sandbox::integration_test	test_sandbox_manager_lifecycle
+xai-grok-sandbox::integration_test	test_sandbox_logger
+xai-grok-sandbox::integration_test	test_should_restrict_child_network_default
+xai-grok-sandbox::deny_paths_e2e	deny_exact_paths_block_read_write_rename
+xai-grok-sandbox::deny_paths_e2e	deny_globs_block_read_write_rename
+xai-grok-sandbox::deny_paths_e2e	devbox_genuine_reexec_applies_enforcement
+xai-grok-sandbox::deny_paths_e2e	devbox_marker_spoof_does_not_skip_enforcement
+xai-grok-sandbox::deny_paths_e2e	hardlinked_hooks_json_refuses_startup
+xai-grok-sandbox::deny_paths_e2e	hardlinked_hooks_paths_refuses_startup
+xai-grok-sandbox::deny_paths_e2e	hook_write_deny_refuses_marker_spoof
+xai-grok-sandbox::deny_paths_e2e	read_deny_empty_set_verifies_inside_bwrap
+xai-grok-sandbox::deny_paths_e2e	read_deny_forged_mounts_are_refused
+xai-grok-sandbox::deny_paths_e2e	read_deny_marker_spoof_refused
+xai-grok-sandbox::deny_paths_e2e	symlinked_hooks_json_refuses_startup
+xai-grok-sandbox::deny_paths_e2e	workspace_protects_direct_hook_sources
+xai-grok-sandbox::deny_paths_e2e	workspace_protects_direct_hook_sources_first_run
+xai-grok-sandbox::child_net_e2e	filtered_child_cannot_connect_to_socket_created_after_launch
+xai-grok-sandbox::child_net_e2e	restrict_child_network_std_arms_from_config_without_apply
+xai-grok-sandbox::read_write_trailing_glob_e2e	trailing_glob_read_write_grants_parent_directory

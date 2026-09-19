@@ -46,7 +46,7 @@ certification ran 2026-09-04 (see Status above and
   commits of the SDK repo's `main` only (Phase 2 acceptance `358c8d1` or
   later; the historical `lhc-rs-port` working branch was retired into `main`
   2026-08-08). Never copy the port in; bump the pin and record it here.
-  Current pin: `e9456a6e` (LHC `origin/main` 2026-09-04 — turn parts
+  Current pin: `aa9caa16` (Reed-accepted E2 serving-model token weights on Rust LHC budget reads; grok 1.05 / o200k 1.00. Previous pin `e9456a6e` (LHC `origin/main` 2026-09-04 — turn parts
   (schema 12 step index), content blocks (schema 13 blob table), bounded
   metadata-first compact, compact-continuation runtime; lhc-rs gate 846).
   Thread schema **13**. Previous pin `dd251ec` (Wave B code tip, schema 6,
@@ -218,6 +218,16 @@ The production choke still uses `params: None`; live Replace must produce
 bands under real budgets for that kill test to be meaningful.
 
 ## Sync record
+
+### 2026-09-19 — public source 1.0.35 (`a28ee2b2`)
+
+At sync time the upstream stable channel advertised 1.0.34. No public
+source snapshot for 1.0.34 was available; public source history jumped
+from 1.0.32 to 1.0.35 and upstream advertised no tags. This fork is built
+from public source snapshot `a28ee2b2063426e8816e380ccea528b9de95e5da`
+(1.0.35), selected by Reed. Merge `--no-ff` from frozen
+`4e44265b3bec3baed12a9ba5a459dcfcc4479629`; `patches/BASE` advanced to
+`a28ee2b2`. LHC pin bump to `aa9caa16` is a separate integration commit.
 
 ### 2026-09-04 — slice 3: vendor pin `dd251ec` → `e9456a6e` (thread schema 6 → 13)
 

@@ -1,8 +1,8 @@
 diff --git a/Cargo.toml b/Cargo.toml
-index 585a482b..58ca001e 100644
+index cedf2365..c3397c87 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -98,6 +98,7 @@ members = [
+@@ -102,6 +102,7 @@ members = [
      "crates/common/xai-tool-runtime",
      "crates/common/xai-tool-types",
      "crates/common/xai-tracing",
@@ -11,7 +11,7 @@ index 585a482b..58ca001e 100644
      "third_party/dagre_rust",
      "third_party/graphlib_rust",
 diff --git a/crates/codegen/xai-chat-state/src/actor/mod.rs b/crates/codegen/xai-chat-state/src/actor/mod.rs
-index f554da1f..299d3f12 100644
+index c6b3cd04..03aa29c4 100644
 --- a/crates/codegen/xai-chat-state/src/actor/mod.rs
 +++ b/crates/codegen/xai-chat-state/src/actor/mod.rs
 @@ -204,6 +204,12 @@ impl ChatStateActor {
@@ -39,10 +39,10 @@ index f554da1f..299d3f12 100644
              ChatStateCommand::RepairHistory {
                  dry_run,
 diff --git a/crates/codegen/xai-chat-state/src/actor/mutations.rs b/crates/codegen/xai-chat-state/src/actor/mutations.rs
-index 6ff942d7..00f9ec09 100644
+index bea8e714..8249a0c6 100644
 --- a/crates/codegen/xai-chat-state/src/actor/mutations.rs
 +++ b/crates/codegen/xai-chat-state/src/actor/mutations.rs
-@@ -193,7 +193,7 @@ impl ChatStateActor {
+@@ -167,7 +167,7 @@ impl ChatStateActor {
                  "History repair modified the conversation"
              );
              // Full replace: persists atomically and re-bases token estimates.
@@ -51,7 +51,7 @@ index 6ff942d7..00f9ec09 100644
          } else {
              // Nothing changed — put the conversation back untouched.
              self.state.conversation = items;
-@@ -281,7 +281,25 @@ impl ChatStateActor {
+@@ -255,7 +255,25 @@ impl ChatStateActor {
      }
  
      fn persist_and_push_message(&mut self, item: ConversationItem) {
@@ -78,7 +78,7 @@ index 6ff942d7..00f9ec09 100644
          self.state.conversation.push(item);
      }
  
-@@ -532,6 +550,32 @@ impl ChatStateActor {
+@@ -443,6 +461,32 @@ impl ChatStateActor {
              api_duration_ms,
              cost_usd_ticks,
          );
@@ -111,7 +111,7 @@ index 6ff942d7..00f9ec09 100644
      }
  
      pub(super) fn record_subagent_usage(
-@@ -608,6 +652,7 @@ impl ChatStateActor {
+@@ -512,6 +556,7 @@ impl ChatStateActor {
          &mut self,
          items: Vec<ConversationItem>,
          is_compaction: bool,
@@ -119,7 +119,7 @@ index 6ff942d7..00f9ec09 100644
      ) {
          self.snapshot_turn_slice();
          if is_compaction && let Some(cap) = &mut self.state.turn_capture {
-@@ -616,7 +661,14 @@ impl ChatStateActor {
+@@ -520,7 +565,14 @@ impl ChatStateActor {
          // `harness_trace_buffer` / `harness_trace_turns` intentionally untouched:
          // the planner/verifier subagents ran, so their sealed trace turns survive
          // a conversation replace (same intent as the `TruncateToPromptIndex` arm).
@@ -135,7 +135,7 @@ index 6ff942d7..00f9ec09 100644
          let base_estimate = super::state::estimate_conversation_tokens(&items);
          let estimated_tokens = self.reseed_total_tokens(base_estimate);
          self.state.conversation = items;
-@@ -651,7 +703,7 @@ impl ChatStateActor {
+@@ -549,7 +601,7 @@ impl ChatStateActor {
          let changed =
              crate::conversation_util::replace_or_insert_system_head(&mut conversation, prompt);
          debug_assert!(changed, "head mismatch must produce a change");
@@ -145,12 +145,12 @@ index 6ff942d7..00f9ec09 100644
      }
  
 diff --git a/crates/codegen/xai-chat-state/src/actor/state.rs b/crates/codegen/xai-chat-state/src/actor/state.rs
-index 21b04f43..43851eb6 100644
+index 82d50cc0..06955283 100644
 --- a/crates/codegen/xai-chat-state/src/actor/state.rs
 +++ b/crates/codegen/xai-chat-state/src/actor/state.rs
-@@ -171,6 +171,24 @@ pub(crate) struct ChatState {
-     /// persist last_turn_usage). Always overwritten by the most recent turn —
-     /// historical turns are not retained here.
+@@ -159,6 +159,24 @@ pub(crate) struct ChatState {
+     /// `None` means no model turn has completed (or a restore that did not persist it).
+     /// Always overwritten by the most recent turn — historical turns are not retained here.
      pub last_turn_usage: Option<TokenUsage>,
 +    // LHC-HOOK 7/10: pending model-call TokenUsage + assistant identity for LHC
 +    // assistant_text / assistant_thinking (schema v5 / D3 + Wave B identity)
@@ -173,7 +173,7 @@ index 21b04f43..43851eb6 100644
      /// Billing for the open prompt (cleared on next prompt; not persisted).
      pub prompt_usage: Option<UsageLedger>,
      /// Lifetime session billing (not persisted).
-@@ -258,6 +276,8 @@ impl ChatState {
+@@ -228,6 +246,8 @@ impl ChatState {
              estimated_tokens_since_model: 0,
              estimate_at_last_response: initial_tokens,
              last_turn_usage: None,
@@ -183,10 +183,10 @@ index 21b04f43..43851eb6 100644
              session_usage: UsageLedger::default(),
              turn_capture: None,
 diff --git a/crates/codegen/xai-chat-state/src/actor/tests.rs b/crates/codegen/xai-chat-state/src/actor/tests.rs
-index 220c654b..60e4e6bf 100644
+index d16a8db1..a8e6f153 100644
 --- a/crates/codegen/xai-chat-state/src/actor/tests.rs
 +++ b/crates/codegen/xai-chat-state/src/actor/tests.rs
-@@ -494,6 +494,230 @@ async fn record_token_usage_emits_event() {
+@@ -506,6 +506,230 @@ async fn record_token_usage_emits_event() {
      assert_eq!(tokens, 1000);
  }
  
@@ -418,7 +418,7 @@ index 220c654b..60e4e6bf 100644
  async fn record_last_turn_usage_round_trip() {
      use xai_grok_sampling_types::TokenUsage;
 diff --git a/crates/codegen/xai-chat-state/src/commands.rs b/crates/codegen/xai-chat-state/src/commands.rs
-index d3243775..f77d2edd 100644
+index 15cedb0c..21d48895 100644
 --- a/crates/codegen/xai-chat-state/src/commands.rs
 +++ b/crates/codegen/xai-chat-state/src/commands.rs
 @@ -114,6 +114,14 @@ pub enum ChatStateCommand {
@@ -447,8 +447,8 @@ index d3243775..f77d2edd 100644
 +        lhc_source_tip: Option<u64>,
      },
  
-     /// Out-of-band history repair (`x.ai/session/repair`): run
-@@ -484,6 +497,7 @@ mod tests {
+     /// Out-of-band history repair; `dry_run` only reports.
+@@ -451,6 +464,7 @@ mod tests {
          let _ = ChatStateCommand::ReplaceConversation {
              items: vec![],
              is_compaction: false,
@@ -457,7 +457,7 @@ index d3243775..f77d2edd 100644
          let _ = ChatStateCommand::CachePromptText {
              text: "prompt".to_string(),
 diff --git a/crates/codegen/xai-chat-state/src/handle.rs b/crates/codegen/xai-chat-state/src/handle.rs
-index ca73dd7c..3733e0a1 100644
+index 30460001..d79a9bb7 100644
 --- a/crates/codegen/xai-chat-state/src/handle.rs
 +++ b/crates/codegen/xai-chat-state/src/handle.rs
 @@ -171,6 +171,24 @@ impl ChatStateHandle {
@@ -526,10 +526,10 @@ index ca73dd7c..3733e0a1 100644
      }
  
 diff --git a/crates/codegen/xai-chat-state/src/lib.rs b/crates/codegen/xai-chat-state/src/lib.rs
-index 4391495f..8eed7986 100644
+index bd846461..8cb96bf7 100644
 --- a/crates/codegen/xai-chat-state/src/lib.rs
 +++ b/crates/codegen/xai-chat-state/src/lib.rs
-@@ -47,8 +47,8 @@ pub use compaction_mode::CompactionMode;
+@@ -49,8 +49,8 @@ pub use compaction_mode::CompactionMode;
  pub use events::ChatStateEvent;
  pub use handle::{ChatStateHandle, ChatStateMailboxClosed};
  pub use persistence::{
@@ -541,10 +541,10 @@ index 4391495f..8eed7986 100644
  pub use types::*;
  pub use usage::{UsageLedger, UsageTotals};
 diff --git a/crates/codegen/xai-chat-state/src/persistence.rs b/crates/codegen/xai-chat-state/src/persistence.rs
-index 4d5ac957..9fb14c38 100644
+index ef2eeb7c..9ca1066f 100644
 --- a/crates/codegen/xai-chat-state/src/persistence.rs
 +++ b/crates/codegen/xai-chat-state/src/persistence.rs
-@@ -8,10 +8,58 @@
+@@ -8,16 +8,87 @@
  use std::io;
  
  use tokio::sync::{mpsc, oneshot};
@@ -553,6 +553,8 @@ index 4d5ac957..9fb14c38 100644
  
  use crate::commands::{StrictAppendAck, StrictAppendError};
  
+-/// Abstraction over chat-specific persistence. The actor owns this exclusively via `Box<dyn ChatPersistence>`.
+-/// Methods take `&mut self` — no interior mutability. The real impl wraps a sender the actor solely owns.
 +/// Host-observed assistant provenance for one model response (Wave B identity).
 +///
 +/// Captured at the response boundary and attached to `assistant_thinking` /
@@ -601,10 +603,15 @@ index 4d5ac957..9fb14c38 100644
 +    }
 +}
 +
- /// Abstraction over chat-specific persistence operations.
- ///
- /// The actor owns this exclusively via `Box<dyn ChatPersistence>`, so all
-@@ -24,6 +72,23 @@ pub trait ChatPersistence: Send + 'static {
++/// Abstraction over chat-specific persistence operations.
++///
++/// The actor owns this exclusively via `Box<dyn ChatPersistence>`, so all
++/// methods take `&mut self` — no interior mutability needed.
++///
++/// The real implementation wraps an `mpsc::UnboundedSender<PersistenceMsg>`
++/// (which only needs `&self` to send, but `&mut self` is still correct
++/// because the actor is the sole owner).
+ pub trait ChatPersistence: Send + 'static {
      /// Persist a single conversation item (append to chat_history.jsonl).
      fn persist_message(&mut self, item: &ConversationItem);
  
@@ -628,7 +635,7 @@ index 4d5ac957..9fb14c38 100644
      /// Persist one working-directory switch generation and report commit status.
      fn persist_working_directory_switch_and_ack(
          &mut self,
-@@ -33,6 +98,17 @@ pub trait ChatPersistence: Send + 'static {
+@@ -27,6 +98,17 @@ pub trait ChatPersistence: Send + 'static {
      /// Replace the entire chat history (compaction / rewind).
      fn replace_history(&mut self, items: &[ConversationItem]);
  
@@ -643,10 +650,10 @@ index 4d5ac957..9fb14c38 100644
 +        self.replace_history(items);
 +    }
 +
-     /// Destructive image-strip rewrite: back up the on-disk history, then
-     /// replace it, acking the DISK outcome. A failed backup gates off the
-     /// rewrite so recoverability never silently evaporates; backends without
-@@ -70,8 +146,20 @@ pub enum StripOutcome {
+     /// Destructive image-strip rewrite: back up on-disk history, then replace it, acking the disk outcome.
+     /// A failed backup gates off the rewrite so recoverability never silently evaporates.
+     /// Backends without a recoverable store may no-op the backup but must ack the write.
+@@ -63,8 +145,20 @@ pub enum StripOutcome {
  /// A record of a persistence call, sent over a channel to the test.
  #[derive(Debug, Clone)]
  pub enum PersistenceRecord {
@@ -668,7 +675,7 @@ index 4d5ac957..9fb14c38 100644
      /// A persistence-acknowledged switch append was requested.
      AcknowledgedMessage(ConversationItem),
      /// The full history was replaced.
-@@ -169,12 +257,15 @@ impl MockPersistenceReceiver {
+@@ -162,12 +256,15 @@ impl MockPersistenceReceiver {
          }
      }
  
@@ -686,7 +693,7 @@ index 4d5ac957..9fb14c38 100644
                  _ => None,
              })
              .collect()
-@@ -186,6 +277,32 @@ impl ChatPersistence for MockChatPersistence {
+@@ -179,6 +276,32 @@ impl ChatPersistence for MockChatPersistence {
          let _ = self.tx.send(PersistenceRecord::Message(item.clone()));
      }
  
@@ -720,10 +727,10 @@ index 4d5ac957..9fb14c38 100644
          &mut self,
          item: &ConversationItem,
 diff --git a/crates/codegen/xai-grok-pager-bin/src/main.rs b/crates/codegen/xai-grok-pager-bin/src/main.rs
-index 9efd3416..d541a02b 100644
+index ec8d2084..5a14e1fa 100644
 --- a/crates/codegen/xai-grok-pager-bin/src/main.rs
 +++ b/crates/codegen/xai-grok-pager-bin/src/main.rs
-@@ -1881,6 +1881,11 @@ fn write_version(writer: &mut impl std::io::Write, channel_label: &str) -> std::
+@@ -1963,6 +1963,11 @@ fn write_version(writer: &mut impl std::io::Write, channel_label: &str) -> std::
      writer.write_all(version_text(channel_label).as_bytes())
  }
  fn dispatch_version_if_requested(args: &PagerArgs) -> bool {
@@ -735,7 +742,7 @@ index 9efd3416..d541a02b 100644
      if !args.version {
          return false;
      }
-@@ -2107,6 +2112,8 @@ async fn async_main(args: PagerArgs) -> Result<()> {
+@@ -2171,6 +2176,8 @@ async fn async_main(mut args: PagerArgs) -> Result<()> {
                      let payload = serde_json::json!({
                          "currentVersion": env!("VERSION_WITH_COMMIT"),
                          "channel": xai_grok_update::channel_name().unwrap_or("unknown"),
@@ -744,9 +751,9 @@ index 9efd3416..d541a02b 100644
                      });
                      println!("{}", serde_json::to_string(&payload)?);
                  } else {
-@@ -2498,12 +2505,17 @@ fn stdio_auto_update_enabled(
- /// canonicalized; any failure reports unmanaged and skips the update. The
- /// npm shim hardcodes `~/.grok`, so a custom `GROK_HOME` skips here too.
+@@ -2583,12 +2590,17 @@ fn stdio_auto_update_enabled(
+ /// respawn. Both sides are canonicalized; any failure reports unmanaged and skips the update. The npm shim
+ /// hardcodes `~/.grok`, so a custom `GROK_HOME` skips here too.
  fn is_managed_install(exe: Option<std::path::PathBuf>, grok_home: &std::path::Path) -> bool {
 -    if grok_home.as_os_str().is_empty() {
 -        return false;
@@ -765,7 +772,7 @@ index 9efd3416..d541a02b 100644
      let managed = xai_grok_config::grok_application_in(grok_home);
      match (dunce::canonicalize(&exe), dunce::canonicalize(&managed)) {
          (Ok(exe), Ok(managed)) => exe == managed,
-@@ -2980,6 +2992,65 @@ mod tests {
+@@ -3065,6 +3077,65 @@ mod tests {
          assert!(!is_managed_install(Some(pinned), &home));
          let _ = std::fs::remove_dir_all(&home);
      }
@@ -832,10 +839,10 @@ index 9efd3416..d541a02b 100644
      #[test]
      fn stdio_auto_update_requires_direct_stdio_enabled_and_managed() {
 diff --git a/crates/codegen/xai-grok-pager/src/app/cli.rs b/crates/codegen/xai-grok-pager/src/app/cli.rs
-index 673b1264..a8a2b4b0 100644
+index 87f63aef..7aa77cd4 100644
 --- a/crates/codegen/xai-grok-pager/src/app/cli.rs
 +++ b/crates/codegen/xai-grok-pager/src/app/cli.rs
-@@ -422,6 +422,9 @@ pub struct PagerArgs {
+@@ -417,6 +417,9 @@ pub struct PagerArgs {
      /// Print version
      #[arg(short = 'v', short_alias = 'V', long = "version", action = ArgAction::SetTrue)]
      pub version: bool,
@@ -846,10 +853,10 @@ index 673b1264..a8a2b4b0 100644
      #[arg(long)]
      pub cwd: Option<PathBuf>,
 diff --git a/crates/codegen/xai-grok-pager/src/headless.rs b/crates/codegen/xai-grok-pager/src/headless.rs
-index 718740e6..96748ae3 100644
+index e0b8a786..9ba4dfb3 100644
 --- a/crates/codegen/xai-grok-pager/src/headless.rs
 +++ b/crates/codegen/xai-grok-pager/src/headless.rs
-@@ -11,7 +11,7 @@ use anyhow::Result;
+@@ -15,7 +15,7 @@ use anyhow::Result;
  use tokio_util::sync::CancellationToken;
  
  use agent_client_protocol as acp;
@@ -857,8 +864,14 @@ index 718740e6..96748ae3 100644
 +use xai_acp_lib::{AcpAgentTx, AcpClientMessageBox, AcpClientRx, AcpRequest, AcpResult, acp_send};
  use xai_grok_shell::agent::auth_method::AuthMethodKind;
  use xai_grok_shell::agent::config::Config as AgentConfig;
- use xai_grok_shell::extensions::task::{CancelSubagentRequest, KillTaskRequest};
-@@ -526,20 +526,195 @@ struct OpenedSession {
+ use xai_grok_shell::extensions::memory::MemoryFlushResponse;
+@@ -527,26 +527,200 @@ fn build_headless_init_request(
+         .meta(meta.as_object().cloned())
+ }
+ 
+-#[derive(Debug)]
+ struct OpenedSession {
+     session_id: acp::SessionId,
      models: ModelState,
      /// Directory the session is anchored to (launch cwd, resume `original_cwd`, or fork `write_cwd`).
      cwd: PathBuf,
@@ -880,14 +893,14 @@ index 718740e6..96748ae3 100644
 +/// completion-receiver ownership.
 +///
 +/// Synthetic stale-on-load `task_completed` is intentionally quiet: it only
-+/// tombstones the task id in [`ColdAttachInbox::completed_bg`] (so a later
-+/// out-of-order `task_backgrounded` cannot re-arm wait-for-background).
-+/// Stateful lifecycle/stream events are buffered for apply after
-+/// `emitter.begin_session` rather than discarded.
++/// tombstones the task id in [`BackgroundLifecycleState::completed_tasks`]
++/// (so a later out-of-order `task_backgrounded` cannot re-arm
++/// wait-for-background). Stateful lifecycle/stream events are buffered for
++/// apply after `emitter.begin_session` rather than discarded.
 +#[derive(Default)]
 +struct ColdAttachInbox {
 +    pending_bg: HashSet<BackgroundWork>,
-+    completed_bg: HashSet<BackgroundWork>,
++    background_lifecycle: BackgroundLifecycleState,
 +    lifecycle: Vec<Lifecycle>,
 +    stream: Vec<StreamEvent>,
 +}
@@ -947,7 +960,7 @@ index 718740e6..96748ae3 100644
 +                other => track_background_lifecycle(
 +                    other,
 +                    &mut inbox.pending_bg,
-+                    &mut inbox.completed_bg,
++                    &mut inbox.background_lifecycle,
 +                ),
 +            }
 +        }
@@ -1055,7 +1068,7 @@ index 718740e6..96748ae3 100644
              acp::LoadSessionRequest::new(acp::SessionId::new(sid.to_string()), cwd.to_path_buf())
                  .mcp_servers(mcp_servers.clone())
                  .meta({
-@@ -551,6 +726,9 @@ async fn open_session(
+@@ -558,6 +732,9 @@ async fn open_session(
                      Some(m)
                  }),
              acp_tx,
@@ -1065,7 +1078,7 @@ index 718740e6..96748ae3 100644
          )
          .await;
          if let Ok(resp) = try_load {
-@@ -558,12 +736,13 @@ async fn open_session(
+@@ -565,6 +742,7 @@ async fn open_session(
                  session_id: acp::SessionId::new(sid.to_string()),
                  models: ModelState::from(resp.models),
                  cwd: cwd.to_path_buf(),
@@ -1073,16 +1086,15 @@ index 718740e6..96748ae3 100644
              });
          }
          anyhow::bail!("Session does not exist");
-     }
- 
+@@ -575,54 +753,67 @@ async fn open_session(
+         .as_object()
+         .cloned();
+     crate::app::session_startup::stamp_phase_traceparent(&mut meta);
 -    let new_resp: acp::NewSessionResponse = acp_send(
 +    let new_resp: acp::NewSessionResponse = acp_send_servicing_cold_attach(
          acp::NewSessionRequest::new(cwd.to_path_buf())
              .mcp_servers(mcp_servers)
-             // Fresh `-p` sessions persist as headless so `/resume` keeps them off its default pages; the load path above never restamps
-@@ -573,25 +752,32 @@ async fn open_session(
-                     .cloned(),
-             ),
+             .meta(meta),
          acp_tx,
 +        acp_rx,
 +        &mut cold_inbox,
@@ -1108,15 +1120,16 @@ index 718740e6..96748ae3 100644
      crate::app::session_startup::ensure_session_id_available(session_id, &cwd_str)?;
      let mcp_servers =
          cli_config::load_mcp_servers(cwd, &xai_grok_tools::types::compat::CompatConfig::default());
--    let new_resp: acp::NewSessionResponse = acp_send(
 +    let mut cold_inbox = ColdAttachInbox::default();
+     let mut meta = serde_json::json!({ "sessionId": session_id, "sessionKind": "headless" })
+         .as_object()
+         .cloned();
+     crate::app::session_startup::stamp_phase_traceparent(&mut meta);
+-    let new_resp: acp::NewSessionResponse = acp_send(
 +    let new_resp: acp::NewSessionResponse = acp_send_servicing_cold_attach(
          acp::NewSessionRequest::new(cwd.to_path_buf())
              .mcp_servers(mcp_servers)
-             .meta(
-@@ -600,22 +786,28 @@ async fn open_session_with_id(
-                     .cloned(),
-             ),
+             .meta(meta),
          acp_tx,
 +        acp_rx,
 +        &mut cold_inbox,
@@ -1143,7 +1156,7 @@ index 718740e6..96748ae3 100644
  ) -> anyhow::Result<OpenedSession> {
      use crate::app::session_startup::{
          effective_fork_new_cwd, ensure_session_id_available, fork_response_error,
-@@ -636,14 +828,25 @@ async fn fork_then_open(
+@@ -648,14 +839,31 @@ async fn fork_then_open(
      let fork_params = serde_json::value::to_raw_value(&payload)
          .map_err(|e| anyhow::anyhow!("serialize fork params: {e}"))?;
      let req = acp::ExtRequest::new("x.ai/session/fork", fork_params.into());
@@ -1163,8 +1176,14 @@ index 718740e6..96748ae3 100644
 +            opened.cold_inbox.pending_bg.extend(cold_inbox.pending_bg);
 +            opened
 +                .cold_inbox
-+                .completed_bg
-+                .extend(cold_inbox.completed_bg);
++                .background_lifecycle
++                .completed_tasks
++                .extend(cold_inbox.background_lifecycle.completed_tasks);
++            opened
++                .cold_inbox
++                .background_lifecycle
++                .subagents
++                .extend(cold_inbox.background_lifecycle.subagents);
 +            opened.cold_inbox.lifecycle.extend(cold_inbox.lifecycle);
 +            opened.cold_inbox.stream.extend(cold_inbox.stream);
 +            Ok(opened)
@@ -1172,23 +1191,103 @@ index 718740e6..96748ae3 100644
          Err(e) => Err(anyhow::anyhow!(
              "fork succeeded as {child} but load failed: {e}"
          )),
-@@ -969,9 +1172,11 @@ pub async fn run_single_turn(
-     let t_session = Instant::now();
+@@ -667,9 +875,11 @@ async fn fork_then_open(
+ /// `materialize_startup_for_cwd` skipped that check when `has_worktree` is set.
+ async fn open_session_in_new_worktree(
+     acp_tx: &AcpAgentTx,
++    acp_rx: &mut AcpClientRx,
+     cwd: &Path,
+     spec: &WorktreeSpec,
+     session_id: Option<&str>,
++    yolo: bool,
+ ) -> anyhow::Result<OpenedSession> {
+     let created = create_worktree(acp_tx, cwd, spec, &new_worktree_id(session_id))
+         .await
+@@ -681,8 +891,8 @@ async fn open_session_in_new_worktree(
+         "headless: worktree created"
+     );
+     let opened = match session_id {
+-        Some(sid) => open_session_with_id(acp_tx, &created.session_cwd, sid).await,
+-        None => open_session(acp_tx, &created.session_cwd, None, None).await,
++        Some(sid) => open_session_with_id(acp_tx, acp_rx, &created.session_cwd, sid, yolo).await,
++        None => open_session(acp_tx, acp_rx, &created.session_cwd, None, None, yolo).await,
+     };
+     opened.map_err(|e| {
+         anyhow::anyhow!(
+@@ -696,11 +906,13 @@ async fn open_session_in_new_worktree(
+ /// worktree and restores into it, then the session is loaded at the cwd it reports.
+ async fn resume_session_in_new_worktree(
+     acp_tx: &AcpAgentTx,
++    acp_rx: &mut AcpClientRx,
+     cwd: &Path,
+     spec: &WorktreeSpec,
+     session_id: &str,
+     restore_code: Option<bool>,
+     local_miss: bool,
++    yolo: bool,
+ ) -> anyhow::Result<OpenedSession> {
+     let resumed = resume_session_into_worktree(
+         acp_tx,
+@@ -722,9 +934,11 @@ async fn resume_session_in_new_worktree(
+     // resume_session already restored code; asking again on load would redo it.
+     open_session(
+         acp_tx,
++        acp_rx,
+         &resumed.session_cwd,
+         Some(&resumed.session_id),
+         None,
++        yolo,
+     )
+     .await
+     .map_err(|e| {
+@@ -1061,10 +1275,18 @@ pub async fn run_single_turn(
      xai_grok_telemetry::startup::enter(crate::acp::StartupPhase::SessionCreate);
-     let opened = match materialized {
--        MaterializedStartup::NewAuto => open_session(&acp_tx, &cwd, None, None).await,
-+        MaterializedStartup::NewAuto => {
+     let opened = match (materialized, worktree.as_ref()) {
+         (MaterializedStartup::NewAuto, Some(spec)) => {
+-            open_session_in_new_worktree(&acp_tx, &cwd, spec, None).await
++            open_session_in_new_worktree(&acp_tx, &mut acp_rx, &cwd, spec, None, options.yolo).await
+         }
+         (MaterializedStartup::NewWithId { session_id }, Some(spec)) => {
+-            open_session_in_new_worktree(&acp_tx, &cwd, spec, Some(&session_id)).await
++            open_session_in_new_worktree(
++                &acp_tx,
++                &mut acp_rx,
++                &cwd,
++                spec,
++                Some(&session_id),
++                options.yolo,
++            )
++            .await
+         }
+         (
+             MaterializedStartup::Resume {
+@@ -1076,17 +1298,21 @@ pub async fn run_single_turn(
+         ) => {
+             resume_session_in_new_worktree(
+                 &acp_tx,
++                &mut acp_rx,
+                 &cwd,
+                 spec,
+                 &session_id,
+                 restore_code,
+                 deferred_local_miss,
++                options.yolo,
+             )
+             .await
+         }
+-        (MaterializedStartup::NewAuto, None) => open_session(&acp_tx, &cwd, None, None).await,
++        (MaterializedStartup::NewAuto, None) => {
 +            open_session(&acp_tx, &mut acp_rx, &cwd, None, None, options.yolo).await
 +        }
-         MaterializedStartup::NewWithId { session_id } => {
+         (MaterializedStartup::NewWithId { session_id }, None) => {
 -            open_session_with_id(&acp_tx, &cwd, &session_id).await
 +            open_session_with_id(&acp_tx, &mut acp_rx, &cwd, &session_id, options.yolo).await
          }
-         MaterializedStartup::Resume {
-             session_id,
-@@ -979,7 +1184,15 @@ pub async fn run_single_turn(
-             ..
-         } => {
+         (
+             MaterializedStartup::Resume {
+@@ -1097,7 +1323,15 @@ pub async fn run_single_turn(
+             None,
+         ) => {
              let load_cwd = original_cwd.as_deref().unwrap_or(cwd.as_path());
 -            open_session(&acp_tx, load_cwd, Some(session_id.as_str()), restore_code).await
 +            open_session(
@@ -1201,10 +1300,10 @@ index 718740e6..96748ae3 100644
 +            )
 +            .await
          }
-         MaterializedStartup::Fork {
-             parent_session_id,
-@@ -989,11 +1202,13 @@ pub async fn run_single_turn(
-         } => {
+         // Fork with `-w` never reaches here; the intent check above refuses it.
+         (
+@@ -1111,11 +1345,13 @@ pub async fn run_single_turn(
+         ) => {
              fork_then_open(
                  &acp_tx,
 +                &mut acp_rx,
@@ -1217,7 +1316,7 @@ index 718740e6..96748ae3 100644
              )
              .await
          }
-@@ -1002,6 +1217,7 @@ pub async fn run_single_turn(
+@@ -1124,6 +1360,7 @@ pub async fn run_single_turn(
          session_id,
          models: session_models,
          cwd: session_cwd,
@@ -1225,13 +1324,13 @@ index 718740e6..96748ae3 100644
      } = match opened {
          Ok(v) => v,
          Err(e) => {
-@@ -1048,6 +1264,15 @@ pub async fn run_single_turn(
+@@ -1175,6 +1412,15 @@ pub async fn run_single_turn(
              api_key_auth: is_api_key_auth,
              context_window: session_models.get_context_window(),
          });
 +        // Apply cold-attach lifecycle/stream events only after begin_session so
 +        // reducers see real session context. Stale task_completed stays quiet
-+        // (tombstone only in cold_inbox.completed_bg — no Lifecycle emit).
++        // (tombstone only in cold_inbox.background_lifecycle — no Lifecycle emit).
 +        for event in cold_inbox.lifecycle {
 +            emitter.on_lifecycle(event);
 +        }
@@ -1241,26 +1340,34 @@ index 718740e6..96748ae3 100644
      }
  
      // One bounded catalog read covers what the session catalog cannot resolve.
-@@ -1126,10 +1351,10 @@ pub async fn run_single_turn(
-         None => None,
+@@ -1263,9 +1509,11 @@ pub async fn run_single_turn(
+         None => (None, None),
      };
      let mut prompt_result = None;
--    // Tracked regardless of wait_for_background so the exit reaper always sees running work.
--    let mut pending_bg: HashSet<BackgroundWork> = HashSet::new();
--    // Tombstone of completed ids so an out-of-order task_backgrounded or subagent_spawned never re-adds them to pending
--    let mut completed_bg: HashSet<BackgroundWork> = HashSet::new();
 +    // Seed from cold-attach observations (e.g. stale task_completed tombstones,
 +    // any true backgrounded seen during load) so wait/reap stay consistent.
+     // Tracked regardless of wait_for_background so the exit reaper always sees running work.
+-    let mut pending_bg: HashSet<BackgroundWork> = HashSet::new();
+-    let mut background_lifecycle = BackgroundLifecycleState::default();
 +    let mut pending_bg = cold_inbox.pending_bg;
-+    let mut completed_bg = cold_inbox.completed_bg;
++    let mut background_lifecycle = cold_inbox.background_lifecycle;
      let mut prompt_done_at: Option<Instant> = None;
      // On mid-turn channel close, break (not bail) so the exit path still drains and reaps.
      let mut connection_closed = false;
+@@ -1609,7 +1857,7 @@ enum BackgroundWork {
+     Subagent(String),
+ }
+ 
+-#[derive(Default)]
++#[derive(Default, Debug)]
+ struct BackgroundLifecycleState {
+     completed_tasks: HashSet<String>,
+     subagents: HashMap<String, SubagentLifecycleState>,
 diff --git a/crates/codegen/xai-grok-pager/src/headless_tests.rs b/crates/codegen/xai-grok-pager/src/headless_tests.rs
-index 326acffb..601d289b 100644
+index 4a9d0963..ff23894c 100644
 --- a/crates/codegen/xai-grok-pager/src/headless_tests.rs
 +++ b/crates/codegen/xai-grok-pager/src/headless_tests.rs
-@@ -202,6 +202,222 @@ fn drain_records_task_backgrounded_delivered_at_exit() {
+@@ -109,6 +109,400 @@ fn drain_records_task_backgrounded_delivered_at_exit() {
      );
  }
  
@@ -1377,10 +1484,11 @@ index 326acffb..601d289b 100644
 +            // tombstone only — no pending wait, no lifecycle buffer.
 +            assert!(
 +                inbox
-+                    .completed_bg
-+                    .contains(&super::BackgroundWork::Task("bg-stale-1".into())),
++                    .background_lifecycle
++                    .completed_tasks
++                    .contains("bg-stale-1"),
 +                "stale task_completed must tombstone the task id: {:?}",
-+                inbox.completed_bg
++                inbox.background_lifecycle.completed_tasks
 +            );
 +            assert!(
 +                inbox.pending_bg.is_empty(),
@@ -1480,14 +1588,358 @@ index 326acffb..601d289b 100644
 +        .await;
 +}
 +
++/// YOLO cold attach must select AllowOnce rather than cancel, still without
++/// deadlocking the outstanding NewSession oneshot.
++#[tokio::test(flavor = "current_thread")]
++async fn cold_attach_yolo_selects_allow_once_without_deadlock() {
++    use std::time::Duration;
++
++    use xai_acp_lib::{AcpAgentMessage, AcpArgs, AcpClientMessage, acp_channels};
++
++    let (client, mut agent) = acp_channels();
++    let acp_tx = client.tx;
++    let mut acp_rx = client.rx;
++
++    let local = tokio::task::LocalSet::new();
++    local
++        .run_until(async move {
++            let peer = tokio::task::spawn_local(async move {
++                let msg = agent.rx.recv().await.expect("new_session request");
++                let AcpAgentMessage::NewSession(args) = msg else {
++                    panic!("expected NewSession, got {msg:?}");
++                };
++
++                let (perm_tx, perm_rx) = tokio::sync::oneshot::channel();
++                agent
++                    .tx
++                    .send(AcpClientMessage::RequestPermission(AcpArgs {
++                        request: acp::RequestPermissionRequest::new(
++                            acp::SessionId::new("s-yolo"),
++                            acp::ToolCallUpdate::new(
++                                acp::ToolCallId::new(std::sync::Arc::from("tc-yolo")),
++                                acp::ToolCallUpdateFields::default(),
++                            ),
++                            vec![acp::PermissionOption::new(
++                                acp::PermissionOptionId::new(std::sync::Arc::from("allow-once")),
++                                "Allow once",
++                                acp::PermissionOptionKind::AllowOnce,
++                            )],
++                        ),
++                        response_tx: perm_tx,
++                    }))
++                    .unwrap();
++
++                let outcome = tokio::time::timeout(Duration::from_secs(2), perm_rx)
++                    .await
++                    .expect("permission request not answered during yolo cold attach")
++                    .expect("permission oneshot closed");
++                let resp = outcome.expect("permission reply error");
++                match resp.outcome {
++                    acp::RequestPermissionOutcome::Selected(selected) => {
++                        assert_eq!(selected.option_id.0.as_ref(), "allow-once");
++                    }
++                    other => panic!("yolo cold attach must select AllowOnce, got {other:?}"),
++                }
++
++                args.response_tx
++                    .send(Ok(acp::NewSessionResponse::new(acp::SessionId::new(
++                        "s-yolo",
++                    ))))
++                    .unwrap();
++            });
++
++            let mut inbox = super::ColdAttachInbox::default();
++            let resp = tokio::time::timeout(
++                Duration::from_secs(3),
++                super::acp_send_servicing_cold_attach(
++                    acp::NewSessionRequest::new(std::path::PathBuf::from("/tmp")),
++                    &acp_tx,
++                    &mut acp_rx,
++                    &mut inbox,
++                    /*yolo*/ true,
++                ),
++            )
++            .await
++            .expect("new_session deadlocked on unanswered yolo permission")
++            .expect("new_session ok");
++            assert_eq!(resp.session_id.0.as_ref(), "s-yolo");
++            peer.await.expect("peer");
++        })
++        .await;
++}
++
++/// Live `task_backgrounded` during cold load must arm wait-for-background
++/// (`pending_bg`) rather than the quiet completed-task tombstone used for
++/// stale `task_completed`.
++#[tokio::test(flavor = "current_thread")]
++async fn cold_load_task_backgrounded_arms_pending_lifecycle() {
++    use std::time::Duration;
++
++    use xai_acp_lib::{AcpAgentMessage, AcpArgs, AcpClientMessage, acp_channels};
++
++    let (client, mut agent) = acp_channels();
++    let acp_tx = client.tx;
++    let mut acp_rx = client.rx;
++
++    let local = tokio::task::LocalSet::new();
++    local
++        .run_until(async move {
++            let peer = tokio::task::spawn_local(async move {
++                let msg = agent
++                    .rx
++                    .recv()
++                    .await
++                    .expect("client must send session/load");
++                let AcpAgentMessage::LoadSession(args) = msg else {
++                    panic!("expected LoadSession, got {msg:?}");
++                };
++
++                let payload = serde_json::json!({
++                    "sessionId": "s-bg-load",
++                    "update": {
++                        "sessionUpdate": "task_backgrounded",
++                        "task_id": "bg-live-1",
++                    },
++                });
++                let raw = serde_json::value::to_raw_value(&payload).unwrap();
++                let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
++                agent
++                    .tx
++                    .send(AcpClientMessage::ExtNotification(AcpArgs {
++                        request: acp::ExtNotification::new("x.ai/task_backgrounded", raw.into()),
++                        response_tx: completion_tx,
++                    }))
++                    .expect("enqueue task_backgrounded while load outstanding");
++
++                tokio::time::timeout(Duration::from_secs(2), completion_rx)
++                    .await
++                    .expect("task_backgrounded was not acknowledged during session/load")
++                    .expect("task_backgrounded oneshot closed")
++                    .expect("task_backgrounded ack");
++
++                args.response_tx
++                    .send(Ok(acp::LoadSessionResponse::new()))
++                    .expect("deliver LoadSessionResponse after nested ack");
++            });
++
++            let mut inbox = super::ColdAttachInbox::default();
++            let load = super::acp_send_servicing_cold_attach(
++                acp::LoadSessionRequest::new(
++                    acp::SessionId::new("s-bg-load"),
++                    std::path::PathBuf::from("/tmp"),
++                )
++                .meta({
++                    let mut m = acp::Meta::new();
++                    m.insert("noReplay".into(), serde_json::Value::Bool(true));
++                    Some(m)
++                }),
++                &acp_tx,
++                &mut acp_rx,
++                &mut inbox,
++                /*yolo*/ false,
++            );
++
++            tokio::time::timeout(Duration::from_secs(3), load)
++                .await
++                .expect("session/load deadlocked on task_backgrounded")
++                .expect("session/load should succeed");
++
++            assert!(
++                inbox
++                    .pending_bg
++                    .contains(&super::BackgroundWork::Task("bg-live-1".into())),
++                "live task_backgrounded must arm pending work: {:?}",
++                inbox.pending_bg
++            );
++            assert!(
++                !inbox
++                    .background_lifecycle
++                    .completed_tasks
++                    .contains("bg-live-1"),
++                "live backgrounded task is not a completed tombstone: {:?}",
++                inbox.background_lifecycle.completed_tasks
++            );
++
++            peer.await.expect("peer task");
++        })
++        .await;
++}
++
  /// `begin_session` runs before the model and effort are applied, so a post-open error carries the real context.
  #[test]
  fn post_open_error_carries_real_session_context() {
+@@ -320,7 +714,8 @@ async fn worktree_create_opens_session_at_worktree_subdirectory() {
+     );
+     let spec = WorktreeSpec::from_cli(Some("fix"), Some("origin/main")).unwrap();
+ 
+-    let opened = open_session_in_new_worktree(&tx, &launch_cwd, &spec, None)
++    let (_client_tx, mut acp_rx) = tokio::sync::mpsc::unbounded_channel();
++    let opened = open_session_in_new_worktree(&tx, &mut acp_rx, &launch_cwd, &spec, None, false)
+         .await
+         .unwrap();
+ 
+@@ -365,10 +760,17 @@ async fn worktree_create_with_session_id_names_worktree_and_session() {
+     );
+     let sid = "2d3c6b3e-3d43-4f0a-9d2e-2b6d1b6a9c11";
+ 
+-    let opened =
+-        open_session_in_new_worktree(&tx, source.path(), &WorktreeSpec::default(), Some(sid))
+-            .await
+-            .unwrap();
++    let (_client_tx, mut acp_rx) = tokio::sync::mpsc::unbounded_channel();
++    let opened = open_session_in_new_worktree(
++        &tx,
++        &mut acp_rx,
++        source.path(),
++        &WorktreeSpec::default(),
++        Some(sid),
++        false,
++    )
++    .await
++    .unwrap();
+ 
+     assert_eq!(opened.session_id.0.as_ref(), sid);
+     assert_eq!(opened.cwd, wt_root.path());
+@@ -406,10 +808,19 @@ async fn worktree_create_failure_is_reported_before_any_session_opens() {
+         ),
+     ] {
+         let (tx, log) = spawn_fake_agent(reply, Ok("never"));
+-        let err = open_session_in_new_worktree(&tx, source.path(), &WorktreeSpec::default(), None)
+-            .await
+-            .unwrap_err()
+-            .to_string();
++        let (_client_tx, mut acp_rx) = tokio::sync::mpsc::unbounded_channel();
++        let err = open_session_in_new_worktree(
++            &tx,
++            &mut acp_rx,
++            source.path(),
++            &WorktreeSpec::default(),
++            None,
++            false,
++        )
++        .await
++        .err()
++        .expect("worktree create must fail")
++        .to_string();
+         assert!(err.contains("couldn't create worktree"), "{err}");
+         assert!(err.contains(expect), "{err}");
+         assert!(log.lock().unwrap().new_sessions.is_empty());
+@@ -425,10 +836,19 @@ async fn worktree_create_then_session_failure_names_the_orphaned_worktree() {
+         Err("agent refused"),
+     );
+ 
+-    let err = open_session_in_new_worktree(&tx, source.path(), &WorktreeSpec::default(), None)
+-        .await
+-        .unwrap_err()
+-        .to_string();
++    let (_client_tx, mut acp_rx) = tokio::sync::mpsc::unbounded_channel();
++    let err = open_session_in_new_worktree(
++        &tx,
++        &mut acp_rx,
++        source.path(),
++        &WorktreeSpec::default(),
++        None,
++        false,
++    )
++    .await
++    .err()
++    .expect("session open after worktree create must fail")
++    .to_string();
+ 
+     assert!(err.contains("agent refused"), "{err}");
+     assert!(err.contains(&wt_root.path().display().to_string()), "{err}");
+@@ -451,10 +871,19 @@ async fn worktree_resume_loads_reported_session_without_re_restoring_code() {
+     );
+     let spec = WorktreeSpec::from_cli(Some(""), Some("v1.2")).unwrap();
+ 
+-    let opened =
+-        resume_session_in_new_worktree(&tx, source.path(), &spec, "orig", Some(true), false)
+-            .await
+-            .unwrap();
++    let (_client_tx, mut acp_rx) = tokio::sync::mpsc::unbounded_channel();
++    let opened = resume_session_in_new_worktree(
++        &tx,
++        &mut acp_rx,
++        source.path(),
++        &spec,
++        "orig",
++        Some(true),
++        false,
++        false,
++    )
++    .await
++    .unwrap();
+ 
+     assert_eq!(opened.session_id.0.as_ref(), "forked-in-worktree");
+     assert_eq!(opened.cwd, eff_cwd);
+@@ -501,14 +930,36 @@ async fn worktree_resume_failure_carries_local_miss_hint_like_the_tui() {
+     let (tx, _log) = spawn_fake_agent(serde_json::json!({"error": "archive unavailable"}), Ok("x"));
+     let spec = WorktreeSpec::default();
+ 
+-    let hinted = resume_session_in_new_worktree(&tx, source.path(), &spec, "my title", None, true)
+-        .await
+-        .unwrap_err()
+-        .to_string();
+-    let plain = resume_session_in_new_worktree(&tx, source.path(), &spec, "my title", None, false)
+-        .await
+-        .unwrap_err()
+-        .to_string();
++    let (_client_tx, mut acp_rx) = tokio::sync::mpsc::unbounded_channel();
++    let hinted = resume_session_in_new_worktree(
++        &tx,
++        &mut acp_rx,
++        source.path(),
++        &spec,
++        "my title",
++        None,
++        true,
++        false,
++    )
++    .await
++    .err()
++    .expect("hinted worktree resume must fail")
++    .to_string();
++    let (_client_tx2, mut acp_rx2) = tokio::sync::mpsc::unbounded_channel();
++    let plain = resume_session_in_new_worktree(
++        &tx,
++        &mut acp_rx2,
++        source.path(),
++        &spec,
++        "my title",
++        None,
++        false,
++        false,
++    )
++    .await
++    .err()
++    .expect("plain worktree resume must fail")
++    .to_string();
+ 
+     assert_eq!(
+         plain,
 diff --git a/crates/codegen/xai-grok-shell/Cargo.toml b/crates/codegen/xai-grok-shell/Cargo.toml
-index 92befe00..f59d49c1 100644
+index f36d134b..8a9173aa 100644
 --- a/crates/codegen/xai-grok-shell/Cargo.toml
 +++ b/crates/codegen/xai-grok-shell/Cargo.toml
-@@ -144,6 +144,8 @@ xai-interjection-core = { workspace = true }
+@@ -9,9 +9,14 @@ default = []
+ dhat-heap = ["dep:dhat"]
+ # Session synthesis + in-process e2e harness (`session::testkit`) for soak,
+ # load, and bench tests. Off by default; the tests/benches that use it declare
+-# it via `required-features`. Forwards login and sampler `test-support` so
+-# downstream test builds see those crates' test seams.
+-test-support = ["xai-grok-login/test-support", "xai-grok-sampler/test-support"]
++# it via `required-features`. Forwards login, sampler, and workspace
++# `test-support` so pager/headless test builds see `WorkspaceOps::for_test`
++# when `isolated_spawn_e2e` is compiled.
++test-support = [
++    "xai-grok-login/test-support",
++    "xai-grok-sampler/test-support",
++    "xai-grok-workspace/test-support",
++]
+ test-util = []
+ # Local Computer Hub workspace_server (own/attach + crash-restart). Requires
+ local-workspace = []
+@@ -134,6 +139,8 @@ xai-interjection-core = { workspace = true }
  xai-message-delivery-core = { workspace = true }
  xai-grok-sandbox = { path = "../xai-grok-sandbox", default-features = false }
  xai-chat-state = { path = "../xai-chat-state" }
@@ -1496,7 +1948,7 @@ index 92befe00..f59d49c1 100644
  # Segment markdown rendering + the `compaction/` store path convention.
  xai-compaction-transcript = { workspace = true }
  xai-grok-compaction = { path = "../../common/xai-grok-compaction" }
-@@ -212,6 +214,11 @@ ctor = { workspace = true }
+@@ -205,6 +212,11 @@ ctor = { workspace = true }
  filetime = { workspace = true }
  pretty_assertions = { workspace = true }
  tempfile = { workspace = true }
@@ -1509,10 +1961,10 @@ index 92befe00..f59d49c1 100644
  # is `#[cfg(test)]`-only inside xai-grok-bundle without this feature.
  xai-grok-bundle = { workspace = true, features = ["test-support"] }
 diff --git a/crates/codegen/xai-grok-shell/src/agent/config.rs b/crates/codegen/xai-grok-shell/src/agent/config.rs
-index 953734d2..8c47a3f1 100644
+index 24e72947..0e295a65 100644
 --- a/crates/codegen/xai-grok-shell/src/agent/config.rs
 +++ b/crates/codegen/xai-grok-shell/src/agent/config.rs
-@@ -1353,6 +1353,9 @@ pub struct Config {
+@@ -1286,6 +1286,9 @@ pub struct Config {
      pub subagents: crate::config::SubagentsConfig,
      #[serde(default, skip_serializing)]
      pub memory: crate::config::MemorySettings,
@@ -1520,20 +1972,20 @@ index 953734d2..8c47a3f1 100644
 +    #[serde(default, skip_serializing)]
 +    pub lhc: crate::config::LhcConfig,
      #[serde(default, skip_serializing)]
-     pub compaction: CompactionConfig,
+     pub memory_v2: crate::config::MemoryV2Settings,
      #[serde(default, skip_serializing)]
-@@ -1718,6 +1721,7 @@ impl Default for Config {
-             disabled_mcp_tools: std::collections::HashMap::new(),
+@@ -1634,6 +1637,7 @@ impl Default for Config {
              subagents: crate::config::SubagentsConfig::default(),
              memory: crate::config::MemorySettings::default(),
+             memory_v2: crate::config::MemoryV2Settings::default(),
 +            lhc: crate::config::LhcConfig::default(),
              compaction: CompactionConfig::default(),
              managed_mcps: crate::config::ManagedMcpsConfig::default(),
              auth: None,
-@@ -2264,6 +2268,9 @@ impl Config {
+@@ -2224,6 +2228,9 @@ impl Config {
          self.memory_enabled_override = ctx.memory_enabled_override;
          let mem = self.resolve_memory(ctx.memory_enabled_override, ctx.remote_settings);
-         self.memory_config = if mem.enabled { Some(mem) } else { None };
+         self.memory_config = Some(mem);
 +        // LHC: env > [lhc] config > default on. Fills unset GROK_LHC* env
 +        // vars only for non-default sources (defaults must not leak into env).
 +        self.lhc = crate::config::LhcConfig::resolve_and_apply(ctx.raw_config);
@@ -1541,7 +1993,7 @@ index 953734d2..8c47a3f1 100644
          self.todo_gate = ctx.todo_gate;
          self.laziness_debug_log = ctx.laziness_debug_log.map(std::path::Path::to_path_buf);
 diff --git a/crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs b/crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs
-index fe835124..3346ef72 100644
+index 67c4c44a..666a7d7a 100644
 --- a/crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs
 +++ b/crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs
 @@ -57,6 +57,7 @@ pub(crate) async fn apply(
@@ -1552,7 +2004,7 @@ index fe835124..3346ef72 100644
      let is_family_switch = {
          let models = agent.models_manager.models();
          let old_family = config::find_model_by_id(&models, &previous_model_id)
-@@ -250,6 +251,14 @@ pub(crate) async fn apply(
+@@ -259,6 +260,14 @@ pub(crate) async fn apply(
          model_id.0.as_ref(),
          applied_effort.map(|eff| eff.to_string()),
      );
@@ -1568,10 +2020,10 @@ index fe835124..3346ef72 100644
          notify_config_options(agent, &session_id).await;
      }
 diff --git a/crates/codegen/xai-grok-shell/src/agent/mvp_agent/mod.rs b/crates/codegen/xai-grok-shell/src/agent/mvp_agent/mod.rs
-index 5628ecde..3b25a1ef 100644
+index e7ad743a..84080a1b 100644
 --- a/crates/codegen/xai-grok-shell/src/agent/mvp_agent/mod.rs
 +++ b/crates/codegen/xai-grok-shell/src/agent/mvp_agent/mod.rs
-@@ -1480,8 +1480,13 @@ impl MvpAgent {
+@@ -1353,8 +1353,13 @@ impl MvpAgent {
          }
          pending.into_values().collect()
      }
@@ -1588,10 +2040,10 @@ index 5628ecde..3b25a1ef 100644
          &self,
          session_id: &acp::SessionId,
 diff --git a/crates/codegen/xai-grok-shell/src/agent/mvp_agent/replay.rs b/crates/codegen/xai-grok-shell/src/agent/mvp_agent/replay.rs
-index 96a63f1b..0858b35f 100644
+index f42ed0a3..c8f833ec 100644
 --- a/crates/codegen/xai-grok-shell/src/agent/mvp_agent/replay.rs
 +++ b/crates/codegen/xai-grok-shell/src/agent/mvp_agent/replay.rs
-@@ -51,6 +51,52 @@ impl ReplayCompletionDrain {
+@@ -52,6 +52,52 @@ impl ReplayCompletionDrain {
      }
  }
  
@@ -1644,7 +2096,7 @@ index 96a63f1b..0858b35f 100644
  impl MvpAgent {
      /// Records written before completions were bounded can still be too long for a client to read.
      /// `None` drops one that cannot be shrunk, which costs a completion event but keeps the connection.
-@@ -373,7 +419,43 @@ impl MvpAgent {
+@@ -433,7 +479,43 @@ fn line_is_background_tasks_update(line: &str) -> bool {
  
  #[cfg(test)]
  mod drain_tests {
@@ -1690,10 +2142,10 @@ index 96a63f1b..0858b35f 100644
      #[tokio::test]
      async fn completion_window_drains_all_ready_receivers() {
 diff --git a/crates/codegen/xai-grok-shell/src/agent/mvp_agent/replay_tests.rs b/crates/codegen/xai-grok-shell/src/agent/mvp_agent/replay_tests.rs
-index 8b6c3ab4..5a82c884 100644
+index e8f3112b..c8709b99 100644
 --- a/crates/codegen/xai-grok-shell/src/agent/mvp_agent/replay_tests.rs
 +++ b/crates/codegen/xai-grok-shell/src/agent/mvp_agent/replay_tests.rs
-@@ -200,6 +200,49 @@ async fn a_stale_task_completion_is_frame_bounded() {
+@@ -217,6 +217,49 @@ async fn a_stale_task_completion_is_frame_bounded() {
      assert!(params.contains("session_restart"));
  }
  
@@ -1740,14 +2192,14 @@ index 8b6c3ab4..5a82c884 100644
 +        .await;
 +}
 +
- fn build_agent_with_gateway() -> (
-     MvpAgent,
-     tokio::sync::mpsc::UnboundedReceiver<AcpClientMessage>,
+ #[tokio::test]
+ async fn stale_task_reconcile_keeps_incrementals_without_list() {
+     let (agent, mut rx) = build_agent_with_gateway();
 diff --git a/crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_setup.rs b/crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_setup.rs
-index ce672f52..21697166 100644
+index 0ac96fa8..fb47a98e 100644
 --- a/crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_setup.rs
 +++ b/crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_setup.rs
-@@ -1202,6 +1202,12 @@ impl MvpAgent {
+@@ -1459,6 +1459,12 @@ impl MvpAgent {
      }
      /// Replay-gate phase: replay the transcript (unless `no_replay`), reopen the live-output gate, drain deltas so replay precedes the response.
      /// Stale-task reconciliation runs even under `no_replay`: it corrects state.
@@ -1760,7 +2212,7 @@ index ce672f52..21697166 100644
      async fn replay_transcript_gate(
          &self,
          session_id: &acp::SessionId,
-@@ -1264,6 +1270,8 @@ impl MvpAgent {
+@@ -1524,6 +1530,8 @@ impl MvpAgent {
                  .gateway_enabled
                  .store(true, std::sync::atomic::Ordering::Relaxed);
          }
@@ -1769,7 +2221,7 @@ index ce672f52..21697166 100644
          for rx in delta_completions {
              let _ = rx.await;
          }
-@@ -1271,9 +1279,9 @@ impl MvpAgent {
+@@ -1531,9 +1539,9 @@ impl MvpAgent {
              let _timer = crate::instrumentation_timer!("session.reconcile_stale_tasks");
              self.reconcile_stale_background_tasks(&session_id, &updates_file_path)
          };
@@ -1781,8 +2233,8 @@ index ce672f52..21697166 100644
 +        super::replay::defer_load_completion_drain(reconcile_completions, "stale_task_reconcile");
          Ok((initial_total_tokens, unfinished_subagents))
      }
-     /// Reconnect phase: re-apply per-client capability and permission state to the resident handle, which still reflects the client that spawned it.
-@@ -1632,6 +1640,152 @@ pub(super) fn load_request_for_resume(args: acp::ResumeSessionRequest) -> acp::L
+     /// Enqueue a persist+broadcast of the live *local* list before `session/load`
+@@ -1931,6 +1939,155 @@ pub(super) fn load_request_for_resume(args: acp::ResumeSessionRequest) -> acp::L
          .mcp_servers(mcp_servers)
          .meta(meta.unwrap_or_default())
  }
@@ -1833,6 +2285,7 @@ index ce672f52..21697166 100644
 +                        cursor: None,
 +                    },
 +                    /*no_replay*/ true,
++                    /*skip_local_background_tasks_replay*/ false,
 +                );
 +                let gate_result = tokio::time::timeout(Duration::from_secs(2), gate)
 +                    .await
@@ -1901,6 +2354,7 @@ index ce672f52..21697166 100644
 +                            cursor: None,
 +                        },
 +                        /*no_replay*/ false,
++                        /*skip_local_background_tasks_replay*/ false,
 +                    )
 +                    .await
 +                    .expect("empty replay");
@@ -1926,6 +2380,7 @@ index ce672f52..21697166 100644
 +            &AgentConfig::default(),
 +            auth_manager,
 +            None,
++            None,
 +        )
 +        .expect("valid test config");
 +        (agent, rx)
@@ -1936,10 +2391,10 @@ index ce672f52..21697166 100644
  mod session_kind_claim_tests {
      use super::parse_client_session_kind;
 diff --git a/crates/codegen/xai-grok-shell/src/config/mod.rs b/crates/codegen/xai-grok-shell/src/config/mod.rs
-index 5c5669e8..38c757c1 100644
+index 81fb33d2..22f2b612 100644
 --- a/crates/codegen/xai-grok-shell/src/config/mod.rs
 +++ b/crates/codegen/xai-grok-shell/src/config/mod.rs
-@@ -2094,5 +2094,86 @@ pub(crate) fn remove_hooks_path_from_file(
+@@ -1992,5 +1992,86 @@ pub(crate) fn remove_hooks_path_from_file(
      )?;
      Ok(true)
  }
@@ -2027,10 +2482,10 @@ index 5c5669e8..38c757c1 100644
  #[cfg(test)]
  mod tests;
 diff --git a/crates/codegen/xai-grok-shell/src/config/tests.rs b/crates/codegen/xai-grok-shell/src/config/tests.rs
-index 01da7063..51c51e53 100644
+index 6bdbe926..8b4830bd 100644
 --- a/crates/codegen/xai-grok-shell/src/config/tests.rs
 +++ b/crates/codegen/xai-grok-shell/src/config/tests.rs
-@@ -4155,6 +4155,122 @@ fn from_remote_gated_requires_xai_auth_for_writeback() {
+@@ -4254,6 +4254,122 @@ fn from_remote_gated_requires_xai_auth_for_writeback() {
          StorageMode::Local
      );
  }
@@ -2154,10 +2609,10 @@ index 01da7063..51c51e53 100644
  #[cfg(target_os = "linux")]
  fn required_bwrap_routes_fail_closed() {
 diff --git a/crates/codegen/xai-grok-shell/src/extensions/notification.rs b/crates/codegen/xai-grok-shell/src/extensions/notification.rs
-index e24a14c1..7e8e0adc 100644
+index ecaf6491..c9e44d47 100644
 --- a/crates/codegen/xai-grok-shell/src/extensions/notification.rs
 +++ b/crates/codegen/xai-grok-shell/src/extensions/notification.rs
-@@ -1298,6 +1298,13 @@ pub struct CompactionCheckpointFile {
+@@ -1420,6 +1420,13 @@ pub struct CompactionCheckpointFile {
      /// Informational: kept for debugging and for understanding replay.
      #[serde(default)]
      pub reread_file_paths: Vec<String>,
@@ -2172,10 +2627,10 @@ index e24a14c1..7e8e0adc 100644
  
  /// A compaction segment to persist under `compaction/segment_NNN.md`.
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session.rs b/crates/codegen/xai-grok-shell/src/session/acp_session.rs
-index 5a784287..311ba4e4 100644
+index a2ac498d..91fbc8ad 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session.rs
-@@ -1729,6 +1729,12 @@ mod fs_injection_regression_tests;
+@@ -1686,6 +1686,12 @@ mod fs_injection_regression_tests;
  #[path = "acp_session_tests/interjection_actor_tests.rs"]
  mod interjection_actor_tests;
  #[cfg(test)]
@@ -2188,7 +2643,7 @@ index 5a784287..311ba4e4 100644
  #[path = "acp_session_tests/observability_bridge_mapping_tests.rs"]
  mod observability_bridge_mapping_tests;
  #[cfg(test)]
-@@ -2009,6 +2015,9 @@ mod laziness_integration_tests;
+@@ -1987,6 +1993,9 @@ mod laziness_integration_tests;
  #[path = "acp_session_tests/turn/length_salvage_tests.rs"]
  mod length_salvage_tests;
  #[cfg(test)]
@@ -2199,13 +2654,13 @@ index 5a784287..311ba4e4 100644
  mod load_user_prompts_tests;
  #[cfg(test)]
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/model_switch.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/model_switch.rs
-index dde7e38f..6696d173 100644
+index 79f18080..f7d1fde7 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/model_switch.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/model_switch.rs
-@@ -307,6 +307,42 @@ impl SessionActor {
-             }
-         }
+@@ -354,6 +354,42 @@ impl SessionActor {
+         let claim = self.restart_mcp_init(&mut *self.mcp_state.lock().await);
          self.re_register_mcp_tools_on_rebuilt_bridge().await;
+         self.run_mcp_init_with_claim(claim).await;
 +        // Wave B: rebuilt ToolBridge drops dynamic tools — re-attach retrieval
 +        // tools only when archive open has succeeded (not provisional registry).
 +        {
@@ -2242,14 +2697,14 @@ index dde7e38f..6696d173 100644
 +                }
 +            }
 +        }
-         if let Some(old_handle) = self.deferred_prefix.take() {
-             old_handle.abort();
-         }
+         self.deferred_prefix.cancel();
+         let new_user_prefix = self
+             .build_prefix_after_mcp_wait(self.requires_full_mcp_wait())
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs
-index 94b4f388..c99651b5 100644
+index 814c2474..514108d4 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs
-@@ -979,15 +979,20 @@ impl SessionActor {
+@@ -1004,15 +1004,20 @@ impl SessionActor {
  
          Ok(sampling_client)
      }
@@ -2279,7 +2734,7 @@ index 94b4f388..c99651b5 100644
          self.refresh_token_if_expired().await;
          let mut sampler_config = self.reconstruct_full_config().await;
          if self.tool_context.task_output_token_budget.is_some()
-@@ -997,7 +1002,12 @@ impl SessionActor {
+@@ -1022,7 +1027,12 @@ impl SessionActor {
          }
          // Carry over the session's per-chunk idle timeout via `SamplerConfig.idle_timeout_secs`
          sampler_config.idle_timeout_secs = Some(self.inference_idle_timeout.as_secs());
@@ -2292,27 +2747,19 @@ index 94b4f388..c99651b5 100644
      }
  
      /// Fold an auth remedy into a turn failure: its advice becomes the tail of the message.
-@@ -1585,17 +1595,34 @@ impl SessionActor {
+@@ -1643,22 +1653,27 @@ impl SessionActor {
      }
  
      /// Drive one turn through the sampler, pacing a subagent's 429s via `budget`.
+-    /// `Parked` resubmits skip every refresh-driving prepare (see the re-park arm);
+-    /// the wire bearer comes from the live resolver at send time.
 +    ///
 +    /// Caller must have already called [`Self::prepare_sampler_for_turn`]
 +    /// for this attempt (so hook-4 signature gating and response identity
 +    /// stamping share the same frozen attempt config) and passes that frozen
-+    /// identity in as `frozen`. The only config re-push inside this method
-+    /// (after a paced 429 backoff, where a token can expire) writes the
-+    /// newly frozen identity back into `frozen`, so the caller always stamps
-+    /// the response with the identity of the submission that produced it.
-+    /// This method otherwise only submits via
-+    /// `SamplerHandle::submit_and_collect` and returns:
-+    /// * `Ok(SamplerTurnOutcome::Response(_))` - model responded.
-+    /// * `Ok(SamplerTurnOutcome::CompactAndResubmit)` - compaction
-+    ///    ran, the outer turn loop should `continue`.
-+    /// * `Ok(SamplerTurnOutcome::RefreshAuthAndResubmit)` - auth 401
-+    ///    recovery succeeded, credentials refreshed, retry once.
-+    /// * `Err(acp::Error)` - terminal failure already reported via
-+    ///    `send_xai_notification(RetryState::Failed)`.
++    /// identity in as `frozen`, except `Parked` resubmits which skip every
++    /// refresh-driving prepare; the wire bearer then comes from the live
++    /// resolver at send time.
      pub(crate) async fn run_turn_via_sampler(
          self: &Arc<Self>,
          request: ConversationRequest,
@@ -2320,37 +2767,44 @@ index 94b4f388..c99651b5 100644
          transient: TransientRetryState,
          mid_salvage_continuation: bool,
 +        frozen: &mut SamplerAttemptIdentity,
+         park: TurnParkState,
      ) -> Result<SamplerTurnOutcome, acp::Error> {
--        // Per-turn auth refresh and sampler config push
--        // Mirrors `prepare_chat_completion(false)` from the legacy path
--        self.prepare_sampler_for_turn().await;
--
+-        // Per-turn auth refresh + sampler config push. Mirrors
+-        // `prepare_chat_completion(false)` from the legacy path.
+-        if !park.is_parked() {
+-            self.prepare_sampler_for_turn().await;
 +        // Caller froze `frozen` via `prepare_sampler_for_turn` (hook-4 gate +
-+        // response identity). Do not re-push config here: a second push could
-+        // race a concurrent `SetSessionModel` past the frozen identity.
++        // response identity) except parked resubmits, which skip that refresh.
++        if park.is_parked() {
++            // Parked: do not re-push config; send-time resolver supplies the bearer.
+         }
+-
          if !budget.can_wait() {
              // Nothing will send this request a second time, so move it into the sampler instead of deep-cloning the whole message history on every main-session turn
              return match self.submit_turn_request(request).await {
-@@ -1635,7 +1662,10 @@ impl SessionActor {
+@@ -1699,10 +1714,12 @@ impl SessionActor {
+                     self.notify_rate_limit_wait(attempt, budget, backoff).await;
                      // Esc cancels a turn by aborting its task, so this await point is itself the cancellation point; no select needed
                      sleep(backoff).await;
-                     // A token can expire across minutes of accumulated waits.
--                    self.prepare_sampler_for_turn().await;
+-                    // A token can expire across minutes of accumulated waits
+-                    // (parked turns skip it — see `run_turn_via_sampler`).
++                    // A token can expire across minutes of accumulated waits.
 +                    // The re-push freezes a new attempt; hand it back so a model
 +                    // switch during the backoff is what the response is stamped
-+                    // with (FIFO UpdateConfig → Submit still holds).
-+                    *frozen = self.prepare_sampler_for_turn().await;
++                    // with (FIFO UpdateConfig → Submit still holds). Parked turns skip it.
+                     if !park.is_parked() {
+-                        self.prepare_sampler_for_turn().await;
++                        *frozen = self.prepare_sampler_for_turn().await;
+                     }
+                     self.turn_phases.record_sampling_retries(1);
                  }
-             }
-         }
-@@ -2068,15 +2098,32 @@ impl SessionActor {
+@@ -2143,13 +2160,33 @@ impl SessionActor {
+     }
  
      /// Propagate the model-reported token usage from a turn response into chat state, the per-prompt usage ledger, and per-turn signals.
-     ///
--    /// This is the only place per-turn `total_tokens` is refreshed in the post-sampler-refactor path.
 -    /// Without it `state.total_tokens` would stay frozen at the `estimate_conversation_tokens` seed from `ChatState::new`.
--    /// That freezes `/context` and corrupts the resume restore that reads `meta.totalTokens` from `updates.jsonl`.
 -    /// Resetting `estimated_tokens_since_model = 0` here also keeps the preflight-overflow guard accurate against the next turn's tool-result deltas.
++    ///
 +    /// This is the only place per-turn `total_tokens` is refreshed in the
 +    /// post-sampler-refactor path; without it `state.total_tokens` would
 +    /// stay frozen at the `estimate_conversation_tokens` seed from
@@ -2381,10 +2835,10 @@ index 94b4f388..c99651b5 100644
              self.tool_context
                  .record_task_model_output(u64::from(u.completion_tokens));
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/slash_exec.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/slash_exec.rs
-index e24ad6d2..7779cdde 100644
+index 220544b4..674360b3 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/slash_exec.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/slash_exec.rs
-@@ -88,6 +88,213 @@ impl SessionActor {
+@@ -72,6 +72,216 @@ impl SessionActor {
                  ok_end_turn(0, None)
              }
              BuiltinAction::ContextInfo => ok_end_turn(0, None),
@@ -2513,6 +2967,7 @@ index e24ad6d2..7779cdde 100644
 +                            // the same sampler capability as spawn-time tee install (Z2).
 +                            let conversation = self.chat_state_handle.get_conversation().await;
 +                            let sampling_config = self.reconstruct_full_config().await;
++                            let serving_model = sampling_config.model.clone();
 +                            let sampler =
 +                                crate::session::lhc_inference::ShellLhcInferenceSampler::new(
 +                                    sampling_config,
@@ -2521,12 +2976,14 @@ index e24ad6d2..7779cdde 100644
 +                                    std::time::Duration::from_secs(60),
 +                                )
 +                                .into_arc();
-+                            match grok_lhc_host::spawn_capture(
++                            match grok_lhc_host::spawn_capture_with_serving_model(
 +                                sid,
 +                                Some(self.session_info.cwd.as_ref()),
 +                                &conversation,
 +                                None,
++                                None,
 +                                Some(sampler),
++                                Some(serving_model.as_str()),
 +                            ) {
 +                                Some(_) => {
 +                                    match grok_lhc_host::wait_capture_archive_ready(
@@ -2599,13 +3056,15 @@ index e24ad6d2..7779cdde 100644
                  let msg = match Self::do_hooks_trust_project(&self.session_info.cwd) {
                      Ok(root) => {
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs
-index e5638318..8eecb495 100644
+index e8460933..f9235d46 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs
-@@ -63,6 +63,40 @@ fn configured_memory_retrieval_mode(
+@@ -59,8 +59,47 @@ fn configured_memory_retrieval_mode(
          Some(_) => FtsOnly,
      }
  }
+-/// One 429 layer per role, never stacked, never zero: an active subagent pacer disables the sampler retry, and a
+-/// disabled pacer falls back to it (a true rollback). A per-model sampler threshold overrides this policy elsewhere.
 +/// LHC (slice 1A): the latest compaction checkpoint, when LHC-marked
 +/// (`lhc_source_tip` present), gives capture the generated body and the tip it
 +/// was built from. Native or pre-1A checkpoints yield `None` and bootstrap
@@ -2640,10 +3099,17 @@ index e5638318..8eecb495 100644
 +    })
 +}
 +
- /// Choose the sampler's own 429 retry threshold for a session's inference path.
- ///
- /// One 429 layer per role, never stacked, never zero.
-@@ -557,13 +591,36 @@ pub(crate) async fn spawn_session_actor(
++/// Choose the sampler's own 429 retry threshold for a session's inference path.
++///
++/// One 429 layer per role, never stacked, never zero.
++/// A subagent with an active pacer (`pacer_max_attempts > 0`) paces 429s itself, so the sampler retry is disabled.
++/// With the pacer off, the subagent falls back to the sampler retry, so disabling the pacer is a true rollback rather than zero 429 handling.
++/// Main sessions always keep the sampler retry.
++/// A per-model sampler threshold overrides this policy elsewhere.
+ fn subagent_sampler_rate_limit_threshold(is_subagent: bool, pacer_max_attempts: u32) -> u32 {
+     if is_subagent && pacer_max_attempts > 0 {
+         xai_grok_sampler::RATE_LIMIT_RETRY_DISABLED
+@@ -585,13 +624,37 @@ pub(crate) async fn spawn_session_actor(
          hard_clear_age_turns: session_pruning_config.hard_clear_age_turns,
      };
      let (chat_state_event_tx, chat_state_event_rx) = mpsc::unbounded_channel();
@@ -2664,7 +3130,7 @@ index e5638318..8eecb495 100644
 -            persistence.tx.clone(),
 -        )),
 +        // LHC-HOOK 2/10: wrap persistence in the LHC capture tee (+ inference sampler)
-+        grok_lhc_host::tee_chat_persistence(
++        grok_lhc_host::tee_chat_persistence_with_serving_model(
 +            session_info.id.0.as_ref(),
 +            session_info.cwd.as_ref(),
 +            &conversation,
@@ -2679,55 +3145,59 @@ index e5638318..8eecb495 100644
 +                )
 +                .into_arc(),
 +            ),
++            Some(sampling_config.model.as_str()),
 +        ),
          chat_state_event_tx,
          tokio_util::sync::CancellationToken::new(),
      );
-@@ -1057,6 +1114,39 @@ pub(crate) async fn spawn_session_actor(
-             resources.insert(task_wake_suppressed);
-         })
-         .await;
-+    // Wave B: register get_turns/get_messages only after archive open succeeds
-+    // (not mere registry presence — open may still be pending or refused).
-+    {
-+        let sid = session_info.id.0.as_ref();
-+        if grok_lhc_host::capture_active(sid) {
-+            match grok_lhc_host::wait_capture_archive_ready(sid, grok_lhc_host::CAPTURE_OPEN_WAIT)
+@@ -1228,6 +1291,42 @@ pub(crate) async fn spawn_session_actor(
+                 resources.insert(task_wake_suppressed);
+             })
+             .await;
++        // Wave B: register get_turns/get_messages only after archive open succeeds
++        // (not mere registry presence — open may still be pending or refused).
++        {
++            let sid = session_info.id.0.as_ref();
++            if grok_lhc_host::capture_active(sid) {
++                match grok_lhc_host::wait_capture_archive_ready(
++                    sid,
++                    grok_lhc_host::CAPTURE_OPEN_WAIT,
++                )
 +                .await
-+            {
-+                Ok(_) => {
-+                    if let Err(e) =
-+                        crate::session::lhc_retrieval_tools::register_lhc_retrieval_tools(
-+                            agent.tool_bridge(),
-+                            sid,
-+                        )
-+                        .await
-+                    {
++                {
++                    Ok(_) => {
++                        if let Err(e) =
++                            crate::session::lhc_retrieval_tools::register_lhc_retrieval_tools(
++                                agent.tool_bridge(),
++                                sid,
++                            )
++                            .await
++                        {
++                            tracing::warn!(
++                                session_id = %session_info.id.0,
++                                error = %e,
++                                "LHC retrieval tools: registration failed at spawn"
++                            );
++                        }
++                    }
++                    Err(e) => {
 +                        tracing::warn!(
 +                            session_id = %session_info.id.0,
-+                            error = %e,
-+                            "LHC retrieval tools: registration failed at spawn"
++                            error = %e.message(),
++                            "LHC retrieval tools: skipped at spawn — archive not ready"
 +                        );
 +                    }
 +                }
-+                Err(e) => {
-+                    tracing::warn!(
-+                        session_id = %session_info.id.0,
-+                        error = %e.message(),
-+                        "LHC retrieval tools: skipped at spawn — archive not ready"
-+                    );
-+                }
 +            }
 +        }
-+    }
-     let memory_retrieval_mode = configured_memory_retrieval_mode(memory_config.as_ref());
-     let harness_metrics = if !startup_hints.is_subagent
-         && (telemetry_enabled || xai_grok_telemetry::external::is_active())
+         let memory_retrieval_mode = configured_memory_retrieval_mode(memory_config.as_ref());
+         let harness_metrics = if !startup_hints.is_subagent
+             && (telemetry_enabled || xai_grok_telemetry::external::is_active())
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/tool_calls.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/tool_calls.rs
-index 46f83774..836b8579 100644
+index 818462e8..8b3b6475 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/tool_calls.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/tool_calls.rs
-@@ -2914,6 +2914,22 @@ impl SessionActor {
+@@ -2960,6 +2960,22 @@ impl SessionActor {
          Vec<xai_grok_tools::util::base64_images::ExtractedImage>,
      ) {
          use crate::session::acp_conversion::maybe_rewrite;
@@ -2751,10 +3221,10 @@ index 46f83774..836b8579 100644
          let mut inline_images: Vec<ContentPart> = Vec::new();
          let extraction = if !self.is_cursor_harness()
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
-index 7d091d1a..1830f75e 100644
+index 914ae3b8..b867bf78 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
-@@ -1462,6 +1462,40 @@ impl SessionActor {
+@@ -1611,6 +1611,40 @@ impl SessionActor {
                  );
              }
          }
@@ -2795,7 +3265,15 @@ index 7d091d1a..1830f75e 100644
          xai_grok_telemetry::session_ctx::log_session_event(
              crate::agent::session_metrics::TurnCompletedLifecycle {
                  session_id: self.session_info.id.0.to_string(),
-@@ -2606,7 +2640,63 @@ impl SessionActor {
+@@ -2655,6 +2689,7 @@ impl SessionActor {
+         let mut turn_tools_called: Vec<String> = Vec::new();
+         let mut tool_turn_count: usize = 1;
+         let mut loop_index: u32 = 0;
++        let mut last_attempt_identity: Option<SamplerAttemptIdentity> = None;
+         let mut identical_tool_calls = IdenticalToolCallRun::default();
+         let mut todo_gate_fires: u32 = 0;
+         let mut length_salvage_streak = LengthSalvageStreak::default();
+@@ -2929,7 +2964,76 @@ impl SessionActor {
                  })),
              );
              let mut request = request;
@@ -2803,7 +3281,20 @@ index 7d091d1a..1830f75e 100644
 +            // signature admission and response stamping share the exact
 +            // config this attempt will use (FIFO UpdateConfig → Submit).
 +            // Auth-retry / compact-resubmit re-enter this loop and freeze again.
-+            let mut attempt_identity = self.prepare_sampler_for_turn().await;
++            // Parked uncharged-401 resubmits skip prepare: it drives preflight
++            // refreshes. Reuse the last frozen identity; send-time resolver
++            // supplies the bearer (same contract as run_turn_via_sampler).
++            let mut attempt_identity = if turn_parked.is_parked() {
++                // Parked resubmits skip prepare (it drives preflight
++                // refreshes). The previous iteration froze the identity;
++                // never invent an empty model / default backend.
++                last_attempt_identity
++                    .clone()
++                    .expect("parked resubmit must reuse the last frozen SamplerAttemptIdentity")
++            } else {
++                self.prepare_sampler_for_turn().await
++            };
++            last_attempt_identity = Some(attempt_identity.clone());
 +            // LHC-HOOK 4/10: substitute LHC request context after build_request
 +            // (+ live identity for signature gate). Cheap atomic first, then
 +            // per-session registry — no mutex when off. Instrumented-redundant
@@ -2859,15 +3350,15 @@ index 7d091d1a..1830f75e 100644
              request.x_grok_turn_idx =
                  Some(self.chat_state_handle.get_prompt_index().await.to_string());
              request.x_grok_agent_id = Some(xai_grok_telemetry::id::agent_id());
-@@ -2660,6 +2750,7 @@ impl SessionActor {
+@@ -2985,6 +3089,7 @@ impl SessionActor {
                          enabled: transient_retry_enabled,
                      },
                      salvage.awaiting_continuation(),
 +                    &mut attempt_identity,
+                     turn_parked,
                  )
-                 .await
-             {
-@@ -2983,7 +3074,11 @@ impl SessionActor {
+                 .await;
+@@ -3314,7 +3419,11 @@ impl SessionActor {
                      },
                  );
              }
@@ -2879,12 +3370,12 @@ index 7d091d1a..1830f75e 100644
 +            );
              let response_completed = self.response_completed_update(&response);
              if let Some(mut pt) = prompt_timing.take() {
-                 pt.record_stream_latency(
+                 pt.record_stream_latency(latency.time_to_last_byte_ms);
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/types.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/types.rs
-index 8d842c38..baced08b 100644
+index 0132305c..e7167634 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/types.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/types.rs
-@@ -42,6 +42,50 @@ pub(crate) enum SamplerFailureRecovery {
+@@ -57,6 +57,50 @@ pub(crate) enum SamplerFailureRecovery {
      },
  }
  
@@ -3597,7 +4088,7 @@ index 00000000..0a827a69
 +}
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/lhc_real_inference_g2.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/lhc_real_inference_g2.rs
 new file mode 100644
-index 00000000..e5fc5c05
+index 00000000..fc68495e
 --- /dev/null
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/lhc_real_inference_g2.rs
 @@ -0,0 +1,516 @@
@@ -3660,7 +4151,7 @@ index 00000000..e5fc5c05
 +        .map(|i| {
 +            let kind = match i {
 +                ConversationItem::System(_) => "system",
-+                ConversationItem::User(u) if u.synthetic_reason.is_some() => "user_meta",
++                ConversationItem::User(u) if !u.synthetic_reason.is_human() => "user_meta",
 +                ConversationItem::User(_) => "user",
 +                ConversationItem::Assistant(a) if !a.tool_calls.is_empty() => "assistant_tools",
 +                ConversationItem::Assistant(_) => "assistant",
@@ -4359,7 +4850,7 @@ index 00000000..f3a31934
 +        .await;
 +}
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/record_response_token_usage_tests.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/record_response_token_usage_tests.rs
-index b232da71..9cc268b6 100644
+index f686598e..679bd70f 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/record_response_token_usage_tests.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/record_response_token_usage_tests.rs
 @@ -95,7 +95,11 @@ async fn response_reasoning_does_not_inflate_model_reported_context() {
@@ -4414,7 +4905,7 @@ index b232da71..9cc268b6 100644
  
              assert_eq!(actor.chat_state_handle.get_total_tokens().await, 99_999);
          })
-@@ -287,7 +303,11 @@ async fn build_session_info_used_reflects_recorded_response() {
+@@ -286,7 +302,11 @@ async fn build_session_info_used_reflects_recorded_response() {
                  .push_user_message_and_ack(ConversationItem::user("hello hello hello hello"))
                  .await;
  
@@ -4427,7 +4918,7 @@ index b232da71..9cc268b6 100644
  
              let info = actor.build_session_info().await;
              assert_eq!(info.context.used, 120_000);
-@@ -359,6 +379,83 @@ async fn build_session_info_sources_show_model_fingerprint_from_catalog() {
+@@ -358,6 +378,83 @@ async fn build_session_info_sources_show_model_fingerprint_from_catalog() {
          .await;
  }
  
@@ -4511,7 +5002,7 @@ index b232da71..9cc268b6 100644
  /// `record_response_token_usage` must also stash the per-turn `TokenUsage` in chat state.
  /// The next `PromptResponse._meta` carries the input/output token counts to the bot's telemetry.
  #[tokio::test(flavor = "current_thread")]
-@@ -380,8 +477,12 @@ async fn stashes_per_turn_usage_in_chat_state() {
+@@ -379,8 +476,12 @@ async fn stashes_per_turn_usage_in_chat_state() {
                      .is_none()
              );
  
@@ -4527,10 +5018,10 @@ index b232da71..9cc268b6 100644
              let stashed = actor
                  .chat_state_handle
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/rewind_cross_compaction_tests.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/rewind_cross_compaction_tests.rs
-index 108bdada..509b1d9d 100644
+index b05330e6..2ed3c729 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/rewind_cross_compaction_tests.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/rewind_cross_compaction_tests.rs
-@@ -65,6 +65,7 @@ fn write_compacted_session_fixture(session_dir: &std::path::Path, ckpt_id: &str)
+@@ -68,6 +68,7 @@ fn write_compacted_session_fixture(session_dir: &std::path::Path, ckpt_id: &str)
          created_at: "2026-01-01T00:00:00Z".to_string(),
          original_user_info: Some("UI0".to_string()),
          reread_file_paths: vec![],
@@ -4538,7 +5029,7 @@ index 108bdada..509b1d9d 100644
      };
      std::fs::write(
          session_dir.join(format!("compaction_checkpoints/{ckpt_id}.json")),
-@@ -452,3 +453,260 @@ async fn run_forked_rewind_scenario() {
+@@ -508,3 +509,260 @@ async fn run_forked_rewind_scenario() {
          "prompt_index must be reset to the rewind target"
      );
  }
@@ -4811,101 +5302,233 @@ index 63c41fc0..339907fc 100644
      use image::{ImageBuffer, Rgba};
      let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
          ImageBuffer::from_pixel(32, 32, Rgba([128, 64, 32, 255]));
+diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/turn/auth_retry_budget_tests.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/turn/auth_retry_budget_tests.rs
+index dfcdd20c..672c0f0e 100644
+--- a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/turn/auth_retry_budget_tests.rs
++++ b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/turn/auth_retry_budget_tests.rs
+@@ -164,7 +164,6 @@ fn drain_persistence(mut rx: tokio::sync::mpsc::UnboundedReceiver<PersistenceMsg
+ }
+ 
+ /// Shape options for [`session_token_actor`].
+-#[derive(Default)]
+ struct ActorShape {
+     /// Shape the actor like a spawned subagent turn — the only shape that
+     /// gets a 429 wait budget.
+@@ -173,6 +172,24 @@ struct ActorShape {
+     task_output_budget: Option<u64>,
+     /// Flip the `uncharged_401_park` kill switch off.
+     park_disabled: bool,
++    /// Sampler transport retry policy. Default `max_retries: 0` keeps 401
++    /// tests from absorbing retries inside the sampler. Parked 429 coverage
++    /// must disable the sampler's rate-limit loop so the pacer owns the wait.
++    retry_policy: xai_grok_sampler::RetryPolicy,
++}
++
++impl Default for ActorShape {
++    fn default() -> Self {
++        Self {
++            is_subagent: false,
++            task_output_budget: None,
++            park_disabled: false,
++            retry_policy: xai_grok_sampler::RetryPolicy {
++                max_retries: 0,
++                ..Default::default()
++            },
++        }
++    }
+ }
+ 
+ /// Actor wired for session-token auth against the mock server: a real sampler, the `cached_token` method, and the supplied auth manager.
+@@ -182,25 +199,20 @@ async fn session_token_actor(
+     auth_manager: Arc<AuthManager>,
+     shape: ActorShape,
+ ) -> (Arc<SessionActor>, XaiUpdates) {
++    let retry_policy = shape.retry_policy.clone();
+     let sampling_cfg = xai_grok_sampler::SamplerConfig {
+         base_url: server.url(),
+         model: "test".to_string(),
+         api_backend: xai_grok_sampler::ApiBackend::Responses,
+         context_window: 256_000,
+-        max_retries: Some(0),
++        max_retries: Some(retry_policy.max_retries),
+         idle_timeout_secs: Some(30),
+         ..Default::default()
+     };
+     let (sampler_event_tx, sampler_event_rx) =
+         tokio::sync::mpsc::unbounded_channel::<xai_grok_sampler::SamplingEvent>();
+-    let sampler_handle = xai_grok_sampler::SamplerActor::spawn(
+-        sampling_cfg,
+-        xai_grok_sampler::RetryPolicy {
+-            max_retries: 0,
+-            ..Default::default()
+-        },
+-        sampler_event_tx,
+-    );
++    let sampler_handle =
++        xai_grok_sampler::SamplerActor::spawn(sampling_cfg, retry_policy.clone(), sampler_event_tx);
+ 
+     let (gateway_tx, gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+     let xai_updates = drain_gateway(gateway_rx);
+@@ -233,6 +245,11 @@ async fn session_token_actor(
+     cfg.base_url = server.url();
+     cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+     cfg.model = "test".to_string();
++    if retry_policy.rate_limit_retry_threshold == xai_grok_sampler::RATE_LIMIT_RETRY_DISABLED {
++        cfg.max_retries = Some(retry_policy.max_retries);
++        cfg.rate_limit_retry_threshold = Some(retry_policy.rate_limit_retry_threshold);
++        actor.max_retries = retry_policy.max_retries;
++    }
+     actor.chat_state_handle.update_sampling_config(cfg);
+     let mut creds = actor.chat_state_handle.get_credentials().await;
+     creds.api_key = None;
+@@ -792,10 +809,13 @@ async fn parked_429_wait_does_not_drive_refreshes() {
+             let server = MockInferenceServer::start_with_models(vec![MockModelEntry::new("test")])
+                 .await
+                 .expect("mock inference server");
+-            // One 429 rung, then the default 200: exactly one paced wait.
++            // One surfaced 429 (retry-after + sampler rate-limit loop disabled),
++            // then the default 200: exactly one paced wait. JSON 429 with the
++            // default sampler policy is absorbed inside the sampler and never
++            // reaches the pacer.
+             server.enqueue_response(
+                 "/v1/responses",
+-                ScriptedResponse::json(429, serde_json::json!({ "error": "rate limited" })),
++                super::rate_limit_backoff_tests::rate_limited_reply(1),
+             );
+ 
+             let refresher = Arc::new(DeferredRefreshNeverLands::default());
+@@ -807,6 +827,7 @@ async fn parked_429_wait_does_not_drive_refreshes() {
+                 am,
+                 ActorShape {
+                     is_subagent: true,
++                    retry_policy: super::rate_limit_backoff_tests::sampler_surfaces_429(),
+                     ..Default::default()
+                 },
+             )
+@@ -814,6 +835,8 @@ async fn parked_429_wait_does_not_drive_refreshes() {
+ 
+             let request = super::rate_limit_backoff_tests::conversation_request(&actor).await;
+             let mut budget = actor.rate_limit_wait_budget(None);
++            let mut attempt = actor.prepare_sampler_for_turn().await;
++            let preflights_after_prepare = pre_request_calls.load(Ordering::SeqCst);
+             let outcome = tokio::time::timeout(
+                 Duration::from_secs(300),
+                 actor.run_turn_via_sampler(
+@@ -821,6 +844,7 @@ async fn parked_429_wait_does_not_drive_refreshes() {
+                     &mut budget,
+                     transient_state(0, true),
+                     false,
++                    &mut attempt,
+                     TurnParkState::Parked,
+                 ),
+             )
+@@ -832,10 +856,10 @@ async fn parked_429_wait_does_not_drive_refreshes() {
+             );
+             assert_eq!(budget.attempts_used(), 1, "the pacer must own the 429 wait");
+             // The expired token makes every prepare observable: a re-prepare
+-            // during the wait would dispatch at least one preflight refresh.
++            // during the wait would dispatch at least one extra preflight.
+             assert_eq!(
+                 pre_request_calls.load(Ordering::SeqCst),
+-                0,
++                preflights_after_prepare,
+                 "a parked iteration's 429 waits must not drive preflight refreshes"
+             );
+             assert_eq!(
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/turn/rate_limit_backoff_tests.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/turn/rate_limit_backoff_tests.rs
-index a241e5b0..7aa7f6e6 100644
+index c6c978a9..c0797c43 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/turn/rate_limit_backoff_tests.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/turn/rate_limit_backoff_tests.rs
-@@ -173,11 +173,18 @@ async fn subagent_429_wait_is_owned_and_capped_by_the_pacer() {
+@@ -12,7 +12,7 @@ pub(super) enum SessionKind {
+     Subagent,
+ }
+ 
+-fn rate_limited_reply(retry_after_secs: u64) -> ScriptedResponse {
++pub(super) fn rate_limited_reply(retry_after_secs: u64) -> ScriptedResponse {
+     let mut reply = ScriptedResponse::text(429, "concurrent sampling cap exceeded");
+     reply
+         .headers
+@@ -219,6 +219,7 @@ async fn subagent_429_wait_is_owned_and_capped_by_the_pacer() {
              let request = conversation_request(&actor).await;
              let requests_before = server.request_count();
-             let mut budget = actor.rate_limit_wait_budget();
+             let mut budget = actor.rate_limit_wait_budget(None);
 +            let mut attempt = actor.prepare_sampler_for_turn().await;
  
              let started = tokio::time::Instant::now();
              let outcome = tokio::time::timeout(
-                 Duration::from_secs(300),
--                actor.run_turn_via_sampler(request, &mut budget, transient_state(0, true), false),
-+                actor.run_turn_via_sampler(
-+                    request,
-+                    &mut budget,
-+                    transient_state(0, true),
-+                    false,
+@@ -228,6 +229,7 @@ async fn subagent_429_wait_is_owned_and_capped_by_the_pacer() {
+                     &mut budget,
+                     transient_state(0, true),
+                     false,
 +                    &mut attempt,
-+                ),
+                     TurnParkState::Fresh,
+                 ),
              )
-             .await
-             .expect("turn must finish within timeout");
-@@ -222,10 +229,17 @@ async fn paced_wait_notifies_the_client_with_a_retrying_state() {
+@@ -274,6 +276,7 @@ async fn paced_wait_notifies_the_client_with_a_retrying_state() {
                      .await;
              let request = conversation_request(&actor).await;
-             let mut budget = actor.rate_limit_wait_budget();
+             let mut budget = actor.rate_limit_wait_budget(None);
 +            let mut attempt = actor.prepare_sampler_for_turn().await;
  
              let outcome = tokio::time::timeout(
                  Duration::from_secs(30),
--                actor.run_turn_via_sampler(request, &mut budget, transient_state(0, true), false),
-+                actor.run_turn_via_sampler(
-+                    request,
-+                    &mut budget,
-+                    transient_state(0, true),
-+                    false,
+@@ -282,6 +285,7 @@ async fn paced_wait_notifies_the_client_with_a_retrying_state() {
+                     &mut budget,
+                     transient_state(0, true),
+                     false,
 +                    &mut attempt,
-+                ),
+                     TurnParkState::Fresh,
+                 ),
              )
-             .await
-             .expect("turn must finish within timeout");
-@@ -279,10 +293,17 @@ async fn exhausted_subagent_budget_notifies_exhausted_with_the_attempts_taken()
+@@ -339,6 +343,7 @@ async fn exhausted_subagent_budget_notifies_exhausted_with_the_attempts_taken()
                      .await;
              let request = conversation_request(&actor).await;
-             let mut budget = actor.rate_limit_wait_budget();
+             let mut budget = actor.rate_limit_wait_budget(None);
 +            let mut attempt = actor.prepare_sampler_for_turn().await;
  
              let outcome = tokio::time::timeout(
                  Duration::from_secs(60),
--                actor.run_turn_via_sampler(request, &mut budget, transient_state(0, true), false),
-+                actor.run_turn_via_sampler(
-+                    request,
-+                    &mut budget,
-+                    transient_state(0, true),
-+                    false,
+@@ -347,6 +352,7 @@ async fn exhausted_subagent_budget_notifies_exhausted_with_the_attempts_taken()
+                     &mut budget,
+                     transient_state(0, true),
+                     false,
 +                    &mut attempt,
-+                ),
+                     TurnParkState::Fresh,
+                 ),
              )
-             .await
-             .expect("turn must finish within timeout");
-@@ -342,6 +363,7 @@ async fn main_session_429_is_owned_by_the_sampler_never_the_pacer() {
+@@ -410,6 +416,7 @@ async fn main_session_429_is_owned_by_the_sampler_never_the_pacer() {
                  let request = conversation_request(&actor).await;
                  let requests_before = server.request_count();
-                 let mut budget = actor.rate_limit_wait_budget();
+                 let mut budget = actor.rate_limit_wait_budget(None);
 +                let mut attempt = actor.prepare_sampler_for_turn().await;
  
                  let outcome = tokio::time::timeout(
                      Duration::from_secs(30),
-@@ -350,6 +372,7 @@ async fn main_session_429_is_owned_by_the_sampler_never_the_pacer() {
+@@ -418,6 +425,7 @@ async fn main_session_429_is_owned_by_the_sampler_never_the_pacer() {
                          &mut budget,
                          transient_state(0, true),
                          false,
 +                        &mut attempt,
+                         TurnParkState::Fresh,
                      ),
                  )
-                 .await
-@@ -412,6 +435,7 @@ async fn run_burst(n: usize, cap: usize) -> BurstMetrics {
+@@ -481,6 +489,7 @@ async fn run_burst(n: usize, cap: usize) -> BurstMetrics {
          .map(|(actor, request)| {
              tokio::task::spawn_local(async move {
-                 let mut budget = actor.rate_limit_wait_budget();
+                 let mut budget = actor.rate_limit_wait_budget(None);
 +                let mut attempt = actor.prepare_sampler_for_turn().await;
                  tokio::time::timeout(
                      Duration::from_secs(60),
                      actor.run_turn_via_sampler(
-@@ -419,6 +443,7 @@ async fn run_burst(n: usize, cap: usize) -> BurstMetrics {
+@@ -488,6 +497,7 @@ async fn run_burst(n: usize, cap: usize) -> BurstMetrics {
                          &mut budget,
                          transient_state(0, true),
                          false,
 +                        &mut attempt,
+                         TurnParkState::Fresh,
                      ),
                  )
-                 .await
-@@ -463,3 +488,88 @@ async fn subagents_over_cap_all_complete_under_paced_time() {
+@@ -533,3 +543,89 @@ async fn subagents_over_cap_all_complete_under_paced_time() {
          })
          .await;
  }
@@ -4952,7 +5575,7 @@ index a241e5b0..7aa7f6e6 100644
 +                switcher.chat_state_handle.update_sampling_config(cfg);
 +            });
 +
-+            let mut budget = actor.rate_limit_wait_budget();
++            let mut budget = actor.rate_limit_wait_budget(None);
 +            let outcome = tokio::time::timeout(
 +                Duration::from_secs(120),
 +                actor.run_turn_via_sampler(
@@ -4961,6 +5584,7 @@ index a241e5b0..7aa7f6e6 100644
 +                    transient_state(0, true),
 +                    false,
 +                    &mut attempt,
++                    TurnParkState::Fresh,
 +                ),
 +            )
 +            .await
@@ -4995,10 +5619,10 @@ index a241e5b0..7aa7f6e6 100644
 +        .await;
 +}
 diff --git a/crates/codegen/xai-grok-shell/src/session/compaction.rs b/crates/codegen/xai-grok-shell/src/session/compaction.rs
-index 5ce113f0..d851ff51 100644
+index fa132057..7406a7e4 100644
 --- a/crates/codegen/xai-grok-shell/src/session/compaction.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/compaction.rs
-@@ -567,6 +567,16 @@ impl SessionActor {
+@@ -594,6 +594,16 @@ impl SessionActor {
          self: &Arc<Self>,
          user_context: Option<String>,
      ) -> Result<(), acp::Error> {
@@ -5015,7 +5639,7 @@ index 5ce113f0..d851ff51 100644
          let (_cancel, _cancel_scope) = self.compaction.cancel.enter();
          self.record_compaction_variant();
          let total_tokens = self.chat_state_handle.get_total_tokens().await;
-@@ -1780,6 +1790,7 @@ impl SessionActor {
+@@ -1886,6 +1896,7 @@ impl SessionActor {
              prompt_index_at_compaction,
              auto_continue,
              original_user_info,
@@ -5023,7 +5647,7 @@ index 5ce113f0..d851ff51 100644
          );
          let prefix_len = if self
              .compaction
-@@ -1979,6 +1990,168 @@ impl SessionActor {
+@@ -2085,6 +2096,168 @@ impl SessionActor {
          let estimated_total = self.chat_state_handle.get_estimated_total_tokens().await;
          estimated_total > context_window
      }
@@ -5192,7 +5816,7 @@ index 5ce113f0..d851ff51 100644
      /// Pre-sampling compaction check.
      /// Uses `get_estimated_total_tokens()` (exact prior count plus a byte-estimate of items since last response) so tool results are accounted for.
      /// Returns `None` when `is_flushing`.
-@@ -2033,6 +2206,7 @@ impl SessionActor {
+@@ -2140,6 +2313,7 @@ impl SessionActor {
                  trigger_info.tokens_used,
                  trigger_info.context_window,
              );
@@ -5200,7 +5824,7 @@ index 5ce113f0..d851ff51 100644
              return Some(trigger_info);
          }
          None
-@@ -2099,6 +2273,7 @@ impl SessionActor {
+@@ -2207,6 +2381,7 @@ impl SessionActor {
              cfg.context_window.get(),
              trigger_info.percentage,
          );
@@ -5208,7 +5832,7 @@ index 5ce113f0..d851ff51 100644
          if let Err(e) = self.run_compact_only(trigger_info, false).await {
              tracing::error!(error = %e, "Model-switch compaction failed");
              if Self::is_auth_compact_error(&e) {
-@@ -2139,6 +2314,10 @@ impl SessionActor {
+@@ -2247,6 +2422,10 @@ impl SessionActor {
          trigger_info: AutoCompactTriggerInfo,
          lossy_input: bool,
      ) -> Result<(), acp::Error> {
@@ -5218,10 +5842,10 @@ index 5ce113f0..d851ff51 100644
 +        }
          use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
          let (_cancel, _cancel_scope) = self.compaction.cancel.enter();
-         self.record_compaction_variant();
-@@ -2287,12 +2466,13 @@ impl SessionActor {
+         let _compaction_phase = self.turn_phases.begin_compaction();
+@@ -2393,12 +2572,13 @@ impl SessionActor {
+     /// Persist a compaction checkpoint.
      /// Writes the compacted history to a separate file and records a `CompactionCheckpoint` marker in `updates.jsonl`.
-     ///
      /// `auto_continue` should be `Some` when this compaction was triggered by auto-compact and an auto-continue prompt will follow.
 -    fn persist_compaction_checkpoint(
 +    pub(crate) fn persist_compaction_checkpoint(
@@ -5234,7 +5858,7 @@ index 5ce113f0..d851ff51 100644
      ) {
          use crate::extensions::notification::{
              CompactionCheckpointFile, CompactionCheckpointInfo, SessionUpdate as XaiSessionUpdate,
-@@ -2308,6 +2488,7 @@ impl SessionActor {
+@@ -2414,6 +2594,7 @@ impl SessionActor {
              created_at: created_at.clone(),
              original_user_info,
              reread_file_paths: vec![],
@@ -5243,10 +5867,10 @@ index 5ce113f0..d851ff51 100644
          if self
              .notifications
 diff --git a/crates/codegen/xai-grok-shell/src/session/helpers/replay.rs b/crates/codegen/xai-grok-shell/src/session/helpers/replay.rs
-index 67830878..820c57c7 100644
+index 4a1b90f7..67231fd4 100644
 --- a/crates/codegen/xai-grok-shell/src/session/helpers/replay.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/helpers/replay.rs
-@@ -769,6 +769,7 @@ mod tests {
+@@ -737,6 +737,7 @@ mod tests {
              created_at: "2024-01-01T00:00:00Z".to_string(),
              original_user_info: None,
              reread_file_paths: vec![],
@@ -5254,12 +5878,20 @@ index 67830878..820c57c7 100644
          };
          let bytes = serde_json::to_vec_pretty(&file).unwrap();
          std::fs::write(dir.join(format!("{checkpoint_id}.json")), bytes).unwrap();
+@@ -849,6 +850,7 @@ mod tests {
+             created_at: "2024-01-01T00:00:00Z".to_owned(),
+             original_user_info: None,
+             reread_file_paths: vec![],
++            lhc_source_tip: None,
+         };
+         let path = tmp.path().join("compaction_checkpoints/ckpt2.json");
+         std::fs::write(&path, serde_json::to_vec(&newer).unwrap()).unwrap();
 diff --git a/crates/codegen/xai-grok-shell/src/session/lhc_inference.rs b/crates/codegen/xai-grok-shell/src/session/lhc_inference.rs
 new file mode 100644
-index 00000000..c403cd77
+index 00000000..837006de
 --- /dev/null
 +++ b/crates/codegen/xai-grok-shell/src/session/lhc_inference.rs
-@@ -0,0 +1,421 @@
+@@ -0,0 +1,423 @@
 +//! Shell-side [`grok_lhc_host::LhcInferenceSampler`] — dedicated LHC transport.
 +//!
 +//! Builds a fresh client per call (credentials re-resolved via
@@ -5391,6 +6023,7 @@ index 00000000..c403cd77
 +            x_grok_deployment_id: None,
 +            x_grok_user_id: None,
 +            trace: None,
++            traceparent: None,
 +            prompt_cache_key: None,
 +            reasoning_effort: Some(self.thinking_level()),
 +            json_schema: None,
@@ -5445,6 +6078,7 @@ index 00000000..c403cd77
 +        SamplingError::Http(_)
 +        | SamplingError::Api { .. }
 +        | SamplingError::InvalidConfiguration(_)
++        | SamplingError::MtlsConfiguration(_)
 +        | SamplingError::Serialization(_)
 +        | SamplingError::EventStreamError(_)
 +        | SamplingError::StreamError { .. }
@@ -5683,10 +6317,10 @@ index 00000000..c403cd77
 +}
 diff --git a/crates/codegen/xai-grok-shell/src/session/lhc_retrieval_tools.rs b/crates/codegen/xai-grok-shell/src/session/lhc_retrieval_tools.rs
 new file mode 100644
-index 00000000..4b4a044a
+index 00000000..e1f45116
 --- /dev/null
 +++ b/crates/codegen/xai-grok-shell/src/session/lhc_retrieval_tools.rs
-@@ -0,0 +1,422 @@
+@@ -0,0 +1,416 @@
 +//! LHC Wave B retrieval tools — direct ToolBridge registration.
 +//!
 +//! Registered only while capture is active for the owning session. Tools bind
@@ -5856,27 +6490,21 @@ index 00000000..4b4a044a
 +    let turns_schema = retrieval_args_schema("Turn ids, e.g. t211");
 +    let messages_schema = retrieval_args_schema("Message ids, e.g. m3177");
 +
-+    if let Err(e) = bridge
-+        .register_mcp_tools(
-+            GET_TURNS_TOOL_NAME.to_owned(),
-+            GetTurnsTool {
-+                session: session.clone(),
-+            },
-+            Some(turns_schema),
-+        )
-+        .await
-+    {
++    if let Err(e) = bridge.register_mcp_tools(
++        GET_TURNS_TOOL_NAME.to_owned(),
++        GetTurnsTool {
++            session: session.clone(),
++        },
++        Some(turns_schema),
++    ) {
 +        unregister_lhc_retrieval_tools(bridge);
 +        return Err(format!("failed to register get_turns: {e}"));
 +    }
-+    if let Err(e) = bridge
-+        .register_mcp_tools(
-+            GET_MESSAGES_TOOL_NAME.to_owned(),
-+            GetMessagesTool { session },
-+            Some(messages_schema),
-+        )
-+        .await
-+    {
++    if let Err(e) = bridge.register_mcp_tools(
++        GET_MESSAGES_TOOL_NAME.to_owned(),
++        GetMessagesTool { session },
++        Some(messages_schema),
++    ) {
 +        // Roll back turns so the pair is never half-advertised.
 +        unregister_lhc_retrieval_tools(bridge);
 +        return Err(format!("failed to register get_messages: {e}"));
@@ -6110,10 +6738,10 @@ index 00000000..4b4a044a
 +    }
 +}
 diff --git a/crates/codegen/xai-grok-shell/src/session/mod.rs b/crates/codegen/xai-grok-shell/src/session/mod.rs
-index f4834d5e..5564adc0 100644
+index c9617298..b206762c 100644
 --- a/crates/codegen/xai-grok-shell/src/session/mod.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/mod.rs
-@@ -463,6 +463,10 @@ pub mod helpers;
+@@ -539,6 +539,10 @@ pub mod helpers;
  pub(crate) mod image_describe;
  pub(crate) mod image_normalize;
  pub(crate) mod inference_metrics;
@@ -6125,10 +6753,10 @@ index f4834d5e..5564adc0 100644
  pub mod managed_mcp;
  pub(crate) mod mcp_descriptors;
 diff --git a/crates/codegen/xai-grok-shell/src/session/slash_commands.rs b/crates/codegen/xai-grok-shell/src/session/slash_commands.rs
-index 07d1ee80..137eb4bb 100644
+index 123fda59..df005f03 100644
 --- a/crates/codegen/xai-grok-shell/src/session/slash_commands.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/slash_commands.rs
-@@ -136,6 +136,16 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
+@@ -121,6 +121,16 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
          workflow_projection: WorkflowProjection::None,
          resolve: |_args| BuiltinAction::ContextInfo,
      },
@@ -6145,7 +6773,7 @@ index 07d1ee80..137eb4bb 100644
      BuiltinCommand {
          name: "hooks-trust",
          description: "Trust this project for hook execution",
-@@ -1238,6 +1248,10 @@ pub(super) enum BuiltinAction {
+@@ -1214,6 +1224,10 @@ pub(super) enum BuiltinAction {
      FlushMemory,
      Dream,
      ContextInfo,
@@ -6156,7 +6784,7 @@ index 07d1ee80..137eb4bb 100644
      HooksTrust,
      HooksList,
      HooksAdd {
-@@ -1295,6 +1309,43 @@ pub(super) enum BuiltinAction {
+@@ -1268,6 +1282,43 @@ pub(super) enum BuiltinAction {
          input: String,
      },
  }
@@ -6200,7 +6828,7 @@ index 07d1ee80..137eb4bb 100644
  impl BuiltinAction {
      pub(crate) fn command_name(&self) -> &'static str {
          match self {
-@@ -1303,6 +1354,7 @@ impl BuiltinAction {
+@@ -1276,6 +1327,7 @@ impl BuiltinAction {
              BuiltinAction::FlushMemory => "flush",
              BuiltinAction::Dream => "dream",
              BuiltinAction::ContextInfo => "context",
@@ -6208,7 +6836,7 @@ index 07d1ee80..137eb4bb 100644
              BuiltinAction::HooksTrust => "hooks-trust",
              BuiltinAction::HooksList => "hooks-list",
              BuiltinAction::HooksAdd { .. } => "hooks-add",
-@@ -1337,6 +1389,7 @@ impl BuiltinAction {
+@@ -1309,6 +1361,7 @@ impl BuiltinAction {
              BuiltinAction::FlushMemory => false,
              BuiltinAction::Dream => false,
              BuiltinAction::ContextInfo => false,
@@ -6217,7 +6845,7 @@ index 07d1ee80..137eb4bb 100644
              BuiltinAction::HooksList => false,
              BuiltinAction::HooksAdd { .. } => true,
 diff --git a/crates/codegen/xai-grok-shell/src/session/storage/jsonl/copy_tests.rs b/crates/codegen/xai-grok-shell/src/session/storage/jsonl/copy_tests.rs
-index 5541899f..f0093157 100644
+index bc5f88b9..adf23b81 100644
 --- a/crates/codegen/xai-grok-shell/src/session/storage/jsonl/copy_tests.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/storage/jsonl/copy_tests.rs
 @@ -457,6 +457,7 @@ async fn write_checkpoint_file(adapter: &JsonlStorageAdapter, info: &Info, id: &
@@ -6228,26 +6856,8 @@ index 5541899f..f0093157 100644
              },
          )
          .await
-diff --git a/crates/codegen/xai-grok-shell/src/upload/memory_tests.rs b/crates/codegen/xai-grok-shell/src/upload/memory_tests.rs
-index c43ce4bc..c81fac32 100644
---- a/crates/codegen/xai-grok-shell/src/upload/memory_tests.rs
-+++ b/crates/codegen/xai-grok-shell/src/upload/memory_tests.rs
-@@ -2,9 +2,10 @@
- //! build, per-cwd in-flight sharing, flush-deadline detach, and manifest
- //! terminal records.
- use super::*;
--use crate::upload::trace::tests::{
--    assert_artifact_failed, read_tar_gz_entries, test_prompt_trace_ctx,
--};
-+// Fork note (2026-09-04 sync): upstream imports `assert_artifact_failed` and
-+// `test_prompt_trace_ctx` here but neither exists in `trace::tests` as published
-+// (upstream bug, unused names) — trimmed so the lib test target compiles.
-+use crate::upload::trace::tests::read_tar_gz_entries;
- use crate::upload::trace::{ArchiveBuildFault, set_archive_build_fault, spawn_upload_queue};
- #[tokio::test(flavor = "current_thread")]
- #[serial_test::serial(archive_build_fault)]
 diff --git a/crates/codegen/xai-grok-update/Cargo.toml b/crates/codegen/xai-grok-update/Cargo.toml
-index d0e3d849..86ef368e 100644
+index 7302480d..92f27cb9 100644
 --- a/crates/codegen/xai-grok-update/Cargo.toml
 +++ b/crates/codegen/xai-grok-update/Cargo.toml
 @@ -5,6 +5,7 @@ version = "0.1.220-alpha.4"
@@ -6258,7 +6868,15 @@ index d0e3d849..86ef368e 100644
  dunce = { workspace = true }
  anyhow = { workspace = true }
  futures = { workspace = true }
-@@ -30,7 +31,14 @@ zstd = { workspace = true }
+@@ -27,7 +28,6 @@ xai-grok-tools = { workspace = true }
+ xai-grok-version = { workspace = true }
+ flate2 = { workspace = true }
+ zstd = { workspace = true }
+-sha2 = { workspace = true }
+ xai-tty-utils = { workspace = true }
+ # MinGit archive extraction. Not `workspace = true`: the workspace pin has
+ # default features on (aes/bzip2/lzma/zstd); MinGit entries are only deflated.
+@@ -36,7 +36,14 @@ zip = { version = "3", default-features = false, features = ["deflate-flate2"] }
  [target.'cfg(target_os = "macos")'.dependencies]
  libc = { workspace = true }
  
@@ -6274,26 +6892,31 @@ index d0e3d849..86ef368e 100644
  serde_json = { workspace = true }
  serial_test = { workspace = true }
 diff --git a/crates/codegen/xai-grok-update/src/auto_update.rs b/crates/codegen/xai-grok-update/src/auto_update.rs
-index 7a391e7e..25f146a7 100644
+index b95cd59e..f77f33ac 100644
 --- a/crates/codegen/xai-grok-update/src/auto_update.rs
 +++ b/crates/codegen/xai-grok-update/src/auto_update.rs
-@@ -10,6 +10,7 @@ use futures::StreamExt;
- use indicatif::{ProgressBar, ProgressStyle};
+@@ -11,6 +11,7 @@ use indicatif::{ProgressBar, ProgressStyle};
  use tokio::io::AsyncWriteExt;
  
+ use crate::cleanup_downloads::cleanup_old_downloads;
 +use crate::lhc_release::{INSTALLER_LHC_MANAGED, INSTALLER_LHC_UNMANAGED};
  use crate::version::{
      UpdateConfig, fetch_latest_version, get_installed_grok_version, get_latest_version,
      is_version_cache_fresh, try_fetch_stable_pointer, write_version_cache,
-@@ -37,43 +38,35 @@ fn is_stable_channel(channel: &str) -> bool {
+@@ -36,44 +37,39 @@ fn is_stable_channel(channel: &str) -> bool {
+     channel.is_empty() || channel == "stable"
+ }
  
- /// Manual-install one-liner for this platform's bootstrap installer.
- ///
--/// On Unix the variable must prefix `bash` (which runs install.sh), not `curl`.
--/// In `VAR=x curl … | bash` the assignment applies to `curl` only and install.sh would fall back to stable.
+-/// Manual-install one-liner for this platform's bootstrap installer. On Unix the variable must prefix `bash` (which runs
+-/// install.sh), not `curl`. In `VAR=x curl … | bash` the assignment applies to `curl` only and install.sh would fall back
+-/// to stable.
++/// Manual-install one-liner for this platform's bootstrap installer.
++///
 +/// Fork policy: never send users to official x.ai install (would replace LHC).
 +/// Channel-aware API matches upstream signature; non-stable channels still
 +/// point at liminal-ai/grok-build-lhc GitHub Releases (fork has no x.ai CDN).
++/// On Unix, a channel env var must prefix `bash` (which runs install.sh), not
++/// `curl` — but this fork path does not use the x.ai installer.
  fn manual_install_cmd(channel: &str) -> String {
 -    // Only interpolate a well-formed channel ([A-Za-z0-9._-]) into the shell one-liner
 -    // Anything else falls back to stable (a working installer beats a broken quoted command)
@@ -6349,7 +6972,7 @@ index 7a391e7e..25f146a7 100644
      }
  }
  
-@@ -223,7 +216,10 @@ pub fn print_update_status(status: &UpdateStatus, json: bool) -> anyhow::Result<
+@@ -220,7 +216,10 @@ pub fn print_update_status(status: &UpdateStatus, json: bool) -> anyhow::Result<
  
  pub async fn check_update_status(update_config: &UpdateConfig) -> UpdateStatus {
      let installer = get_installer().await.map(|value| value.to_string());
@@ -6361,7 +6984,7 @@ index 7a391e7e..25f146a7 100644
      let current_config = config::load_config().await;
      let auto_update = current_config.cli.auto_update;
      let channel = update_config.channel.clone();
-@@ -245,7 +241,8 @@ pub async fn check_update_status(update_config: &UpdateConfig) -> UpdateStatus {
+@@ -242,7 +241,8 @@ pub async fn check_update_status(update_config: &UpdateConfig) -> UpdateStatus {
          Ok(latest) => match plan_for(&config::VersionPolicy::resolve(), latest) {
              UpdatePlan::Install { target, .. } => {
                  let mut error = None;
@@ -6371,7 +6994,7 @@ index 7a391e7e..25f146a7 100644
                      &current_version,
                      &target,
                      &channel,
-@@ -350,7 +347,7 @@ async fn fetch_update_plan(
+@@ -349,7 +349,7 @@ async fn fetch_update_plan(
  /// Gates on the installer (via `installer_allows_downgrade`) so npm is never downgraded; the decision depends on the installer, never the caller.
  pub async fn auto_update_target(update_config: &UpdateConfig) -> Option<(&'static str, String)> {
      let installer = get_installer().await?;
@@ -6380,7 +7003,7 @@ index 7a391e7e..25f146a7 100644
      let policy = config::VersionPolicy::resolve();
      let UpdatePlan::Install { target, .. } = fetch_update_plan(installer, update_config, &policy)
          .await
-@@ -396,6 +393,9 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
+@@ -392,6 +392,9 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
      let Some(installer) = get_installer().await else {
          return Ok(outcome);
      };
@@ -6390,7 +7013,7 @@ index 7a391e7e..25f146a7 100644
      heal_managed_install(installer).await;
      let allow_downgrade = installer_allows_downgrade(installer);
      let policy = config::VersionPolicy::resolve();
-@@ -406,8 +406,9 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
+@@ -402,8 +405,9 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
      };
  
      let effective_current =
@@ -6402,7 +7025,7 @@ index 7a391e7e..25f146a7 100644
          &effective_current,
          &target,
          &update_config.channel,
-@@ -431,13 +432,18 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
+@@ -427,13 +431,18 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
  
      // Relaunch when the running binary differs from what's on disk in the channel's update direction
      // This covers binaries installed by other processes, not just the install above
@@ -6425,8 +7048,8 @@ index 7a391e7e..25f146a7 100644
      }
      Ok(outcome)
  }
-@@ -451,6 +457,8 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
- /// Unknown installers are treated like npm (no trustworthy disk version).
+@@ -443,6 +452,8 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
+ /// symlink left over from a previous internal install would LIE about the npm install's version.
  fn disk_version_for_installer(installer: &str) -> Option<String> {
      match installer {
 +        // The store's `installed-version` receipt is the managed LHC disk truth.
@@ -6434,7 +7057,7 @@ index 7a391e7e..25f146a7 100644
          "internal" | "gh-release" => crate::version::installed_on_disk_version(),
          _ => None,
      }
-@@ -478,6 +486,15 @@ fn env_installer() -> Option<&'static str> {
+@@ -470,6 +481,15 @@ fn env_installer() -> Option<&'static str> {
  }
  
  pub async fn get_installer() -> Option<&'static str> {
@@ -6450,7 +7073,7 @@ index 7a391e7e..25f146a7 100644
      if let Some(i) = env_installer() {
          return Some(i);
      }
-@@ -505,6 +522,21 @@ fn is_under_node_modules(exe: &std::path::Path) -> bool {
+@@ -497,6 +517,21 @@ fn is_under_node_modules(exe: &std::path::Path) -> bool {
      exe.components().any(|c| c.as_os_str() == "node_modules")
  }
  
@@ -6472,7 +7095,7 @@ index 7a391e7e..25f146a7 100644
  fn needs_update(current: &str, target: &str, channel: &str, allow_downgrade: bool) -> Option<bool> {
      let current = semver::Version::parse(current).ok()?;
      let target = semver::Version::parse(target).ok()?;
-@@ -582,6 +614,9 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
+@@ -568,6 +603,9 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
      let Some(installer) = get_installer().await else {
          return BackgroundUpdateCheck::none();
      };
@@ -6482,7 +7105,7 @@ index 7a391e7e..25f146a7 100644
  
      heal_managed_install(installer).await;
  
-@@ -594,7 +629,7 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
+@@ -580,7 +618,7 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
          return BackgroundUpdateCheck::none();
      }
  
@@ -6491,7 +7114,7 @@ index 7a391e7e..25f146a7 100644
      let policy = config::VersionPolicy::resolve();
      let target_version = match fetch_update_plan(installer, update_config, &policy).await {
          Ok(UpdatePlan::Install { target, .. }) => target,
-@@ -604,7 +639,8 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
+@@ -590,7 +628,8 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
      };
  
      let allow_downgrade = installer_allows_downgrade(installer);
@@ -6501,7 +7124,7 @@ index 7a391e7e..25f146a7 100644
          &current_version,
          &target_version,
          &update_config.channel,
-@@ -671,6 +707,10 @@ pub async fn run_update_if_available(
+@@ -655,6 +694,10 @@ pub async fn run_update_if_available(
          return Ok(false);
      };
  
@@ -6512,7 +7135,7 @@ index 7a391e7e..25f146a7 100644
      heal_managed_install(inst).await;
  
      if is_version_cache_fresh().await {
-@@ -684,9 +724,11 @@ pub async fn run_update_if_available(
+@@ -668,9 +711,11 @@ pub async fn run_update_if_available(
      }
  
      // Resolve effective auto_update: None defaults to true (first-run).
@@ -6525,7 +7148,7 @@ index 7a391e7e..25f146a7 100644
          && let Err(e) = config::update_config(|st| {
              if st.cli.auto_update.is_none() {
                  st.cli.auto_update = Some(true);
-@@ -697,7 +739,7 @@ pub async fn run_update_if_available(
+@@ -681,7 +726,7 @@ pub async fn run_update_if_available(
          tracing::warn!("Failed to save auto-update setting: {}", e);
      }
  
@@ -6534,7 +7157,7 @@ index 7a391e7e..25f146a7 100644
      let policy = config::VersionPolicy::resolve();
      // Don't write version.json here
      // Only cache after confirming no update is needed or after a successful install
-@@ -706,7 +748,8 @@ pub async fn run_update_if_available(
+@@ -690,7 +735,8 @@ pub async fn run_update_if_available(
          Ok(UpdatePlan::Install { target, .. }) => target,
          Ok(UpdatePlan::Skip { .. } | UpdatePlan::Unavailable { .. }) | Err(_) => return Ok(false),
      };
@@ -6544,9 +7167,9 @@ index 7a391e7e..25f146a7 100644
          &current_version,
          &latest_version,
          &update_config.channel,
-@@ -851,6 +894,11 @@ async fn run_update_subcommand(
- /// `current_exe()` resolves symlinks via `/proc/self/exe` (see proc(5)), so it returns the old versioned target after a symlink swap.
- /// Prefer `~/.grok/bin/grok` which always points to the latest version.
+@@ -826,6 +872,11 @@ async fn run_update_subcommand(
+ /// (see proc(5)), so it returns the old versioned target after a symlink swap. Prefer `~/.grok/bin/grok` which always
+ /// points to the latest version.
  fn resolve_restart_exe() -> Result<std::path::PathBuf> {
 +    // Fork: a managed LHC install restarts from its own store, never from `~/.grok/bin/grok`
 +    // (which may be a stock install living side by side).
@@ -6556,7 +7179,7 @@ index 7a391e7e..25f146a7 100644
      let canonical = grok_application();
      if canonical.exists() {
          return Ok(canonical);
-@@ -903,7 +951,7 @@ pub async fn run_install_script(
+@@ -878,7 +929,7 @@ pub async fn run_install_script(
  ) -> Result<()> {
      // What's on disk is being replaced, not this (possibly stale) process's version; npm has no trustworthy disk version, so it falls back
      let from_version =
@@ -6565,7 +7188,7 @@ index 7a391e7e..25f146a7 100644
      let started = Instant::now();
      // Internal reports the version it actually activated; npm/gh-release resolve their own artifact, so the requested target stands in
      let result: Result<Option<String>> = match installer {
-@@ -914,6 +962,11 @@ pub async fn run_install_script(
+@@ -889,6 +940,11 @@ pub async fn run_install_script(
          )
          .map(|()| None),
          "gh-release" => install_gh_release(target).await.map(|()| None),
@@ -6577,10 +7200,12 @@ index 7a391e7e..25f146a7 100644
          _ => install_internal(target, update_config).await.map(Some),
      };
      // Measured before the success-only cache sweep, so the sweep cannot inflate success durations
-@@ -950,6 +1003,68 @@ pub async fn run_install_script(
+@@ -925,8 +981,74 @@ pub async fn run_install_script(
      })
  }
  
+-/// Every update path converges to the native build instead of perpetuating the translated one. That covers interactive
+-/// `grok update`, background `--auto` children, the leader's hourly converge, and forced minimum-version installs.
 +fn is_lhc_installer(installer: &str) -> bool {
 +    installer == INSTALLER_LHC_MANAGED || installer == INSTALLER_LHC_UNMANAGED
 +}
@@ -6643,10 +7268,16 @@ index 7a391e7e..25f146a7 100644
 +    Ok(release)
 +}
 +
- /// Detect the platform (os, arch) to download binaries for.
- ///
- /// Arch is the compile-time arch with one correction: an x86_64 build on an Apple Silicon host (Rosetta) selects `aarch64`.
-@@ -2612,9 +2727,13 @@ pub async fn run_update(
++/// Detect the platform (os, arch) to download binaries for.
++///
++/// Arch is the compile-time arch with one correction: an x86_64 build on an Apple Silicon host (Rosetta) selects `aarch64`.
++/// Every update path converges to the native build instead of perpetuating the translated one.
++/// That covers interactive `grok update`, background `--auto` children, the leader's hourly converge, and forced minimum-version installs.
++/// This mirrors install.sh's `hw.optional.arm64` probe.
+ /// Without it, a lingering x86_64 process would reinstall x86_64 right over a fresh native install.
+ pub(crate) fn detect_platform() -> Result<(&'static str, &'static str)> {
+     let os = if cfg!(target_os = "macos") {
+@@ -2452,9 +2574,13 @@ pub async fn run_update(
              return Ok(None);
          }
      };
@@ -6662,7 +7293,7 @@ index 7a391e7e..25f146a7 100644
          let _ = config::update_config(|st| {
              st.cli.installer = Some(installer.to_string());
          })
-@@ -2623,7 +2742,7 @@ pub async fn run_update(
+@@ -2463,7 +2589,7 @@ pub async fn run_update(
  
      heal_managed_install(installer).await;
  
@@ -6671,7 +7302,7 @@ index 7a391e7e..25f146a7 100644
      let policy = config::VersionPolicy::resolve();
  
      // When --version is given, skip the latest-version check and install directly
-@@ -2638,10 +2757,11 @@ pub async fn run_update(
+@@ -2478,10 +2604,11 @@ pub async fn run_update(
          eprintln!();
          run_install_script(installer, Some(version), update_config, trigger).await?;
          refresh_deployment_config().await;
@@ -6687,7 +7318,7 @@ index 7a391e7e..25f146a7 100644
          {
              tracing::warn!("Failed to persist auto_update=false for pinned install: {e}");
          }
-@@ -2696,7 +2816,8 @@ pub async fn run_update(
+@@ -2534,7 +2661,8 @@ pub async fn run_update(
          disk_version_for_installer(installer).unwrap_or_else(|| current_version.clone());
  
      if !force {
@@ -6697,7 +7328,7 @@ index 7a391e7e..25f146a7 100644
              &effective_current,
              &install_target,
              &update_config.channel,
-@@ -2746,7 +2867,8 @@ pub async fn run_update(
+@@ -2584,7 +2712,8 @@ pub async fn run_update(
      }
  
      let target_version = if force
@@ -6708,7 +7339,7 @@ index 7a391e7e..25f146a7 100644
              &install_target,
              &update_config.channel,
 diff --git a/crates/codegen/xai-grok-update/src/auto_update_tests.rs b/crates/codegen/xai-grok-update/src/auto_update_tests.rs
-index 8b7c58cf..1c1368f5 100644
+index 115fae28..01f125a6 100644
 --- a/crates/codegen/xai-grok-update/src/auto_update_tests.rs
 +++ b/crates/codegen/xai-grok-update/src/auto_update_tests.rs
 @@ -934,76 +934,70 @@ fn test_reinstall_hint_gh_release_mentions_gh_command() {
@@ -6824,7 +7455,7 @@ index 8b7c58cf..1c1368f5 100644
          );
      }
  }
-@@ -2439,3 +2433,476 @@ fn npm_entry_is_recognized_by_the_binary_location() {
+@@ -2446,3 +2440,476 @@ fn npm_entry_is_recognized_by_the_binary_location() {
      assert!(super::is_under_node_modules(&resolved));
      assert!(!super::is_under_node_modules(&root.join("home/bin/grok")));
  }
@@ -8144,17 +8775,19 @@ index 00000000..904ff9be
 +    }
 +}
 diff --git a/crates/codegen/xai-grok-update/src/lib.rs b/crates/codegen/xai-grok-update/src/lib.rs
-index c8a97584..ae341987 100644
+index 8e0d5edd..3f641093 100644
 --- a/crates/codegen/xai-grok-update/src/lib.rs
 +++ b/crates/codegen/xai-grok-update/src/lib.rs
-@@ -1,4 +1,5 @@
+@@ -1,6 +1,7 @@
+ #![deny(clippy::indexing_slicing)]
+ 
  pub mod auto_update;
 +pub mod lhc_release;
+ mod cleanup_downloads;
  pub mod version;
  mod version_policy;
- 
 diff --git a/crates/codegen/xai-grok-update/src/version.rs b/crates/codegen/xai-grok-update/src/version.rs
-index f87df2c7..3e9e1fc5 100644
+index 7bd398e5..6837bd30 100644
 --- a/crates/codegen/xai-grok-update/src/version.rs
 +++ b/crates/codegen/xai-grok-update/src/version.rs
 @@ -11,7 +11,10 @@ use xai_grok_shell::util::grok_home::grok_home;
@@ -8169,16 +8802,16 @@ index f87df2c7..3e9e1fc5 100644
  
  /// Primary CLI base URL: Cloudflare-fronted x.ai endpoint with edge caching for binaries and origin-respecting no-cache for channel pointers.
  pub(crate) const CLI_BASE_URL_PRIMARY: &str = "https://x.ai/cli";
-@@ -41,7 +44,7 @@ pub(crate) fn cli_base_urls() -> Vec<String> {
- 
- /// Parsed, not prefix-matched: `http://127.0.0.1:9@evil.com` starts with a
+@@ -43,7 +46,7 @@ pub(crate) fn cli_base_urls() -> Vec<String> {
  /// loopback prefix but its host is `evil.com` (userinfo trick).
+ /// `https` loopback is allowed so merge CI can smoke rustls/aws-lc against a
+ /// local SHA-512 server (GB-6134); non-loopback https is still rejected.
 -fn is_loopback_base(base: &str) -> bool {
 +pub(crate) fn is_loopback_base(base: &str) -> bool {
      let Ok(u) = url::Url::parse(base) else {
          return false;
      };
-@@ -363,6 +366,10 @@ async fn fetch_gcs_channel_pointer(channel: &str, base_url: &str) -> Result<Stri
+@@ -359,6 +362,10 @@ async fn fetch_gcs_channel_pointer(channel: &str, base_url: &str) -> Result<Stri
  /// Auto-update, for example, should only cache after a successful install or when no update is needed.
  pub async fn fetch_latest_version(installer: &str, config: &UpdateConfig) -> Result<String> {
      match installer {
@@ -8189,17 +8822,17 @@ index f87df2c7..3e9e1fc5 100644
          "npm" => fetch_npm_version(&config.channel, config.npm_registry.as_deref()).await,
          "gh-release" => fetch_gh_release_version(&config.channel).await,
          _ => fetch_gcs_version(&config.channel).await,
-@@ -374,7 +381,7 @@ pub async fn fetch_latest_version(installer: &str, config: &UpdateConfig) -> Res
- ///
- /// `stable_version` records the current stable channel pointer so that `channel_label()` can derive `[alpha]` vs `[stable]` without network I/O.
+@@ -369,7 +376,7 @@ pub async fn fetch_latest_version(installer: &str, config: &UpdateConfig) -> Res
+ /// version is current (no update needed) or after a successful install. `stable_version` records the current stable
+ /// channel pointer so that `channel_label()` can derive `[alpha]` vs `[stable]` without network I/O.
  pub async fn write_version_cache(version: &str, stable_version: Option<&str>) {
 -    let version_path = grok_home().join("version.json");
 +    let version_path = version_cache_path();
      let now = time::OffsetDateTime::now_utc();
      let json = GrokVersion::new(
          version.to_string(),
-@@ -413,14 +420,27 @@ pub async fn write_version_cache(version: &str, stable_version: Option<&str>) {
- /// - `"gh-release"`: uses `gh release list` against GitHub Releases.
+@@ -404,14 +411,27 @@ pub async fn write_version_cache(version: &str, stable_version: Option<&str>) {
+ /// pointer from the public GCS bucket; `"gh-release"`: uses `gh release list` against GitHub Releases.
  pub async fn get_latest_version(installer: &str, config: &UpdateConfig) -> Result<String> {
      let version = fetch_latest_version(installer, config).await?;
 +    if installer == crate::lhc_release::INSTALLER_LHC_UNMANAGED {
@@ -8227,7 +8860,7 @@ index f87df2c7..3e9e1fc5 100644
      let now = time::OffsetDateTime::now_utc();
      if let Ok(version_str) = fs::read_to_string(&version_path).await
          && let Ok(version) = serde_json::from_str::<GrokVersion>(&version_str)
-@@ -507,7 +527,7 @@ pub(crate) async fn try_fetch_stable_pointer() -> Option<String> {
+@@ -478,7 +498,7 @@ pub(crate) async fn try_fetch_stable_pointer() -> Option<String> {
  ///
  /// Returns `None` if the file doesn't exist, can't be parsed, or has no `stable_version` field (e.g. written by an older binary).
  pub fn cached_stable_version() -> Option<String> {

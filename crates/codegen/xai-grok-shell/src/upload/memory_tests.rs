@@ -2,11 +2,7 @@
 //! build, per-cwd in-flight sharing, flush-deadline detach, and manifest
 //! terminal records.
 use super::*;
-// Fork note (2026-09-04 sync): upstream imports `assert_artifact_failed` and
-// `test_prompt_trace_ctx` here but neither exists in `trace::tests` as published
-// (upstream bug, unused names) — trimmed so the lib test target compiles.
 use crate::upload::trace::tests::read_tar_gz_entries;
-use crate::upload::trace::{ArchiveBuildFault, set_archive_build_fault, spawn_upload_queue};
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial(archive_build_fault)]
 async fn memory_archive_build_archives_seeded_root_off_runtime() {

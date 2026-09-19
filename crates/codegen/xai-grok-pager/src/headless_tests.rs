@@ -1,126 +1,24 @@
 use pretty_assertions::assert_eq;
 
 #[test]
-fn lifecycle_tracking_is_independent_of_wait_flag() {
-    let mut pending = std::collections::HashSet::new();
-    let mut completed = std::collections::HashSet::new();
-    super::track_background_lifecycle(
-        super::ExtEvent::TaskBackgrounded {
-            task_id: "t1".into(),
-            is_monitor: false,
-        },
-        &mut pending,
-        &mut completed,
-    );
-    super::track_background_lifecycle(
-        super::ExtEvent::SubagentSpawned {
-            subagent_id: "s1".into(),
-        },
-        &mut pending,
-        &mut completed,
-    );
-    assert!(pending.contains(&super::BackgroundWork::Task("t1".into())));
-    assert!(pending.contains(&super::BackgroundWork::Subagent("s1".into())));
-
-    super::track_background_lifecycle(
-        super::ExtEvent::TaskCompleted {
-            task_id: "t1".into(),
-        },
-        &mut pending,
-        &mut completed,
-    );
-    super::track_background_lifecycle(
-        super::ExtEvent::SubagentFinished {
-            subagent_id: "s1".into(),
-        },
-        &mut pending,
-        &mut completed,
-    );
-    assert!(pending.is_empty());
-}
-
-#[test]
-fn completion_before_backgrounded_never_rearms_pending() {
-    let mut pending = std::collections::HashSet::new();
-    let mut completed = std::collections::HashSet::new();
-    super::track_background_lifecycle(
-        super::ExtEvent::TaskCompleted {
-            task_id: "t1".into(),
-        },
-        &mut pending,
-        &mut completed,
-    );
-    super::track_background_lifecycle(
-        super::ExtEvent::TaskBackgrounded {
-            task_id: "t1".into(),
-            is_monitor: false,
-        },
-        &mut pending,
-        &mut completed,
-    );
-    assert!(pending.is_empty());
-}
-
-/// A late/duplicate `task_backgrounded` must not resurrect a completed task.
-#[test]
-fn duplicate_backgrounded_after_completion_stays_dead() {
-    let mut pending = std::collections::HashSet::new();
-    let mut completed = std::collections::HashSet::new();
-    let bg = || super::ExtEvent::TaskBackgrounded {
-        task_id: "t1".into(),
-        is_monitor: false,
-    };
-    super::track_background_lifecycle(bg(), &mut pending, &mut completed);
-    assert!(pending.contains(&super::BackgroundWork::Task("t1".into())));
-    super::track_background_lifecycle(
-        super::ExtEvent::TaskCompleted {
-            task_id: "t1".into(),
-        },
-        &mut pending,
-        &mut completed,
-    );
-    assert!(pending.is_empty());
-    super::track_background_lifecycle(bg(), &mut pending, &mut completed);
-    assert!(
-        pending.is_empty(),
-        "a backgrounded for an already-completed id must not re-arm pending"
-    );
-}
-
-/// The same tombstone dedup applies to background subagents.
-#[test]
-fn duplicate_subagent_spawn_after_finish_stays_dead() {
-    let mut pending = std::collections::HashSet::new();
-    let mut completed = std::collections::HashSet::new();
-    let spawn = || super::ExtEvent::SubagentSpawned {
-        subagent_id: "s1".into(),
-    };
-    super::track_background_lifecycle(spawn(), &mut pending, &mut completed);
-    super::track_background_lifecycle(
-        super::ExtEvent::SubagentFinished {
-            subagent_id: "s1".into(),
-        },
-        &mut pending,
-        &mut completed,
-    );
-    assert!(pending.is_empty());
-    super::track_background_lifecycle(spawn(), &mut pending, &mut completed);
-    assert!(
-        pending.is_empty(),
-        "a spawn for an already-finished subagent id must not re-arm pending"
-    );
-}
-
-#[test]
 fn reap_request_for_task_kills_with_session_scope() {
     let session_id = acp::SessionId::new("sess-1");
     let work = super::BackgroundWork::Task("task-42".into());
     let request = super::reap_request_for_work(&work, &session_id).unwrap();
     assert_eq!(request.method.as_ref(), "x.ai/task/kill");
     let params: serde_json::Value = serde_json::from_str(request.params.get()).unwrap();
-    assert_eq!(params["sessionId"], "sess-1");
-    assert_eq!(params["taskId"], "task-42");
-    assert_eq!(params["source"], "teardown");
+    assert_eq!(
+        params.get("sessionId").and_then(|v| v.as_str()),
+        Some("sess-1")
+    );
+    assert_eq!(
+        params.get("taskId").and_then(|v| v.as_str()),
+        Some("task-42")
+    );
+    assert_eq!(
+        params.get("source").and_then(|v| v.as_str()),
+        Some("teardown")
+    );
 }
 
 /// A numeric `task_id` is coerced to its string form, tracked, and reaped on exit.
@@ -139,7 +37,7 @@ fn numeric_task_id_is_decoded_tracked_and_reaped() {
     .boxed();
     let event = super::handle_ext_notification(&notif);
     let mut pending = std::collections::HashSet::new();
-    let mut completed = std::collections::HashSet::new();
+    let mut completed = super::BackgroundLifecycleState::default();
     super::track_background_lifecycle(event, &mut pending, &mut completed);
     let work = super::BackgroundWork::Task("4242".into());
     assert!(
@@ -150,9 +48,15 @@ fn numeric_task_id_is_decoded_tracked_and_reaped() {
     let request = super::reap_request_for_work(&work, &session_id).unwrap();
     assert_eq!(request.method.as_ref(), "x.ai/task/kill");
     let params: serde_json::Value = serde_json::from_str(request.params.get()).unwrap();
-    assert_eq!(params["taskId"], "4242");
-    assert_eq!(params["sessionId"], "sess-1");
-    assert_eq!(params["source"], "teardown");
+    assert_eq!(params.get("taskId").and_then(|v| v.as_str()), Some("4242"));
+    assert_eq!(
+        params.get("sessionId").and_then(|v| v.as_str()),
+        Some("sess-1")
+    );
+    assert_eq!(
+        params.get("source").and_then(|v| v.as_str()),
+        Some("teardown")
+    );
 }
 
 #[test]
@@ -162,7 +66,10 @@ fn reap_request_for_subagent_cancels_with_typed_id() {
     let request = super::reap_request_for_work(&work, &session_id).unwrap();
     assert_eq!(request.method.as_ref(), "x.ai/subagent/cancel");
     let params: serde_json::Value = serde_json::from_str(request.params.get()).unwrap();
-    assert_eq!(params["subagentId"], "sub-7");
+    assert_eq!(
+        params.get("subagentId").and_then(|v| v.as_str()),
+        Some("sub-7")
+    );
 }
 
 /// A `task_backgrounded` delivered right at prompt completion is still recorded by the drain.
@@ -185,7 +92,7 @@ fn drain_records_task_backgrounded_delivered_at_exit() {
 
     let mut emitter = HeadlessEmitter::new(OutputFormat::Json, false);
     let mut pending = std::collections::HashSet::new();
-    let mut completed = std::collections::HashSet::new();
+    let mut completed = super::BackgroundLifecycleState::default();
     let mut ttf_logged = false;
     super::drain_pending_acp_messages(
         &mut rx,
@@ -315,10 +222,11 @@ async fn cold_load_acks_task_completed_before_load_session_response() {
             // tombstone only — no pending wait, no lifecycle buffer.
             assert!(
                 inbox
-                    .completed_bg
-                    .contains(&super::BackgroundWork::Task("bg-stale-1".into())),
+                    .background_lifecycle
+                    .completed_tasks
+                    .contains("bg-stale-1"),
                 "stale task_completed must tombstone the task id: {:?}",
-                inbox.completed_bg
+                inbox.background_lifecycle.completed_tasks
             );
             assert!(
                 inbox.pending_bg.is_empty(),
@@ -418,6 +326,183 @@ async fn cold_attach_answers_permission_request_without_deadlock() {
         .await;
 }
 
+/// YOLO cold attach must select AllowOnce rather than cancel, still without
+/// deadlocking the outstanding NewSession oneshot.
+#[tokio::test(flavor = "current_thread")]
+async fn cold_attach_yolo_selects_allow_once_without_deadlock() {
+    use std::time::Duration;
+
+    use xai_acp_lib::{AcpAgentMessage, AcpArgs, AcpClientMessage, acp_channels};
+
+    let (client, mut agent) = acp_channels();
+    let acp_tx = client.tx;
+    let mut acp_rx = client.rx;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let peer = tokio::task::spawn_local(async move {
+                let msg = agent.rx.recv().await.expect("new_session request");
+                let AcpAgentMessage::NewSession(args) = msg else {
+                    panic!("expected NewSession, got {msg:?}");
+                };
+
+                let (perm_tx, perm_rx) = tokio::sync::oneshot::channel();
+                agent
+                    .tx
+                    .send(AcpClientMessage::RequestPermission(AcpArgs {
+                        request: acp::RequestPermissionRequest::new(
+                            acp::SessionId::new("s-yolo"),
+                            acp::ToolCallUpdate::new(
+                                acp::ToolCallId::new(std::sync::Arc::from("tc-yolo")),
+                                acp::ToolCallUpdateFields::default(),
+                            ),
+                            vec![acp::PermissionOption::new(
+                                acp::PermissionOptionId::new(std::sync::Arc::from("allow-once")),
+                                "Allow once",
+                                acp::PermissionOptionKind::AllowOnce,
+                            )],
+                        ),
+                        response_tx: perm_tx,
+                    }))
+                    .unwrap();
+
+                let outcome = tokio::time::timeout(Duration::from_secs(2), perm_rx)
+                    .await
+                    .expect("permission request not answered during yolo cold attach")
+                    .expect("permission oneshot closed");
+                let resp = outcome.expect("permission reply error");
+                match resp.outcome {
+                    acp::RequestPermissionOutcome::Selected(selected) => {
+                        assert_eq!(selected.option_id.0.as_ref(), "allow-once");
+                    }
+                    other => panic!("yolo cold attach must select AllowOnce, got {other:?}"),
+                }
+
+                args.response_tx
+                    .send(Ok(acp::NewSessionResponse::new(acp::SessionId::new(
+                        "s-yolo",
+                    ))))
+                    .unwrap();
+            });
+
+            let mut inbox = super::ColdAttachInbox::default();
+            let resp = tokio::time::timeout(
+                Duration::from_secs(3),
+                super::acp_send_servicing_cold_attach(
+                    acp::NewSessionRequest::new(std::path::PathBuf::from("/tmp")),
+                    &acp_tx,
+                    &mut acp_rx,
+                    &mut inbox,
+                    /*yolo*/ true,
+                ),
+            )
+            .await
+            .expect("new_session deadlocked on unanswered yolo permission")
+            .expect("new_session ok");
+            assert_eq!(resp.session_id.0.as_ref(), "s-yolo");
+            peer.await.expect("peer");
+        })
+        .await;
+}
+
+/// Live `task_backgrounded` during cold load must arm wait-for-background
+/// (`pending_bg`) rather than the quiet completed-task tombstone used for
+/// stale `task_completed`.
+#[tokio::test(flavor = "current_thread")]
+async fn cold_load_task_backgrounded_arms_pending_lifecycle() {
+    use std::time::Duration;
+
+    use xai_acp_lib::{AcpAgentMessage, AcpArgs, AcpClientMessage, acp_channels};
+
+    let (client, mut agent) = acp_channels();
+    let acp_tx = client.tx;
+    let mut acp_rx = client.rx;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let peer = tokio::task::spawn_local(async move {
+                let msg = agent
+                    .rx
+                    .recv()
+                    .await
+                    .expect("client must send session/load");
+                let AcpAgentMessage::LoadSession(args) = msg else {
+                    panic!("expected LoadSession, got {msg:?}");
+                };
+
+                let payload = serde_json::json!({
+                    "sessionId": "s-bg-load",
+                    "update": {
+                        "sessionUpdate": "task_backgrounded",
+                        "task_id": "bg-live-1",
+                    },
+                });
+                let raw = serde_json::value::to_raw_value(&payload).unwrap();
+                let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+                agent
+                    .tx
+                    .send(AcpClientMessage::ExtNotification(AcpArgs {
+                        request: acp::ExtNotification::new("x.ai/task_backgrounded", raw.into()),
+                        response_tx: completion_tx,
+                    }))
+                    .expect("enqueue task_backgrounded while load outstanding");
+
+                tokio::time::timeout(Duration::from_secs(2), completion_rx)
+                    .await
+                    .expect("task_backgrounded was not acknowledged during session/load")
+                    .expect("task_backgrounded oneshot closed")
+                    .expect("task_backgrounded ack");
+
+                args.response_tx
+                    .send(Ok(acp::LoadSessionResponse::new()))
+                    .expect("deliver LoadSessionResponse after nested ack");
+            });
+
+            let mut inbox = super::ColdAttachInbox::default();
+            let load = super::acp_send_servicing_cold_attach(
+                acp::LoadSessionRequest::new(
+                    acp::SessionId::new("s-bg-load"),
+                    std::path::PathBuf::from("/tmp"),
+                )
+                .meta({
+                    let mut m = acp::Meta::new();
+                    m.insert("noReplay".into(), serde_json::Value::Bool(true));
+                    Some(m)
+                }),
+                &acp_tx,
+                &mut acp_rx,
+                &mut inbox,
+                /*yolo*/ false,
+            );
+
+            tokio::time::timeout(Duration::from_secs(3), load)
+                .await
+                .expect("session/load deadlocked on task_backgrounded")
+                .expect("session/load should succeed");
+
+            assert!(
+                inbox
+                    .pending_bg
+                    .contains(&super::BackgroundWork::Task("bg-live-1".into())),
+                "live task_backgrounded must arm pending work: {:?}",
+                inbox.pending_bg
+            );
+            assert!(
+                !inbox
+                    .background_lifecycle
+                    .completed_tasks
+                    .contains("bg-live-1"),
+                "live backgrounded task is not a completed tombstone: {:?}",
+                inbox.background_lifecycle.completed_tasks
+            );
+
+            peer.await.expect("peer task");
+        })
+        .await;
+}
+
 /// `begin_session` runs before the model and effort are applied, so a post-open error carries the real context.
 #[test]
 fn post_open_error_carries_real_session_context() {
@@ -425,10 +510,11 @@ fn post_open_error_carries_real_session_context() {
     let pre_lines = pre.error("boom", None, 0, None);
     let pre_result = pre_lines
         .iter()
-        .find(|l| l["type"] == "result")
+        .find(|l| l.get("type").and_then(|t| t.as_str()) == Some("result"))
         .expect("result line");
     assert_eq!(
-        pre_result["session_id"], "",
+        pre_result.get("session_id").and_then(|v| v.as_str()),
+        Some(""),
         "pre-session error keeps the startup-error fallback"
     );
 
@@ -446,18 +532,25 @@ fn post_open_error_carries_real_session_context() {
     let post_lines = post.error("boom", None, 0, None);
     let post_result = post_lines
         .iter()
-        .find(|l| l["type"] == "result")
+        .find(|l| l.get("type").and_then(|t| t.as_str()) == Some("result"))
         .expect("result line");
     assert_eq!(
-        post_result["session_id"], "sess-real",
+        post_result.get("session_id").and_then(|v| v.as_str()),
+        Some("sess-real"),
         "post-open error carries the real session id"
     );
     let init = post_lines
         .iter()
-        .find(|l| l["type"] == "system" && l["subtype"] == "init")
+        .find(|l| {
+            l.get("type").and_then(|t| t.as_str()) == Some("system")
+                && l.get("subtype").and_then(|s| s.as_str()) == Some("init")
+        })
         .expect("system/init line");
-    assert_eq!(init["session_id"], "sess-real");
-    assert_eq!(init["cwd"], "/work/dir");
+    assert_eq!(
+        init.get("session_id").and_then(|v| v.as_str()),
+        Some("sess-real")
+    );
+    assert_eq!(init.get("cwd").and_then(|v| v.as_str()), Some("/work/dir"));
 }
 
 use super::*;
@@ -467,27 +560,25 @@ fn s(v: &str) -> String {
     v.to_owned()
 }
 
-/// Headless materialization is never chat and carries the pre-sandbox pin flag through.
 #[test]
 fn headless_materialize_ctx_stays_non_chat() {
     use crate::app::session_startup::TitleResolution;
     for pinned in [false, true] {
         for restore_code in [false, true] {
-            let ctx = headless_materialize_ctx(pinned, restore_code);
-            assert!(!ctx.chat_mode);
-            assert!(
-                !ctx.has_worktree,
-                "headless must not defer remote miss to a worktree it never creates"
-            );
-            assert_eq!(ctx.restore_code, restore_code);
-            assert_eq!(
-                ctx.title_resolution,
-                if pinned {
-                    TitleResolution::PinnedPreSandbox
-                } else {
-                    TitleResolution::Allowed
-                }
-            );
+            for has_worktree in [false, true] {
+                let ctx = headless_materialize_ctx(pinned, restore_code, has_worktree);
+                assert!(!ctx.chat_mode);
+                assert_eq!(ctx.has_worktree, has_worktree);
+                assert_eq!(ctx.restore_code, restore_code);
+                assert_eq!(
+                    ctx.title_resolution,
+                    if pinned {
+                        TitleResolution::PinnedPreSandbox
+                    } else {
+                        TitleResolution::Allowed
+                    }
+                );
+            }
         }
     }
 }
@@ -496,19 +587,19 @@ fn headless_materialize_ctx_stays_non_chat() {
 fn headless_remote_miss_restores_conversation_instead_of_deferring_worktree() {
     use crate::app::session_startup::{RemoteMissPlan, plan_remote_miss};
     for restore_code in [false, true] {
-        let ctx = headless_materialize_ctx(false, restore_code);
+        let ctx = headless_materialize_ctx(false, restore_code, false);
         assert!(!matches!(
             plan_remote_miss(ctx, true),
             RemoteMissPlan::DeferToWorktree { .. }
         ));
     }
-    let mut conv = headless_materialize_ctx(false, false);
+    let mut conv = headless_materialize_ctx(false, false, false);
     conv.allow_remote_restore = true;
     assert_eq!(
         plan_remote_miss(conv, true),
         RemoteMissPlan::RestoreConversation
     );
-    let mut code = headless_materialize_ctx(false, true);
+    let mut code = headless_materialize_ctx(false, true, false);
     code.allow_remote_restore = true;
     assert_eq!(
         plan_remote_miss(code, true),
@@ -519,17 +610,406 @@ fn headless_remote_miss_restores_conversation_instead_of_deferring_worktree() {
 }
 
 #[test]
+fn headless_remote_miss_defers_to_worktree_when_requested() {
+    use crate::app::session_startup::{RemoteMissPlan, plan_remote_miss};
+    for restore_code in [false, true] {
+        let ctx = headless_materialize_ctx(false, restore_code, true);
+        assert_eq!(
+            plan_remote_miss(ctx, true),
+            RemoteMissPlan::DeferToWorktree {
+                deferred_local_miss: false,
+            }
+        );
+    }
+}
+
+/// Fake agent for the worktree paths: answers the extension method with `ext_reply`, then
+/// `session/new` and `session/load` as directed. Records every request for assertions.
+#[derive(Default)]
+struct FakeAgentLog {
+    ext: Vec<(String, serde_json::Value)>,
+    new_sessions: Vec<(std::path::PathBuf, Option<acp::Meta>)>,
+    loads: Vec<(String, std::path::PathBuf, Option<acp::Meta>)>,
+}
+
+fn spawn_fake_agent(
+    ext_reply: serde_json::Value,
+    session_open: Result<&'static str, &'static str>,
+) -> (
+    xai_acp_lib::AcpAgentTx,
+    std::sync::Arc<std::sync::Mutex<FakeAgentLog>>,
+) {
+    use std::sync::{Arc, Mutex};
+    use xai_acp_lib::AcpAgentMessage;
+    let log = Arc::new(Mutex::new(FakeAgentLog::default()));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AcpAgentMessage>();
+    let log_for_task = log.clone();
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                AcpAgentMessage::ExtMethod(args) => {
+                    let params: serde_json::Value =
+                        serde_json::from_str(args.request.params.get()).unwrap();
+                    log_for_task
+                        .lock()
+                        .unwrap()
+                        .ext
+                        .push((args.request.method.to_string(), params));
+                    let raw = serde_json::value::to_raw_value(&ext_reply).unwrap();
+                    let _ = args
+                        .response_tx
+                        .send(Ok(acp::ExtResponse::new(Arc::from(raw))));
+                }
+                AcpAgentMessage::NewSession(args) => {
+                    log_for_task
+                        .lock()
+                        .unwrap()
+                        .new_sessions
+                        .push((args.request.cwd.clone(), args.request.meta.clone()));
+                    // Like the agent, a `meta.sessionId` names the new session; otherwise mint one.
+                    let forced = args
+                        .request
+                        .meta
+                        .as_ref()
+                        .and_then(|m| m.get("sessionId"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned);
+                    let _ = args.response_tx.send(match session_open {
+                        Ok(sid) => Ok(acp::NewSessionResponse::new(
+                            forced.unwrap_or_else(|| sid.to_owned()),
+                        )),
+                        Err(msg) => Err(acp::Error::internal_error().data(msg)),
+                    });
+                }
+                AcpAgentMessage::LoadSession(args) => {
+                    log_for_task.lock().unwrap().loads.push((
+                        args.request.session_id.0.to_string(),
+                        args.request.cwd.clone(),
+                        args.request.meta.clone(),
+                    ));
+                    let _ = args.response_tx.send(match session_open {
+                        Ok(_) => Ok(acp::LoadSessionResponse::new()),
+                        Err(msg) => Err(acp::Error::internal_error().data(msg)),
+                    });
+                }
+                _ => {}
+            }
+        }
+    });
+    (tx, log)
+}
+
+#[tokio::test]
+async fn worktree_create_opens_session_at_worktree_subdirectory() {
+    let source = tempfile::tempdir().unwrap();
+    let launch_cwd = source.path().join("crates").join("pager");
+    std::fs::create_dir_all(&launch_cwd).unwrap();
+    let wt_root = tempfile::tempdir().unwrap();
+    let (tx, log) = spawn_fake_agent(
+        serde_json::json!({"result": {
+            "worktreePath": wt_root.path(),
+            "sourceGitRoot": source.path(),
+        }}),
+        Ok("sess-new"),
+    );
+    let spec = WorktreeSpec::from_cli(Some("fix"), Some("origin/main")).unwrap();
+
+    let (_client_tx, mut acp_rx) = tokio::sync::mpsc::unbounded_channel();
+    let opened = open_session_in_new_worktree(&tx, &mut acp_rx, &launch_cwd, &spec, None, false)
+        .await
+        .unwrap();
+
+    assert_eq!(opened.session_id.0.as_ref(), "sess-new");
+    assert_eq!(opened.cwd, wt_root.path().join("crates").join("pager"));
+    let log = log.lock().unwrap();
+    let Some((method, params)) = log.ext.first() else {
+        panic!("expected an ext call: {:?}", log.ext);
+    };
+    assert_eq!(method, "x.ai/git/worktree/create_from_worktree_sync");
+    assert_eq!(
+        params.get("sourceWorktreePath").and_then(|v| v.as_str()),
+        Some(launch_cwd.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        params.get("copyMode").and_then(|v| v.as_str()),
+        Some("clean")
+    );
+    assert_eq!(params.get("label").and_then(|v| v.as_str()), Some("fix"));
+    assert_eq!(
+        params.get("gitRef").and_then(|v| v.as_str()),
+        Some("origin/main")
+    );
+    assert!(
+        params
+            .get("newSessionId")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.starts_with("pager-"))
+    );
+    assert_eq!(log.new_sessions.len(), 1);
+    assert_eq!(log.new_sessions.first().map(|s| &s.0), Some(&opened.cwd));
+    assert!(log.loads.is_empty());
+}
+
+#[tokio::test]
+async fn worktree_create_with_session_id_names_worktree_and_session() {
+    let source = tempfile::tempdir().unwrap();
+    let wt_root = tempfile::tempdir().unwrap();
+    let (tx, log) = spawn_fake_agent(
+        serde_json::json!({"worktreePath": wt_root.path()}),
+        Ok("minted-if-not-forced"),
+    );
+    let sid = "2d3c6b3e-3d43-4f0a-9d2e-2b6d1b6a9c11";
+
+    let (_client_tx, mut acp_rx) = tokio::sync::mpsc::unbounded_channel();
+    let opened = open_session_in_new_worktree(
+        &tx,
+        &mut acp_rx,
+        source.path(),
+        &WorktreeSpec::default(),
+        Some(sid),
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(opened.session_id.0.as_ref(), sid);
+    assert_eq!(opened.cwd, wt_root.path());
+    let log = log.lock().unwrap();
+    let Some((_, params)) = log.ext.first() else {
+        panic!("expected an ext call: {:?}", log.ext);
+    };
+    assert_eq!(
+        params.get("newSessionId").and_then(|v| v.as_str()),
+        Some(sid)
+    );
+    assert_eq!(
+        params.get("copyMode").and_then(|v| v.as_str()),
+        Some("dirty")
+    );
+    let meta = log
+        .new_sessions
+        .first()
+        .and_then(|s| s.1.as_ref())
+        .expect("session id forced via meta");
+    assert_eq!(meta.get("sessionId").and_then(|v| v.as_str()), Some(sid));
+}
+
+#[tokio::test]
+async fn worktree_create_failure_is_reported_before_any_session_opens() {
+    let source = tempfile::tempdir().unwrap();
+    for (reply, expect) in [
+        (
+            serde_json::json!({"error": "no space left for worktree"}),
+            "no space left for worktree",
+        ),
+        (
+            serde_json::json!({"result": {}}),
+            "response missing worktreePath",
+        ),
+    ] {
+        let (tx, log) = spawn_fake_agent(reply, Ok("never"));
+        let (_client_tx, mut acp_rx) = tokio::sync::mpsc::unbounded_channel();
+        let err = open_session_in_new_worktree(
+            &tx,
+            &mut acp_rx,
+            source.path(),
+            &WorktreeSpec::default(),
+            None,
+            false,
+        )
+        .await
+        .err()
+        .expect("worktree create must fail")
+        .to_string();
+        assert!(err.contains("couldn't create worktree"), "{err}");
+        assert!(err.contains(expect), "{err}");
+        assert!(log.lock().unwrap().new_sessions.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn worktree_create_then_session_failure_names_the_orphaned_worktree() {
+    let source = tempfile::tempdir().unwrap();
+    let wt_root = tempfile::tempdir().unwrap();
+    let (tx, _log) = spawn_fake_agent(
+        serde_json::json!({"worktreePath": wt_root.path()}),
+        Err("agent refused"),
+    );
+
+    let (_client_tx, mut acp_rx) = tokio::sync::mpsc::unbounded_channel();
+    let err = open_session_in_new_worktree(
+        &tx,
+        &mut acp_rx,
+        source.path(),
+        &WorktreeSpec::default(),
+        None,
+        false,
+    )
+    .await
+    .err()
+    .expect("session open after worktree create must fail")
+    .to_string();
+
+    assert!(err.contains("agent refused"), "{err}");
+    assert!(err.contains(&wt_root.path().display().to_string()), "{err}");
+    assert!(err.contains("grok worktree rm"), "{err}");
+}
+
+#[tokio::test]
+async fn worktree_resume_loads_reported_session_without_re_restoring_code() {
+    let source = tempfile::tempdir().unwrap();
+    let wt_root = tempfile::tempdir().unwrap();
+    let eff_cwd = wt_root.path().join("sub");
+    let (tx, log) = spawn_fake_agent(
+        serde_json::json!({"result": {
+            "sessionId": "forked-in-worktree",
+            "worktreePath": wt_root.path(),
+            "effectiveCwd": eff_cwd,
+            "codeRestored": true,
+        }}),
+        Ok("unused"),
+    );
+    let spec = WorktreeSpec::from_cli(Some(""), Some("v1.2")).unwrap();
+
+    let (_client_tx, mut acp_rx) = tokio::sync::mpsc::unbounded_channel();
+    let opened = resume_session_in_new_worktree(
+        &tx,
+        &mut acp_rx,
+        source.path(),
+        &spec,
+        "orig",
+        Some(true),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(opened.session_id.0.as_ref(), "forked-in-worktree");
+    assert_eq!(opened.cwd, eff_cwd);
+    let log = log.lock().unwrap();
+    let Some((method, params)) = log.ext.first() else {
+        panic!("expected an ext call: {:?}", log.ext);
+    };
+    assert_eq!(method, "x.ai/git/worktree/resume_session");
+    assert_eq!(
+        params.get("sessionId").and_then(|v| v.as_str()),
+        Some("orig")
+    );
+    assert_eq!(
+        params.get("sourceCwd").and_then(|v| v.as_str()),
+        Some(source.path().to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        params.get("copyMode").and_then(|v| v.as_str()),
+        Some("clean")
+    );
+    assert_eq!(params.get("gitRef").and_then(|v| v.as_str()), Some("v1.2"));
+    assert_eq!(
+        params.get("restoreCode").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert!(params.get("worktreeType").is_some());
+    let Some((loaded_sid, loaded_cwd, meta)) = log.loads.first() else {
+        panic!("expected a load: {:?}", log.loads);
+    };
+    assert_eq!(loaded_sid, "forked-in-worktree");
+    assert_eq!(loaded_cwd, &eff_cwd);
+    let meta = meta.as_ref().unwrap();
+    assert_eq!(meta.get("noReplay").and_then(|v| v.as_bool()), Some(true));
+    assert!(
+        meta.get("x.ai/restore_code").is_none(),
+        "load must not request code restore a second time"
+    );
+    assert!(log.new_sessions.is_empty());
+}
+
+#[tokio::test]
+async fn worktree_resume_failure_carries_local_miss_hint_like_the_tui() {
+    let source = tempfile::tempdir().unwrap();
+    let (tx, _log) = spawn_fake_agent(serde_json::json!({"error": "archive unavailable"}), Ok("x"));
+    let spec = WorktreeSpec::default();
+
+    let (_client_tx, mut acp_rx) = tokio::sync::mpsc::unbounded_channel();
+    let hinted = resume_session_in_new_worktree(
+        &tx,
+        &mut acp_rx,
+        source.path(),
+        &spec,
+        "my title",
+        None,
+        true,
+        false,
+    )
+    .await
+    .err()
+    .expect("hinted worktree resume must fail")
+    .to_string();
+    let (_client_tx2, mut acp_rx2) = tokio::sync::mpsc::unbounded_channel();
+    let plain = resume_session_in_new_worktree(
+        &tx,
+        &mut acp_rx2,
+        source.path(),
+        &spec,
+        "my title",
+        None,
+        false,
+        false,
+    )
+    .await
+    .err()
+    .expect("plain worktree resume must fail")
+    .to_string();
+
+    assert_eq!(
+        plain,
+        crate::app::session_title_resolve::worktree_resume_failure_message(
+            None,
+            "archive unavailable"
+        )
+    );
+    assert_eq!(
+        hinted,
+        crate::app::session_title_resolve::worktree_resume_failure_message(
+            Some("my title"),
+            "archive unavailable"
+        )
+    );
+    assert_ne!(hinted, plain);
+}
+
+#[test]
+fn worktree_with_fork_is_rejected_at_intent() {
+    use crate::app::session_startup::{
+        SessionStartupFlags, StartupFlagError, session_startup_intent_from_flags,
+    };
+    let err = session_startup_intent_from_flags(SessionStartupFlags {
+        session_id: None,
+        resume_session_id: Some("01a06380-62b5-7881-b173-c69cd2c213fd"),
+        resume_most_recent: false,
+        continue_last_session: false,
+        fork_session: true,
+        has_worktree: true,
+    })
+    .unwrap_err();
+    assert!(matches!(err, StartupFlagError::ForkWithWorktree));
+}
+
+#[test]
 fn strict_valid_rules_parse_deny_before_allow() {
     let allow = vec![s("Bash(npm*)")];
     let deny = vec![s("Bash(rm*)"), s("Edit(/etc/**)")];
     let rules = parse_permission_rules_strict(&allow, &deny).unwrap();
     assert_eq!(rules.len(), 3);
-    assert_eq!(rules[0].action, RuleAction::Deny);
-    assert!(matches!(rules[0].tool, ToolFilter::Bash));
-    assert_eq!(rules[1].action, RuleAction::Deny);
-    assert!(matches!(rules[1].tool, ToolFilter::Edit));
-    assert_eq!(rules[2].action, RuleAction::Allow);
-    assert!(matches!(rules[2].tool, ToolFilter::Bash));
+    let [r0, r1, r2] = rules.as_slice() else {
+        panic!("expected three rules: {rules:?}");
+    };
+    assert_eq!(r0.action, RuleAction::Deny);
+    assert!(matches!(r0.tool, ToolFilter::Bash));
+    assert_eq!(r1.action, RuleAction::Deny);
+    assert!(matches!(r1.tool, ToolFilter::Edit));
+    assert_eq!(r2.action, RuleAction::Allow);
+    assert!(matches!(r2.tool, ToolFilter::Bash));
 }
 
 #[test]
@@ -562,10 +1042,13 @@ fn lenient_skips_invalid_keeps_valid() {
     let deny = vec![s("EnterWorktree(foo)"), s("Bash(rm*)")];
     let rules = parse_permission_rules_lenient(&allow, &deny);
     assert_eq!(rules.len(), 2);
-    assert_eq!(rules[0].action, RuleAction::Deny);
-    assert_eq!(rules[0].pattern.as_deref(), Some("rm*"));
-    assert_eq!(rules[1].action, RuleAction::Allow);
-    assert_eq!(rules[1].pattern.as_deref(), Some("npm*"));
+    let [r0, r1] = rules.as_slice() else {
+        panic!("expected two rules: {rules:?}");
+    };
+    assert_eq!(r0.action, RuleAction::Deny);
+    assert_eq!(r0.pattern.as_deref(), Some("rm*"));
+    assert_eq!(r1.action, RuleAction::Allow);
+    assert_eq!(r1.pattern.as_deref(), Some("npm*"));
 }
 
 #[test]
@@ -580,20 +1063,26 @@ fn empty_inputs_produce_empty_rules() {
 fn domain_mode_web_fetch() {
     let rules = parse_permission_rules_strict(&[], &[s("WebFetch(domain:evil.com)")]).unwrap();
     assert_eq!(rules.len(), 1);
-    assert!(matches!(rules[0].tool, ToolFilter::WebFetch));
+    let Some(rule) = rules.first() else {
+        panic!("expected a WebFetch rule: {rules:?}");
+    };
+    assert!(matches!(rule.tool, ToolFilter::WebFetch));
     assert_eq!(
-        rules[0].pattern_mode,
+        rule.pattern_mode,
         xai_grok_workspace::permission::types::PatternMode::Domain
     );
-    assert_eq!(rules[0].pattern.as_deref(), Some("evil.com"));
+    assert_eq!(rule.pattern.as_deref(), Some("evil.com"));
 }
 
 #[test]
 fn bash_colon_wildcard_deny_translates_to_prefix() {
     let rules = parse_permission_rules_strict(&[], &[s("Bash(sed:*)")]).unwrap();
     assert_eq!(rules.len(), 1);
-    assert!(matches!(rules[0].tool, ToolFilter::Bash));
-    assert_eq!(rules[0].pattern.as_deref(), Some("sed"));
+    let Some(rule) = rules.first() else {
+        panic!("expected a Bash rule: {rules:?}");
+    };
+    assert!(matches!(rule.tool, ToolFilter::Bash));
+    assert_eq!(rule.pattern.as_deref(), Some("sed"));
 }
 
 #[test]
@@ -602,10 +1091,10 @@ fn structured_output_without_meta_errors_never_parses_text() {
     emitter.text_buffer = r#"{"name":"alice","age":30}"#.into();
     emitter.set_structured_output_from_meta(serde_json::json!({}).as_object());
     let result = emitter.build_json_result("EndTurn", "sess-1", "req-1");
-    assert!(result["structuredOutput"].is_null());
+    assert!(result.get("structuredOutput").is_none_or(|v| v.is_null()));
     assert_eq!(
-        result["structuredOutputError"],
-        "model did not produce structured output"
+        result.get("structuredOutputError").and_then(|v| v.as_str()),
+        Some("model did not produce structured output")
     );
 }
 
@@ -617,7 +1106,13 @@ fn structured_output_from_meta_wins_over_text_buffer() {
         serde_json::json!({"structuredOutput": {"name": "carol"}}).as_object(),
     );
     let result = emitter.build_json_result("EndTurn", "sess-1", "req-1");
-    assert_eq!(result["structuredOutput"]["name"], "carol");
+    assert_eq!(
+        result
+            .get("structuredOutput")
+            .and_then(|o| o.get("name"))
+            .and_then(|n| n.as_str()),
+        Some("carol")
+    );
     assert!(result.get("structuredOutputError").is_none());
 
     let mut emitter = HeadlessEmitter::new(OutputFormat::Json, true);
@@ -628,10 +1123,10 @@ fn structured_output_from_meta_wins_over_text_buffer() {
         .as_object(),
     );
     let result = emitter.build_json_result("EndTurn", "sess-1", "req-1");
-    assert!(result["structuredOutput"].is_null());
+    assert!(result.get("structuredOutput").is_none_or(|v| v.is_null()));
     assert_eq!(
-        result["structuredOutputError"],
-        "output does not match the required schema"
+        result.get("structuredOutputError").and_then(|v| v.as_str()),
+        Some("output does not match the required schema")
     );
 }
 
@@ -647,7 +1142,13 @@ fn streaming_json_structured_output_emits_from_meta() {
     );
     let mut target = serde_json::json!({});
     emitter.attach_structured_output(&mut target);
-    assert_eq!(target["structuredOutput"]["name"], "bob");
+    assert_eq!(
+        target
+            .get("structuredOutput")
+            .and_then(|o| o.get("name"))
+            .and_then(|n| n.as_str()),
+        Some("bob")
+    );
     assert!(target.get("structuredOutputError").is_none());
 }
 
@@ -731,7 +1232,7 @@ fn handler_answers_ext_method_instead_of_dropping() {
     });
     let mut emitter = super::HeadlessEmitter::new(super::OutputFormat::Json, false);
     let mut pending = std::collections::HashSet::new();
-    let mut completed = std::collections::HashSet::new();
+    let mut completed = super::BackgroundLifecycleState::default();
     let mut ttf_logged = false;
     super::handle_headless_acp_message(
         msg.boxed(),

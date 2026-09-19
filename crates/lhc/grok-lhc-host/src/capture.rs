@@ -969,7 +969,7 @@ pub fn spawn_capture(
     root: Option<&Path>,
     sampler: Option<Arc<dyn LhcInferenceSampler>>,
 ) -> Option<CaptureHandle> {
-    spawn_capture_resumed(session_id, cwd, bootstrap, None, root, sampler)
+    spawn_capture_with_serving_model(session_id, cwd, bootstrap, None, root, sampler, None)
 }
 
 /// [`spawn_capture`] for a session resumed after an LHC write-back (slice 1A):
@@ -984,10 +984,28 @@ pub fn spawn_capture_resumed(
     root: Option<&Path>,
     sampler: Option<Arc<dyn LhcInferenceSampler>>,
 ) -> Option<CaptureHandle> {
+    spawn_capture_with_serving_model(session_id, cwd, bootstrap, generated, root, sampler, None)
+}
+
+/// [`spawn_capture_resumed`] plus the live chat serving model for SDK budget
+/// reads (`grok-` → 1.05). Derivation/compression model is not this argument.
+pub fn spawn_capture_with_serving_model(
+    session_id: &str,
+    cwd: Option<&str>,
+    bootstrap: &[ConversationItem],
+    generated: Option<GeneratedPrefix>,
+    root: Option<&Path>,
+    sampler: Option<Arc<dyn LhcInferenceSampler>>,
+    serving_model: Option<&str>,
+) -> Option<CaptureHandle> {
     let session_id_owned = session_id.to_string();
     let cwd_owned = cwd.map(|c| c.to_string());
     let bootstrap = bootstrap.to_vec();
     let root_owned: Option<PathBuf> = root.map(|p| p.to_path_buf());
+    let serving_model_owned = serving_model
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string);
     if let Some(sampler) = sampler {
         register_inference_sampler(session_id, sampler);
     }
@@ -1063,6 +1081,7 @@ pub fn spawn_capture_resumed(
                     &session_id_for_worker,
                     cwd_owned.as_deref(),
                     root_owned.as_deref(),
+                    serving_model_owned.as_deref(),
                 )
                 .await
                 else {
@@ -1702,6 +1721,9 @@ async fn process_cmd(
                 &new_level,
                 ordinal,
             );
+            if previous_model != new_model {
+                sess.set_serving_model(&new_model);
+            }
             if mapped.is_empty() {
                 return false;
             }

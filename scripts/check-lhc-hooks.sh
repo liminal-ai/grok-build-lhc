@@ -100,6 +100,7 @@ if [ -d crates/lhc/grok-lhc-host/tests/goldens ]; then
   run_lhc_test_bin golden_smoke "golden smoke" || fail=1
   run_lhc_test_bin certification "certification" || fail=1
   run_lhc_test_bin harness_chunk3b "chunk3b harness" || fail=1
+  run_lhc_test_bin serving_model_budget "serving-model budget" || fail=1
 else
   echo "SKIP golden smoke: no goldens yet (armed by Chunk 1 certification)"
 fi

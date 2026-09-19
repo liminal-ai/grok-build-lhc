@@ -109,10 +109,9 @@ pub trait ChatPersistence: Send + 'static {
         self.replace_history(items);
     }
 
-    /// Destructive image-strip rewrite: back up the on-disk history, then
-    /// replace it, acking the DISK outcome. A failed backup gates off the
-    /// rewrite so recoverability never silently evaporates; backends without
-    /// a recoverable store may no-op the backup but must ack the write.
+    /// Destructive image-strip rewrite: back up on-disk history, then replace it, acking the disk outcome.
+    /// A failed backup gates off the rewrite so recoverability never silently evaporates.
+    /// Backends without a recoverable store may no-op the backup but must ack the write.
     fn replace_history_for_strip_and_ack(
         &mut self,
         items: &[ConversationItem],
@@ -405,7 +404,10 @@ mod tests {
         mock.persist_message(&item);
         let records = rx.drain();
         assert_eq!(records.len(), 1);
-        assert!(matches!(&records[0], PersistenceRecord::Message(_)));
+        assert!(matches!(
+            records.first(),
+            Some(PersistenceRecord::Message(_))
+        ));
     }
 
     #[test]
@@ -423,8 +425,8 @@ mod tests {
         mock.replace_history(&[ConversationItem::system("a"), ConversationItem::system("b")]);
         let records = rx.drain();
         assert_eq!(records.len(), 1);
-        match &records[0] {
-            PersistenceRecord::ReplaceHistory(items) => assert_eq!(items.len(), 2),
+        match records.first() {
+            Some(PersistenceRecord::ReplaceHistory(items)) => assert_eq!(items.len(), 2),
             other => panic!("expected ReplaceHistory, got {other:?}"),
         }
     }

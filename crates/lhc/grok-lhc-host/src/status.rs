@@ -303,6 +303,14 @@ pub async fn status_report(session_id: &str) -> LhcStatusReport {
                     vs.compact_recommended,
                     vs.tail_tokens
                 ));
+                tracing::info!(
+                    session_id,
+                    tail_tokens = vs.tail_tokens,
+                    compact_recommended = vs.compact_recommended,
+                    threshold = vs.threshold,
+                    view = ?vs.view.as_ref().map(|v| v.built_at.as_str()),
+                    "LHC view status"
+                );
                 if vs.derivation.failed > 0 {
                     notes.push(format!(
                         "{} failed derivation(s) — see /lhc repair",

@@ -17,7 +17,7 @@ use xai_grok_sampling_types::{ConversationItem, TokenUsage};
 
 use crate::capture::{
     CaptureHandle, RegistrySnapshot, lookup_session_snapshot, registry_generation,
-    spawn_capture_resumed,
+    spawn_capture_with_serving_model,
 };
 use crate::gating::is_enabled;
 use crate::generated_prefix::GeneratedPrefix;
@@ -45,9 +45,33 @@ pub fn tee_chat_persistence(
     inner: Box<dyn ChatPersistence>,
     sampler: Option<Arc<dyn LhcInferenceSampler>>,
 ) -> Box<dyn ChatPersistence> {
+    tee_chat_persistence_with_serving_model(
+        session_id, cwd, bootstrap, generated, inner, sampler, None,
+    )
+}
+
+/// [`tee_chat_persistence`] plus the live chat serving model for SDK budget
+/// reads. Pass the session chat model, never the LHC derivation model.
+pub fn tee_chat_persistence_with_serving_model(
+    session_id: &str,
+    cwd: &str,
+    bootstrap: &[ConversationItem],
+    generated: Option<GeneratedPrefix>,
+    inner: Box<dyn ChatPersistence>,
+    sampler: Option<Arc<dyn LhcInferenceSampler>>,
+    serving_model: Option<&str>,
+) -> Box<dyn ChatPersistence> {
     if is_enabled()
-        && spawn_capture_resumed(session_id, Some(cwd), bootstrap, generated, None, sampler)
-            .is_none()
+        && spawn_capture_with_serving_model(
+            session_id,
+            Some(cwd),
+            bootstrap,
+            generated,
+            None,
+            sampler,
+            serving_model,
+        )
+        .is_none()
     {
         tracing::warn!(
             session_id,

@@ -62,6 +62,7 @@ fn sampling_config() -> SamplingConfig {
         context_window: NonZeroU64::new(128_000).unwrap(),
         reasoning_effort: None,
         stream_tool_calls: None,
+        ..Default::default()
     }
 }
 
@@ -280,7 +281,7 @@ fn body_fingerprint(items: &[ConversationItem]) -> String {
         .map(|i| {
             let kind = match i {
                 ConversationItem::System(_) => "system",
-                ConversationItem::User(u) if u.synthetic_reason.is_some() => "user_meta",
+                ConversationItem::User(u) if u.synthetic_reason.is_human() == false => "user_meta",
                 ConversationItem::User(_) => "user",
                 ConversationItem::Assistant(a) if !a.tool_calls.is_empty() => "assistant_tools",
                 ConversationItem::Assistant(_) => "assistant",
