@@ -638,7 +638,7 @@ pub(crate) async fn spawn_session_actor(
         chat_state_sampling_config,
         actor_pruning_config,
         // LHC-HOOK 2/10: wrap persistence in the LHC capture tee (+ inference sampler)
-        grok_lhc_host::tee_chat_persistence(
+        grok_lhc_host::tee_chat_persistence_with_serving_model(
             session_info.id.0.as_ref(),
             session_info.cwd.as_ref(),
             &conversation,
@@ -653,6 +653,7 @@ pub(crate) async fn spawn_session_actor(
                 )
                 .into_arc(),
             ),
+            Some(sampling_config.model.as_str()),
         ),
         chat_state_event_tx,
         tokio_util::sync::CancellationToken::new(),

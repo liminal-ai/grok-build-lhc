@@ -120,10 +120,14 @@ impl LhcSession {
     ///
     /// Returns the session and an occurrence tracker seeded from LHC's stored
     /// events. Refuses to open if `list_events` fails.
+    ///
+    /// `serving_model` is the live chat model (not the LHC derivation model).
+    /// When set, SDK budget reads use that family's weights (`grok-` → 1.05).
     pub async fn open(
         session_id: &str,
         cwd: Option<&str>,
         root: Option<&Path>,
+        serving_model: Option<&str>,
     ) -> Option<(Self, OccurrenceTracker)> {
         let root_buf = root.map(|p| p.to_path_buf()).unwrap_or_else(lhc_root);
         let root = root_buf.as_path();
@@ -162,6 +166,9 @@ impl LhcSession {
             chunk_policy: None,
             view: None,
         });
+        if let Some(model) = serving_model.filter(|m| !m.is_empty()) {
+            lhc.set_model(model);
+        }
 
         let registry_str = registry_path.to_string_lossy().into_owned();
         let thread_ref = if file_path.exists() {
@@ -195,6 +202,14 @@ impl LhcSession {
         };
 
         Some((session, tracker))
+    }
+
+    /// Select the SDK serving family for subsequent budget reads.
+    /// Raw stored estimates are unchanged. Empty slugs are ignored.
+    pub fn set_serving_model(&self, model: &str) {
+        if !model.is_empty() {
+            self.lhc.set_model(model);
+        }
     }
 
     /// Seed tip, change ordinals, and occurrence tracker from stored events.

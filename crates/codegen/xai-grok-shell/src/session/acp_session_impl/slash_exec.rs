@@ -197,6 +197,7 @@ impl SessionActor {
                             // the same sampler capability as spawn-time tee install (Z2).
                             let conversation = self.chat_state_handle.get_conversation().await;
                             let sampling_config = self.reconstruct_full_config().await;
+                            let serving_model = sampling_config.model.clone();
                             let sampler =
                                 crate::session::lhc_inference::ShellLhcInferenceSampler::new(
                                     sampling_config,
@@ -205,12 +206,14 @@ impl SessionActor {
                                     std::time::Duration::from_secs(60),
                                 )
                                 .into_arc();
-                            match grok_lhc_host::spawn_capture(
+                            match grok_lhc_host::spawn_capture_with_serving_model(
                                 sid,
                                 Some(self.session_info.cwd.as_ref()),
                                 &conversation,
                                 None,
+                                None,
                                 Some(sampler),
+                                Some(serving_model.as_str()),
                             ) {
                                 Some(_) => {
                                     match grok_lhc_host::wait_capture_archive_ready(
