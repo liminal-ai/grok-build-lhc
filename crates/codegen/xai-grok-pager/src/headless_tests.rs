@@ -222,10 +222,11 @@ async fn cold_load_acks_task_completed_before_load_session_response() {
             // tombstone only — no pending wait, no lifecycle buffer.
             assert!(
                 inbox
-                    .completed_bg
-                    .contains(&super::BackgroundWork::Task("bg-stale-1".into())),
+                    .background_lifecycle
+                    .completed_tasks
+                    .contains("bg-stale-1"),
                 "stale task_completed must tombstone the task id: {:?}",
-                inbox.completed_bg
+                inbox.background_lifecycle.completed_tasks
             );
             assert!(
                 inbox.pending_bg.is_empty(),
@@ -536,7 +537,8 @@ async fn worktree_create_opens_session_at_worktree_subdirectory() {
     );
     let spec = WorktreeSpec::from_cli(Some("fix"), Some("origin/main")).unwrap();
 
-    let opened = open_session_in_new_worktree(&tx, &launch_cwd, &spec, None)
+    let (_client_tx, mut acp_rx) = tokio::sync::mpsc::unbounded_channel();
+    let opened = open_session_in_new_worktree(&tx, &mut acp_rx, &launch_cwd, &spec, None, false)
         .await
         .unwrap();
 
@@ -581,10 +583,17 @@ async fn worktree_create_with_session_id_names_worktree_and_session() {
     );
     let sid = "2d3c6b3e-3d43-4f0a-9d2e-2b6d1b6a9c11";
 
-    let opened =
-        open_session_in_new_worktree(&tx, source.path(), &WorktreeSpec::default(), Some(sid))
-            .await
-            .unwrap();
+    let (_client_tx, mut acp_rx) = tokio::sync::mpsc::unbounded_channel();
+    let opened = open_session_in_new_worktree(
+        &tx,
+        &mut acp_rx,
+        source.path(),
+        &WorktreeSpec::default(),
+        Some(sid),
+        false,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(opened.session_id.0.as_ref(), sid);
     assert_eq!(opened.cwd, wt_root.path());
@@ -622,10 +631,18 @@ async fn worktree_create_failure_is_reported_before_any_session_opens() {
         ),
     ] {
         let (tx, log) = spawn_fake_agent(reply, Ok("never"));
-        let err = open_session_in_new_worktree(&tx, source.path(), &WorktreeSpec::default(), None)
-            .await
-            .unwrap_err()
-            .to_string();
+        let (_client_tx, mut acp_rx) = tokio::sync::mpsc::unbounded_channel();
+        let err = open_session_in_new_worktree(
+            &tx,
+            &mut acp_rx,
+            source.path(),
+            &WorktreeSpec::default(),
+            None,
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("couldn't create worktree"), "{err}");
         assert!(err.contains(expect), "{err}");
         assert!(log.lock().unwrap().new_sessions.is_empty());
@@ -641,10 +658,18 @@ async fn worktree_create_then_session_failure_names_the_orphaned_worktree() {
         Err("agent refused"),
     );
 
-    let err = open_session_in_new_worktree(&tx, source.path(), &WorktreeSpec::default(), None)
-        .await
-        .unwrap_err()
-        .to_string();
+    let (_client_tx, mut acp_rx) = tokio::sync::mpsc::unbounded_channel();
+    let err = open_session_in_new_worktree(
+        &tx,
+        &mut acp_rx,
+        source.path(),
+        &WorktreeSpec::default(),
+        None,
+        false,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
 
     assert!(err.contains("agent refused"), "{err}");
     assert!(err.contains(&wt_root.path().display().to_string()), "{err}");
@@ -667,10 +692,19 @@ async fn worktree_resume_loads_reported_session_without_re_restoring_code() {
     );
     let spec = WorktreeSpec::from_cli(Some(""), Some("v1.2")).unwrap();
 
-    let opened =
-        resume_session_in_new_worktree(&tx, source.path(), &spec, "orig", Some(true), false)
-            .await
-            .unwrap();
+    let (_client_tx, mut acp_rx) = tokio::sync::mpsc::unbounded_channel();
+    let opened = resume_session_in_new_worktree(
+        &tx,
+        &mut acp_rx,
+        source.path(),
+        &spec,
+        "orig",
+        Some(true),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(opened.session_id.0.as_ref(), "forked-in-worktree");
     assert_eq!(opened.cwd, eff_cwd);
@@ -717,14 +751,34 @@ async fn worktree_resume_failure_carries_local_miss_hint_like_the_tui() {
     let (tx, _log) = spawn_fake_agent(serde_json::json!({"error": "archive unavailable"}), Ok("x"));
     let spec = WorktreeSpec::default();
 
-    let hinted = resume_session_in_new_worktree(&tx, source.path(), &spec, "my title", None, true)
-        .await
-        .unwrap_err()
-        .to_string();
-    let plain = resume_session_in_new_worktree(&tx, source.path(), &spec, "my title", None, false)
-        .await
-        .unwrap_err()
-        .to_string();
+    let (_client_tx, mut acp_rx) = tokio::sync::mpsc::unbounded_channel();
+    let hinted = resume_session_in_new_worktree(
+        &tx,
+        &mut acp_rx,
+        source.path(),
+        &spec,
+        "my title",
+        None,
+        true,
+        false,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    let (_client_tx2, mut acp_rx2) = tokio::sync::mpsc::unbounded_channel();
+    let plain = resume_session_in_new_worktree(
+        &tx,
+        &mut acp_rx2,
+        source.path(),
+        &spec,
+        "my title",
+        None,
+        false,
+        false,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
 
     assert_eq!(
         plain,

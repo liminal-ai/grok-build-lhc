@@ -527,7 +527,6 @@ fn build_headless_init_request(
         .meta(meta.as_object().cloned())
 }
 
-#[derive(Debug)]
 struct OpenedSession {
     session_id: acp::SessionId,
     models: ModelState,
@@ -551,14 +550,14 @@ struct OpenedSession {
 /// completion-receiver ownership.
 ///
 /// Synthetic stale-on-load `task_completed` is intentionally quiet: it only
-/// tombstones the task id in [`ColdAttachInbox::completed_bg`] (so a later
-/// out-of-order `task_backgrounded` cannot re-arm wait-for-background).
-/// Stateful lifecycle/stream events are buffered for apply after
-/// `emitter.begin_session` rather than discarded.
+/// tombstones the task id in [`BackgroundLifecycleState::completed_tasks`]
+/// (so a later out-of-order `task_backgrounded` cannot re-arm
+/// wait-for-background). Stateful lifecycle/stream events are buffered for
+/// apply after `emitter.begin_session` rather than discarded.
 #[derive(Default)]
 struct ColdAttachInbox {
     pending_bg: HashSet<BackgroundWork>,
-    completed_bg: HashSet<BackgroundWork>,
+    background_lifecycle: BackgroundLifecycleState,
     lifecycle: Vec<Lifecycle>,
     stream: Vec<StreamEvent>,
 }
@@ -618,7 +617,7 @@ fn handle_cold_attach_acp_message(
                 other => track_background_lifecycle(
                     other,
                     &mut inbox.pending_bg,
-                    &mut inbox.completed_bg,
+                    &mut inbox.background_lifecycle,
                 ),
             }
         }
@@ -853,8 +852,14 @@ async fn fork_then_open(
             opened.cold_inbox.pending_bg.extend(cold_inbox.pending_bg);
             opened
                 .cold_inbox
-                .completed_bg
-                .extend(cold_inbox.completed_bg);
+                .background_lifecycle
+                .completed_tasks
+                .extend(cold_inbox.background_lifecycle.completed_tasks);
+            opened
+                .cold_inbox
+                .background_lifecycle
+                .subagents
+                .extend(cold_inbox.background_lifecycle.subagents);
             opened.cold_inbox.lifecycle.extend(cold_inbox.lifecycle);
             opened.cold_inbox.stream.extend(cold_inbox.stream);
             Ok(opened)
@@ -870,9 +875,11 @@ async fn fork_then_open(
 /// `materialize_startup_for_cwd` skipped that check when `has_worktree` is set.
 async fn open_session_in_new_worktree(
     acp_tx: &AcpAgentTx,
+    acp_rx: &mut AcpClientRx,
     cwd: &Path,
     spec: &WorktreeSpec,
     session_id: Option<&str>,
+    yolo: bool,
 ) -> anyhow::Result<OpenedSession> {
     let created = create_worktree(acp_tx, cwd, spec, &new_worktree_id(session_id))
         .await
@@ -884,8 +891,8 @@ async fn open_session_in_new_worktree(
         "headless: worktree created"
     );
     let opened = match session_id {
-        Some(sid) => open_session_with_id(acp_tx, &created.session_cwd, sid).await,
-        None => open_session(acp_tx, &created.session_cwd, None, None).await,
+        Some(sid) => open_session_with_id(acp_tx, acp_rx, &created.session_cwd, sid, yolo).await,
+        None => open_session(acp_tx, acp_rx, &created.session_cwd, None, None, yolo).await,
     };
     opened.map_err(|e| {
         anyhow::anyhow!(
@@ -899,11 +906,13 @@ async fn open_session_in_new_worktree(
 /// worktree and restores into it, then the session is loaded at the cwd it reports.
 async fn resume_session_in_new_worktree(
     acp_tx: &AcpAgentTx,
+    acp_rx: &mut AcpClientRx,
     cwd: &Path,
     spec: &WorktreeSpec,
     session_id: &str,
     restore_code: Option<bool>,
     local_miss: bool,
+    yolo: bool,
 ) -> anyhow::Result<OpenedSession> {
     let resumed = resume_session_into_worktree(
         acp_tx,
@@ -925,9 +934,11 @@ async fn resume_session_in_new_worktree(
     // resume_session already restored code; asking again on load would redo it.
     open_session(
         acp_tx,
+        acp_rx,
         &resumed.session_cwd,
         Some(&resumed.session_id),
         None,
+        yolo,
     )
     .await
     .map_err(|e| {
@@ -1264,10 +1275,18 @@ pub async fn run_single_turn(
     xai_grok_telemetry::startup::enter(crate::acp::StartupPhase::SessionCreate);
     let opened = match (materialized, worktree.as_ref()) {
         (MaterializedStartup::NewAuto, Some(spec)) => {
-            open_session_in_new_worktree(&acp_tx, &cwd, spec, None).await
+            open_session_in_new_worktree(&acp_tx, &mut acp_rx, &cwd, spec, None, options.yolo).await
         }
         (MaterializedStartup::NewWithId { session_id }, Some(spec)) => {
-            open_session_in_new_worktree(&acp_tx, &cwd, spec, Some(&session_id)).await
+            open_session_in_new_worktree(
+                &acp_tx,
+                &mut acp_rx,
+                &cwd,
+                spec,
+                Some(&session_id),
+                options.yolo,
+            )
+            .await
         }
         (
             MaterializedStartup::Resume {
@@ -1279,11 +1298,13 @@ pub async fn run_single_turn(
         ) => {
             resume_session_in_new_worktree(
                 &acp_tx,
+                &mut acp_rx,
                 &cwd,
                 spec,
                 &session_id,
                 restore_code,
                 deferred_local_miss,
+                options.yolo,
             )
             .await
         }
@@ -1393,7 +1414,7 @@ pub async fn run_single_turn(
         });
         // Apply cold-attach lifecycle/stream events only after begin_session so
         // reducers see real session context. Stale task_completed stays quiet
-        // (tombstone only in cold_inbox.completed_bg — no Lifecycle emit).
+        // (tombstone only in cold_inbox.background_lifecycle — no Lifecycle emit).
         for event in cold_inbox.lifecycle {
             emitter.on_lifecycle(event);
         }
@@ -1492,8 +1513,7 @@ pub async fn run_single_turn(
     // any true backgrounded seen during load) so wait/reap stay consistent.
     // Tracked regardless of wait_for_background so the exit reaper always sees running work.
     let mut pending_bg = cold_inbox.pending_bg;
-    let mut completed_bg = cold_inbox.completed_bg;
-    let mut background_lifecycle = BackgroundLifecycleState::default();
+    let mut background_lifecycle = cold_inbox.background_lifecycle;
     let mut prompt_done_at: Option<Instant> = None;
     // On mid-turn channel close, break (not bail) so the exit path still drains and reaps.
     let mut connection_closed = false;
@@ -1837,7 +1857,7 @@ enum BackgroundWork {
     Subagent(String),
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct BackgroundLifecycleState {
     completed_tasks: HashSet<String>,
     subagents: HashMap<String, SubagentLifecycleState>,
