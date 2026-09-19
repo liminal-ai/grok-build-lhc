@@ -46,7 +46,7 @@ certification ran 2026-09-04 (see Status above and
   commits of the SDK repo's `main` only (Phase 2 acceptance `358c8d1` or
   later; the historical `lhc-rs-port` working branch was retired into `main`
   2026-08-08). Never copy the port in; bump the pin and record it here.
-  Current pin: `e9456a6e` (LHC `origin/main` 2026-09-04 — turn parts
+  Current pin: `aa9caa16` (Reed-accepted E2 serving-model token weights on Rust LHC budget reads; grok 1.05 / o200k 1.00. Previous pin `e9456a6e` (LHC `origin/main` 2026-09-04 — turn parts
   (schema 12 step index), content blocks (schema 13 blob table), bounded
   metadata-first compact, compact-continuation runtime; lhc-rs gate 846).
   Thread schema **13**. Previous pin `dd251ec` (Wave B code tip, schema 6,
