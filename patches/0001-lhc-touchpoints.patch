@@ -2636,10 +2636,10 @@ index 814c2474..514108d4 100644
              self.tool_context
                  .record_task_model_output(u64::from(u.completion_tokens));
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/slash_exec.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/slash_exec.rs
-index 220544b4..d6972c35 100644
+index 220544b4..674360b3 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/slash_exec.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/slash_exec.rs
-@@ -72,6 +72,213 @@ impl SessionActor {
+@@ -72,6 +72,216 @@ impl SessionActor {
                  ok_end_turn(0, None)
              }
              BuiltinAction::ContextInfo => ok_end_turn(0, None),
@@ -2768,6 +2768,7 @@ index 220544b4..d6972c35 100644
 +                            // the same sampler capability as spawn-time tee install (Z2).
 +                            let conversation = self.chat_state_handle.get_conversation().await;
 +                            let sampling_config = self.reconstruct_full_config().await;
++                            let serving_model = sampling_config.model.clone();
 +                            let sampler =
 +                                crate::session::lhc_inference::ShellLhcInferenceSampler::new(
 +                                    sampling_config,
@@ -2776,12 +2777,14 @@ index 220544b4..d6972c35 100644
 +                                    std::time::Duration::from_secs(60),
 +                                )
 +                                .into_arc();
-+                            match grok_lhc_host::spawn_capture(
++                            match grok_lhc_host::spawn_capture_with_serving_model(
 +                                sid,
 +                                Some(self.session_info.cwd.as_ref()),
 +                                &conversation,
 +                                None,
++                                None,
 +                                Some(sampler),
++                                Some(serving_model.as_str()),
 +                            ) {
 +                                Some(_) => {
 +                                    match grok_lhc_host::wait_capture_archive_ready(
@@ -2854,7 +2857,7 @@ index 220544b4..d6972c35 100644
                  let msg = match Self::do_hooks_trust_project(&self.session_info.cwd) {
                      Ok(root) => {
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs
-index e8460933..7429cf99 100644
+index e8460933..f9235d46 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs
 @@ -59,8 +59,47 @@ fn configured_memory_retrieval_mode(
@@ -2907,7 +2910,7 @@ index e8460933..7429cf99 100644
  fn subagent_sampler_rate_limit_threshold(is_subagent: bool, pacer_max_attempts: u32) -> u32 {
      if is_subagent && pacer_max_attempts > 0 {
          xai_grok_sampler::RATE_LIMIT_RETRY_DISABLED
-@@ -585,13 +624,36 @@ pub(crate) async fn spawn_session_actor(
+@@ -585,13 +624,37 @@ pub(crate) async fn spawn_session_actor(
          hard_clear_age_turns: session_pruning_config.hard_clear_age_turns,
      };
      let (chat_state_event_tx, chat_state_event_rx) = mpsc::unbounded_channel();
@@ -2928,7 +2931,7 @@ index e8460933..7429cf99 100644
 -            persistence.tx.clone(),
 -        )),
 +        // LHC-HOOK 2/10: wrap persistence in the LHC capture tee (+ inference sampler)
-+        grok_lhc_host::tee_chat_persistence(
++        grok_lhc_host::tee_chat_persistence_with_serving_model(
 +            session_info.id.0.as_ref(),
 +            session_info.cwd.as_ref(),
 +            &conversation,
@@ -2943,11 +2946,12 @@ index e8460933..7429cf99 100644
 +                )
 +                .into_arc(),
 +            ),
++            Some(sampling_config.model.as_str()),
 +        ),
          chat_state_event_tx,
          tokio_util::sync::CancellationToken::new(),
      );
-@@ -1228,6 +1290,42 @@ pub(crate) async fn spawn_session_actor(
+@@ -1228,6 +1291,42 @@ pub(crate) async fn spawn_session_actor(
                  resources.insert(task_wake_suppressed);
              })
              .await;
