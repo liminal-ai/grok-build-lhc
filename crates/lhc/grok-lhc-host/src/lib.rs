@@ -359,6 +359,9 @@ pub async fn replace_compact_for_writeback_with_cancel_signal(
     }
     tracing::info!(
         session_id,
+        view_id = %receipt.view_id,
+        compact_point = receipt.compact_point,
+        tail_tokens = receipt.tail_tokens,
         receipt_total = receipt.total_tokens,
         "LHC compact replace: compact complete"
     );
