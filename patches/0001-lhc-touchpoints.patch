@@ -853,7 +853,7 @@ index 87f63aef..7aa77cd4 100644
      #[arg(long)]
      pub cwd: Option<PathBuf>,
 diff --git a/crates/codegen/xai-grok-pager/src/headless.rs b/crates/codegen/xai-grok-pager/src/headless.rs
-index e0b8a786..15ce130b 100644
+index e0b8a786..9ba4dfb3 100644
 --- a/crates/codegen/xai-grok-pager/src/headless.rs
 +++ b/crates/codegen/xai-grok-pager/src/headless.rs
 @@ -15,7 +15,7 @@ use anyhow::Result;
@@ -865,7 +865,13 @@ index e0b8a786..15ce130b 100644
  use xai_grok_shell::agent::auth_method::AuthMethodKind;
  use xai_grok_shell::agent::config::Config as AgentConfig;
  use xai_grok_shell::extensions::memory::MemoryFlushResponse;
-@@ -533,20 +533,195 @@ struct OpenedSession {
+@@ -527,26 +527,200 @@ fn build_headless_init_request(
+         .meta(meta.as_object().cloned())
+ }
+ 
+-#[derive(Debug)]
+ struct OpenedSession {
+     session_id: acp::SessionId,
      models: ModelState,
      /// Directory the session is anchored to (launch cwd, resume `original_cwd`, or fork `write_cwd`).
      cwd: PathBuf,
@@ -887,14 +893,14 @@ index e0b8a786..15ce130b 100644
 +/// completion-receiver ownership.
 +///
 +/// Synthetic stale-on-load `task_completed` is intentionally quiet: it only
-+/// tombstones the task id in [`ColdAttachInbox::completed_bg`] (so a later
-+/// out-of-order `task_backgrounded` cannot re-arm wait-for-background).
-+/// Stateful lifecycle/stream events are buffered for apply after
-+/// `emitter.begin_session` rather than discarded.
++/// tombstones the task id in [`BackgroundLifecycleState::completed_tasks`]
++/// (so a later out-of-order `task_backgrounded` cannot re-arm
++/// wait-for-background). Stateful lifecycle/stream events are buffered for
++/// apply after `emitter.begin_session` rather than discarded.
 +#[derive(Default)]
 +struct ColdAttachInbox {
 +    pending_bg: HashSet<BackgroundWork>,
-+    completed_bg: HashSet<BackgroundWork>,
++    background_lifecycle: BackgroundLifecycleState,
 +    lifecycle: Vec<Lifecycle>,
 +    stream: Vec<StreamEvent>,
 +}
@@ -954,7 +960,7 @@ index e0b8a786..15ce130b 100644
 +                other => track_background_lifecycle(
 +                    other,
 +                    &mut inbox.pending_bg,
-+                    &mut inbox.completed_bg,
++                    &mut inbox.background_lifecycle,
 +                ),
 +            }
 +        }
@@ -1062,7 +1068,7 @@ index e0b8a786..15ce130b 100644
              acp::LoadSessionRequest::new(acp::SessionId::new(sid.to_string()), cwd.to_path_buf())
                  .mcp_servers(mcp_servers.clone())
                  .meta({
-@@ -558,6 +733,9 @@ async fn open_session(
+@@ -558,6 +732,9 @@ async fn open_session(
                      Some(m)
                  }),
              acp_tx,
@@ -1072,7 +1078,7 @@ index e0b8a786..15ce130b 100644
          )
          .await;
          if let Ok(resp) = try_load {
-@@ -565,6 +743,7 @@ async fn open_session(
+@@ -565,6 +742,7 @@ async fn open_session(
                  session_id: acp::SessionId::new(sid.to_string()),
                  models: ModelState::from(resp.models),
                  cwd: cwd.to_path_buf(),
@@ -1080,7 +1086,7 @@ index e0b8a786..15ce130b 100644
              });
          }
          anyhow::bail!("Session does not exist");
-@@ -575,54 +754,67 @@ async fn open_session(
+@@ -575,54 +753,67 @@ async fn open_session(
          .as_object()
          .cloned();
      crate::app::session_startup::stamp_phase_traceparent(&mut meta);
@@ -1150,7 +1156,7 @@ index e0b8a786..15ce130b 100644
  ) -> anyhow::Result<OpenedSession> {
      use crate::app::session_startup::{
          effective_fork_new_cwd, ensure_session_id_available, fork_response_error,
-@@ -648,14 +840,25 @@ async fn fork_then_open(
+@@ -648,14 +839,31 @@ async fn fork_then_open(
      let fork_params = serde_json::value::to_raw_value(&payload)
          .map_err(|e| anyhow::anyhow!("serialize fork params: {e}"))?;
      let req = acp::ExtRequest::new("x.ai/session/fork", fork_params.into());
@@ -1170,8 +1176,14 @@ index e0b8a786..15ce130b 100644
 +            opened.cold_inbox.pending_bg.extend(cold_inbox.pending_bg);
 +            opened
 +                .cold_inbox
-+                .completed_bg
-+                .extend(cold_inbox.completed_bg);
++                .background_lifecycle
++                .completed_tasks
++                .extend(cold_inbox.background_lifecycle.completed_tasks);
++            opened
++                .cold_inbox
++                .background_lifecycle
++                .subagents
++                .extend(cold_inbox.background_lifecycle.subagents);
 +            opened.cold_inbox.lifecycle.extend(cold_inbox.lifecycle);
 +            opened.cold_inbox.stream.extend(cold_inbox.stream);
 +            Ok(opened)
@@ -1179,7 +1191,87 @@ index e0b8a786..15ce130b 100644
          Err(e) => Err(anyhow::anyhow!(
              "fork succeeded as {child} but load failed: {e}"
          )),
-@@ -1084,9 +1287,11 @@ pub async fn run_single_turn(
+@@ -667,9 +875,11 @@ async fn fork_then_open(
+ /// `materialize_startup_for_cwd` skipped that check when `has_worktree` is set.
+ async fn open_session_in_new_worktree(
+     acp_tx: &AcpAgentTx,
++    acp_rx: &mut AcpClientRx,
+     cwd: &Path,
+     spec: &WorktreeSpec,
+     session_id: Option<&str>,
++    yolo: bool,
+ ) -> anyhow::Result<OpenedSession> {
+     let created = create_worktree(acp_tx, cwd, spec, &new_worktree_id(session_id))
+         .await
+@@ -681,8 +891,8 @@ async fn open_session_in_new_worktree(
+         "headless: worktree created"
+     );
+     let opened = match session_id {
+-        Some(sid) => open_session_with_id(acp_tx, &created.session_cwd, sid).await,
+-        None => open_session(acp_tx, &created.session_cwd, None, None).await,
++        Some(sid) => open_session_with_id(acp_tx, acp_rx, &created.session_cwd, sid, yolo).await,
++        None => open_session(acp_tx, acp_rx, &created.session_cwd, None, None, yolo).await,
+     };
+     opened.map_err(|e| {
+         anyhow::anyhow!(
+@@ -696,11 +906,13 @@ async fn open_session_in_new_worktree(
+ /// worktree and restores into it, then the session is loaded at the cwd it reports.
+ async fn resume_session_in_new_worktree(
+     acp_tx: &AcpAgentTx,
++    acp_rx: &mut AcpClientRx,
+     cwd: &Path,
+     spec: &WorktreeSpec,
+     session_id: &str,
+     restore_code: Option<bool>,
+     local_miss: bool,
++    yolo: bool,
+ ) -> anyhow::Result<OpenedSession> {
+     let resumed = resume_session_into_worktree(
+         acp_tx,
+@@ -722,9 +934,11 @@ async fn resume_session_in_new_worktree(
+     // resume_session already restored code; asking again on load would redo it.
+     open_session(
+         acp_tx,
++        acp_rx,
+         &resumed.session_cwd,
+         Some(&resumed.session_id),
+         None,
++        yolo,
+     )
+     .await
+     .map_err(|e| {
+@@ -1061,10 +1275,18 @@ pub async fn run_single_turn(
+     xai_grok_telemetry::startup::enter(crate::acp::StartupPhase::SessionCreate);
+     let opened = match (materialized, worktree.as_ref()) {
+         (MaterializedStartup::NewAuto, Some(spec)) => {
+-            open_session_in_new_worktree(&acp_tx, &cwd, spec, None).await
++            open_session_in_new_worktree(&acp_tx, &mut acp_rx, &cwd, spec, None, options.yolo).await
+         }
+         (MaterializedStartup::NewWithId { session_id }, Some(spec)) => {
+-            open_session_in_new_worktree(&acp_tx, &cwd, spec, Some(&session_id)).await
++            open_session_in_new_worktree(
++                &acp_tx,
++                &mut acp_rx,
++                &cwd,
++                spec,
++                Some(&session_id),
++                options.yolo,
++            )
++            .await
+         }
+         (
+             MaterializedStartup::Resume {
+@@ -1076,17 +1298,21 @@ pub async fn run_single_turn(
+         ) => {
+             resume_session_in_new_worktree(
+                 &acp_tx,
++                &mut acp_rx,
+                 &cwd,
+                 spec,
+                 &session_id,
+                 restore_code,
+                 deferred_local_miss,
++                options.yolo,
              )
              .await
          }
@@ -1193,7 +1285,7 @@ index e0b8a786..15ce130b 100644
          }
          (
              MaterializedStartup::Resume {
-@@ -1097,7 +1302,15 @@ pub async fn run_single_turn(
+@@ -1097,7 +1323,15 @@ pub async fn run_single_turn(
              None,
          ) => {
              let load_cwd = original_cwd.as_deref().unwrap_or(cwd.as_path());
@@ -1210,7 +1302,7 @@ index e0b8a786..15ce130b 100644
          }
          // Fork with `-w` never reaches here; the intent check above refuses it.
          (
-@@ -1111,11 +1324,13 @@ pub async fn run_single_turn(
+@@ -1111,11 +1345,13 @@ pub async fn run_single_turn(
          ) => {
              fork_then_open(
                  &acp_tx,
@@ -1224,7 +1316,7 @@ index e0b8a786..15ce130b 100644
              )
              .await
          }
-@@ -1124,6 +1339,7 @@ pub async fn run_single_turn(
+@@ -1124,6 +1360,7 @@ pub async fn run_single_turn(
          session_id,
          models: session_models,
          cwd: session_cwd,
@@ -1232,13 +1324,13 @@ index e0b8a786..15ce130b 100644
      } = match opened {
          Ok(v) => v,
          Err(e) => {
-@@ -1175,6 +1391,15 @@ pub async fn run_single_turn(
+@@ -1175,6 +1412,15 @@ pub async fn run_single_turn(
              api_key_auth: is_api_key_auth,
              context_window: session_models.get_context_window(),
          });
 +        // Apply cold-attach lifecycle/stream events only after begin_session so
 +        // reducers see real session context. Stale task_completed stays quiet
-+        // (tombstone only in cold_inbox.completed_bg — no Lifecycle emit).
++        // (tombstone only in cold_inbox.background_lifecycle — no Lifecycle emit).
 +        for event in cold_inbox.lifecycle {
 +            emitter.on_lifecycle(event);
 +        }
@@ -1248,7 +1340,7 @@ index e0b8a786..15ce130b 100644
      }
  
      // One bounded catalog read covers what the session catalog cannot resolve.
-@@ -1263,8 +1488,11 @@ pub async fn run_single_turn(
+@@ -1263,9 +1509,11 @@ pub async fn run_single_turn(
          None => (None, None),
      };
      let mut prompt_result = None;
@@ -1256,16 +1348,26 @@ index e0b8a786..15ce130b 100644
 +    // any true backgrounded seen during load) so wait/reap stay consistent.
      // Tracked regardless of wait_for_background so the exit reaper always sees running work.
 -    let mut pending_bg: HashSet<BackgroundWork> = HashSet::new();
+-    let mut background_lifecycle = BackgroundLifecycleState::default();
 +    let mut pending_bg = cold_inbox.pending_bg;
-+    let mut completed_bg = cold_inbox.completed_bg;
-     let mut background_lifecycle = BackgroundLifecycleState::default();
++    let mut background_lifecycle = cold_inbox.background_lifecycle;
      let mut prompt_done_at: Option<Instant> = None;
      // On mid-turn channel close, break (not bail) so the exit path still drains and reaps.
+     let mut connection_closed = false;
+@@ -1609,7 +1857,7 @@ enum BackgroundWork {
+     Subagent(String),
+ }
+ 
+-#[derive(Default)]
++#[derive(Default, Debug)]
+ struct BackgroundLifecycleState {
+     completed_tasks: HashSet<String>,
+     subagents: HashMap<String, SubagentLifecycleState>,
 diff --git a/crates/codegen/xai-grok-pager/src/headless_tests.rs b/crates/codegen/xai-grok-pager/src/headless_tests.rs
-index 4a9d0963..55c9f583 100644
+index 4a9d0963..29a7be33 100644
 --- a/crates/codegen/xai-grok-pager/src/headless_tests.rs
 +++ b/crates/codegen/xai-grok-pager/src/headless_tests.rs
-@@ -109,6 +109,222 @@ fn drain_records_task_backgrounded_delivered_at_exit() {
+@@ -109,6 +109,223 @@ fn drain_records_task_backgrounded_delivered_at_exit() {
      );
  }
  
@@ -1382,10 +1484,11 @@ index 4a9d0963..55c9f583 100644
 +            // tombstone only — no pending wait, no lifecycle buffer.
 +            assert!(
 +                inbox
-+                    .completed_bg
-+                    .contains(&super::BackgroundWork::Task("bg-stale-1".into())),
++                    .background_lifecycle
++                    .completed_tasks
++                    .contains("bg-stale-1"),
 +                "stale task_completed must tombstone the task id: {:?}",
-+                inbox.completed_bg
++                inbox.background_lifecycle.completed_tasks
 +            );
 +            assert!(
 +                inbox.pending_bg.is_empty(),
@@ -1488,6 +1591,151 @@ index 4a9d0963..55c9f583 100644
  /// `begin_session` runs before the model and effort are applied, so a post-open error carries the real context.
  #[test]
  fn post_open_error_carries_real_session_context() {
+@@ -320,7 +537,8 @@ async fn worktree_create_opens_session_at_worktree_subdirectory() {
+     );
+     let spec = WorktreeSpec::from_cli(Some("fix"), Some("origin/main")).unwrap();
+ 
+-    let opened = open_session_in_new_worktree(&tx, &launch_cwd, &spec, None)
++    let (_client_tx, mut acp_rx) = tokio::sync::mpsc::unbounded_channel();
++    let opened = open_session_in_new_worktree(&tx, &mut acp_rx, &launch_cwd, &spec, None, false)
+         .await
+         .unwrap();
+ 
+@@ -365,10 +583,17 @@ async fn worktree_create_with_session_id_names_worktree_and_session() {
+     );
+     let sid = "2d3c6b3e-3d43-4f0a-9d2e-2b6d1b6a9c11";
+ 
+-    let opened =
+-        open_session_in_new_worktree(&tx, source.path(), &WorktreeSpec::default(), Some(sid))
+-            .await
+-            .unwrap();
++    let (_client_tx, mut acp_rx) = tokio::sync::mpsc::unbounded_channel();
++    let opened = open_session_in_new_worktree(
++        &tx,
++        &mut acp_rx,
++        source.path(),
++        &WorktreeSpec::default(),
++        Some(sid),
++        false,
++    )
++    .await
++    .unwrap();
+ 
+     assert_eq!(opened.session_id.0.as_ref(), sid);
+     assert_eq!(opened.cwd, wt_root.path());
+@@ -406,10 +631,18 @@ async fn worktree_create_failure_is_reported_before_any_session_opens() {
+         ),
+     ] {
+         let (tx, log) = spawn_fake_agent(reply, Ok("never"));
+-        let err = open_session_in_new_worktree(&tx, source.path(), &WorktreeSpec::default(), None)
+-            .await
+-            .unwrap_err()
+-            .to_string();
++        let (_client_tx, mut acp_rx) = tokio::sync::mpsc::unbounded_channel();
++        let err = open_session_in_new_worktree(
++            &tx,
++            &mut acp_rx,
++            source.path(),
++            &WorktreeSpec::default(),
++            None,
++            false,
++        )
++        .await
++        .unwrap_err()
++        .to_string();
+         assert!(err.contains("couldn't create worktree"), "{err}");
+         assert!(err.contains(expect), "{err}");
+         assert!(log.lock().unwrap().new_sessions.is_empty());
+@@ -425,10 +658,18 @@ async fn worktree_create_then_session_failure_names_the_orphaned_worktree() {
+         Err("agent refused"),
+     );
+ 
+-    let err = open_session_in_new_worktree(&tx, source.path(), &WorktreeSpec::default(), None)
+-        .await
+-        .unwrap_err()
+-        .to_string();
++    let (_client_tx, mut acp_rx) = tokio::sync::mpsc::unbounded_channel();
++    let err = open_session_in_new_worktree(
++        &tx,
++        &mut acp_rx,
++        source.path(),
++        &WorktreeSpec::default(),
++        None,
++        false,
++    )
++    .await
++    .unwrap_err()
++    .to_string();
+ 
+     assert!(err.contains("agent refused"), "{err}");
+     assert!(err.contains(&wt_root.path().display().to_string()), "{err}");
+@@ -451,10 +692,19 @@ async fn worktree_resume_loads_reported_session_without_re_restoring_code() {
+     );
+     let spec = WorktreeSpec::from_cli(Some(""), Some("v1.2")).unwrap();
+ 
+-    let opened =
+-        resume_session_in_new_worktree(&tx, source.path(), &spec, "orig", Some(true), false)
+-            .await
+-            .unwrap();
++    let (_client_tx, mut acp_rx) = tokio::sync::mpsc::unbounded_channel();
++    let opened = resume_session_in_new_worktree(
++        &tx,
++        &mut acp_rx,
++        source.path(),
++        &spec,
++        "orig",
++        Some(true),
++        false,
++        false,
++    )
++    .await
++    .unwrap();
+ 
+     assert_eq!(opened.session_id.0.as_ref(), "forked-in-worktree");
+     assert_eq!(opened.cwd, eff_cwd);
+@@ -501,14 +751,34 @@ async fn worktree_resume_failure_carries_local_miss_hint_like_the_tui() {
+     let (tx, _log) = spawn_fake_agent(serde_json::json!({"error": "archive unavailable"}), Ok("x"));
+     let spec = WorktreeSpec::default();
+ 
+-    let hinted = resume_session_in_new_worktree(&tx, source.path(), &spec, "my title", None, true)
+-        .await
+-        .unwrap_err()
+-        .to_string();
+-    let plain = resume_session_in_new_worktree(&tx, source.path(), &spec, "my title", None, false)
+-        .await
+-        .unwrap_err()
+-        .to_string();
++    let (_client_tx, mut acp_rx) = tokio::sync::mpsc::unbounded_channel();
++    let hinted = resume_session_in_new_worktree(
++        &tx,
++        &mut acp_rx,
++        source.path(),
++        &spec,
++        "my title",
++        None,
++        true,
++        false,
++    )
++    .await
++    .unwrap_err()
++    .to_string();
++    let (_client_tx2, mut acp_rx2) = tokio::sync::mpsc::unbounded_channel();
++    let plain = resume_session_in_new_worktree(
++        &tx,
++        &mut acp_rx2,
++        source.path(),
++        &spec,
++        "my title",
++        None,
++        false,
++        false,
++    )
++    .await
++    .unwrap_err()
++    .to_string();
+ 
+     assert_eq!(
+         plain,
 diff --git a/crates/codegen/xai-grok-shell/Cargo.toml b/crates/codegen/xai-grok-shell/Cargo.toml
 index f36d134b..53f777f9 100644
 --- a/crates/codegen/xai-grok-shell/Cargo.toml
