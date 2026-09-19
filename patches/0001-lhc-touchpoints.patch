@@ -1749,7 +1749,7 @@ index e8f3112b..c8709b99 100644
  async fn stale_task_reconcile_keeps_incrementals_without_list() {
      let (agent, mut rx) = build_agent_with_gateway();
 diff --git a/crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_setup.rs b/crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_setup.rs
-index 0ac96fa8..947f4af9 100644
+index 0ac96fa8..fb47a98e 100644
 --- a/crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_setup.rs
 +++ b/crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_setup.rs
 @@ -1459,6 +1459,12 @@ impl MvpAgent {
@@ -1787,7 +1787,7 @@ index 0ac96fa8..947f4af9 100644
          Ok((initial_total_tokens, unfinished_subagents))
      }
      /// Enqueue a persist+broadcast of the live *local* list before `session/load`
-@@ -1931,6 +1939,152 @@ pub(super) fn load_request_for_resume(args: acp::ResumeSessionRequest) -> acp::L
+@@ -1931,6 +1939,155 @@ pub(super) fn load_request_for_resume(args: acp::ResumeSessionRequest) -> acp::L
          .mcp_servers(mcp_servers)
          .meta(meta.unwrap_or_default())
  }
@@ -1838,6 +1838,7 @@ index 0ac96fa8..947f4af9 100644
 +                        cursor: None,
 +                    },
 +                    /*no_replay*/ true,
++                    /*skip_local_background_tasks_replay*/ false,
 +                );
 +                let gate_result = tokio::time::timeout(Duration::from_secs(2), gate)
 +                    .await
@@ -1906,6 +1907,7 @@ index 0ac96fa8..947f4af9 100644
 +                            cursor: None,
 +                        },
 +                        /*no_replay*/ false,
++                        /*skip_local_background_tasks_replay*/ false,
 +                    )
 +                    .await
 +                    .expect("empty replay");
@@ -1930,6 +1932,7 @@ index 0ac96fa8..947f4af9 100644
 +            GatewaySender::new(tx),
 +            &AgentConfig::default(),
 +            auth_manager,
++            None,
 +            None,
 +        )
 +        .expect("valid test config");
@@ -2767,7 +2770,7 @@ index 818462e8..8b3b6475 100644
          let mut inline_images: Vec<ContentPart> = Vec::new();
          let extraction = if !self.is_cursor_harness()
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
-index 914ae3b8..558a0bbc 100644
+index 914ae3b8..c4346ee1 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
 @@ -1611,6 +1611,40 @@ impl SessionActor {
@@ -2811,7 +2814,15 @@ index 914ae3b8..558a0bbc 100644
          xai_grok_telemetry::session_ctx::log_session_event(
              crate::agent::session_metrics::TurnCompletedLifecycle {
                  session_id: self.session_info.id.0.to_string(),
-@@ -2929,7 +2963,63 @@ impl SessionActor {
+@@ -2655,6 +2689,7 @@ impl SessionActor {
+         let mut turn_tools_called: Vec<String> = Vec::new();
+         let mut tool_turn_count: usize = 1;
+         let mut loop_index: u32 = 0;
++        let mut last_attempt_identity: Option<SamplerAttemptIdentity> = None;
+         let mut identical_tool_calls = IdenticalToolCallRun::default();
+         let mut todo_gate_fires: u32 = 0;
+         let mut length_salvage_streak = LengthSalvageStreak::default();
+@@ -2929,7 +2964,76 @@ impl SessionActor {
                  })),
              );
              let mut request = request;
@@ -2819,7 +2830,20 @@ index 914ae3b8..558a0bbc 100644
 +            // signature admission and response stamping share the exact
 +            // config this attempt will use (FIFO UpdateConfig → Submit).
 +            // Auth-retry / compact-resubmit re-enter this loop and freeze again.
-+            let mut attempt_identity = self.prepare_sampler_for_turn().await;
++            // Parked uncharged-401 resubmits skip prepare: it drives preflight
++            // refreshes. Reuse the last frozen identity; send-time resolver
++            // supplies the bearer (same contract as run_turn_via_sampler).
++            let mut attempt_identity = if turn_parked.is_parked() {
++                last_attempt_identity
++                    .clone()
++                    .unwrap_or_else(|| SamplerAttemptIdentity {
++                        api_backend: Default::default(),
++                        model: String::new(),
++                    })
++            } else {
++                self.prepare_sampler_for_turn().await
++            };
++            last_attempt_identity = Some(attempt_identity.clone());
 +            // LHC-HOOK 4/10: substitute LHC request context after build_request
 +            // (+ live identity for signature gate). Cheap atomic first, then
 +            // per-session registry — no mutex when off. Instrumented-redundant
@@ -2875,7 +2899,7 @@ index 914ae3b8..558a0bbc 100644
              request.x_grok_turn_idx =
                  Some(self.chat_state_handle.get_prompt_index().await.to_string());
              request.x_grok_agent_id = Some(xai_grok_telemetry::id::agent_id());
-@@ -2985,6 +3075,7 @@ impl SessionActor {
+@@ -2985,6 +3089,7 @@ impl SessionActor {
                          enabled: transient_retry_enabled,
                      },
                      salvage.awaiting_continuation(),
@@ -2883,7 +2907,7 @@ index 914ae3b8..558a0bbc 100644
                      turn_parked,
                  )
                  .await;
-@@ -3314,7 +3405,11 @@ impl SessionActor {
+@@ -3314,7 +3419,11 @@ impl SessionActor {
                      },
                  );
              }
@@ -3613,7 +3637,7 @@ index 00000000..0a827a69
 +}
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/lhc_real_inference_g2.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/lhc_real_inference_g2.rs
 new file mode 100644
-index 00000000..e5fc5c05
+index 00000000..fc68495e
 --- /dev/null
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/lhc_real_inference_g2.rs
 @@ -0,0 +1,516 @@
@@ -3676,7 +3700,7 @@ index 00000000..e5fc5c05
 +        .map(|i| {
 +            let kind = match i {
 +                ConversationItem::System(_) => "system",
-+                ConversationItem::User(u) if u.synthetic_reason.is_some() => "user_meta",
++                ConversationItem::User(u) if !u.synthetic_reason.is_human() => "user_meta",
 +                ConversationItem::User(_) => "user",
 +                ConversationItem::Assistant(a) if !a.tool_calls.is_empty() => "assistant_tools",
 +                ConversationItem::Assistant(_) => "assistant",
@@ -5270,7 +5294,7 @@ index fa132057..7406a7e4 100644
          if self
              .notifications
 diff --git a/crates/codegen/xai-grok-shell/src/session/helpers/replay.rs b/crates/codegen/xai-grok-shell/src/session/helpers/replay.rs
-index 4a1b90f7..c9398384 100644
+index 4a1b90f7..67231fd4 100644
 --- a/crates/codegen/xai-grok-shell/src/session/helpers/replay.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/helpers/replay.rs
 @@ -737,6 +737,7 @@ mod tests {
@@ -5281,12 +5305,20 @@ index 4a1b90f7..c9398384 100644
          };
          let bytes = serde_json::to_vec_pretty(&file).unwrap();
          std::fs::write(dir.join(format!("{checkpoint_id}.json")), bytes).unwrap();
+@@ -849,6 +850,7 @@ mod tests {
+             created_at: "2024-01-01T00:00:00Z".to_owned(),
+             original_user_info: None,
+             reread_file_paths: vec![],
++            lhc_source_tip: None,
+         };
+         let path = tmp.path().join("compaction_checkpoints/ckpt2.json");
+         std::fs::write(&path, serde_json::to_vec(&newer).unwrap()).unwrap();
 diff --git a/crates/codegen/xai-grok-shell/src/session/lhc_inference.rs b/crates/codegen/xai-grok-shell/src/session/lhc_inference.rs
 new file mode 100644
-index 00000000..c403cd77
+index 00000000..837006de
 --- /dev/null
 +++ b/crates/codegen/xai-grok-shell/src/session/lhc_inference.rs
-@@ -0,0 +1,421 @@
+@@ -0,0 +1,423 @@
 +//! Shell-side [`grok_lhc_host::LhcInferenceSampler`] — dedicated LHC transport.
 +//!
 +//! Builds a fresh client per call (credentials re-resolved via
@@ -5418,6 +5450,7 @@ index 00000000..c403cd77
 +            x_grok_deployment_id: None,
 +            x_grok_user_id: None,
 +            trace: None,
++            traceparent: None,
 +            prompt_cache_key: None,
 +            reasoning_effort: Some(self.thinking_level()),
 +            json_schema: None,
@@ -5472,6 +5505,7 @@ index 00000000..c403cd77
 +        SamplingError::Http(_)
 +        | SamplingError::Api { .. }
 +        | SamplingError::InvalidConfiguration(_)
++        | SamplingError::MtlsConfiguration(_)
 +        | SamplingError::Serialization(_)
 +        | SamplingError::EventStreamError(_)
 +        | SamplingError::StreamError { .. }
@@ -5710,10 +5744,10 @@ index 00000000..c403cd77
 +}
 diff --git a/crates/codegen/xai-grok-shell/src/session/lhc_retrieval_tools.rs b/crates/codegen/xai-grok-shell/src/session/lhc_retrieval_tools.rs
 new file mode 100644
-index 00000000..4b4a044a
+index 00000000..e1f45116
 --- /dev/null
 +++ b/crates/codegen/xai-grok-shell/src/session/lhc_retrieval_tools.rs
-@@ -0,0 +1,422 @@
+@@ -0,0 +1,416 @@
 +//! LHC Wave B retrieval tools — direct ToolBridge registration.
 +//!
 +//! Registered only while capture is active for the owning session. Tools bind
@@ -5883,27 +5917,21 @@ index 00000000..4b4a044a
 +    let turns_schema = retrieval_args_schema("Turn ids, e.g. t211");
 +    let messages_schema = retrieval_args_schema("Message ids, e.g. m3177");
 +
-+    if let Err(e) = bridge
-+        .register_mcp_tools(
-+            GET_TURNS_TOOL_NAME.to_owned(),
-+            GetTurnsTool {
-+                session: session.clone(),
-+            },
-+            Some(turns_schema),
-+        )
-+        .await
-+    {
++    if let Err(e) = bridge.register_mcp_tools(
++        GET_TURNS_TOOL_NAME.to_owned(),
++        GetTurnsTool {
++            session: session.clone(),
++        },
++        Some(turns_schema),
++    ) {
 +        unregister_lhc_retrieval_tools(bridge);
 +        return Err(format!("failed to register get_turns: {e}"));
 +    }
-+    if let Err(e) = bridge
-+        .register_mcp_tools(
-+            GET_MESSAGES_TOOL_NAME.to_owned(),
-+            GetMessagesTool { session },
-+            Some(messages_schema),
-+        )
-+        .await
-+    {
++    if let Err(e) = bridge.register_mcp_tools(
++        GET_MESSAGES_TOOL_NAME.to_owned(),
++        GetMessagesTool { session },
++        Some(messages_schema),
++    ) {
 +        // Roll back turns so the pair is never half-advertised.
 +        unregister_lhc_retrieval_tools(bridge);
 +        return Err(format!("failed to register get_messages: {e}"));
