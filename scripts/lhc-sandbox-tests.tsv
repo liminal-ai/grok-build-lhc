@@ -1,0 +1,5 @@
+# count: 3
+# Vanilla a28ee2b2 comparison: hosted 35433358472 failures only. No product edits.
+xai-grok-sandbox::integration_test	test_profile_capability_set_construction
+xai-grok-sandbox::deny_paths_e2e	read_deny_empty_set_verifies_inside_bwrap
+xai-grok-sandbox::deny_paths_e2e	devbox_genuine_reexec_applies_enforcement
