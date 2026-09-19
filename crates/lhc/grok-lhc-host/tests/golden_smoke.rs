@@ -165,7 +165,7 @@ fn user_with_image() -> ConversationItem {
                 url: "https://example.com/a.png".into(),
             },
         ],
-        synthetic_reason: None,
+        synthetic_reason: SyntheticReason::Human,
         cwd_generation: None,
         prior_turn_interrupt: None,
         prompt_index: None,
@@ -179,11 +179,11 @@ fn golden_covers_every_event_kind_and_mapping_row() {
     let imaged = user_with_image();
     let mut synthetic = ConversationItem::user("continue");
     if let ConversationItem::User(u) = &mut synthetic {
-        u.synthetic_reason = Some(SyntheticReason::AutoContinue);
+        u.synthetic_reason = SyntheticReason::AutoContinue;
     }
     let mut wake = ConversationItem::user("task done");
     if let ConversationItem::User(u) = &mut wake {
-        u.synthetic_reason = Some(SyntheticReason::TaskCompleted);
+        u.synthetic_reason = SyntheticReason::TaskCompleted;
     }
     let assistant = ConversationItem::Assistant(xai_grok_sampling_types::AssistantItem {
         content: "calling tool".into(),

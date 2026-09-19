@@ -206,7 +206,7 @@ pub fn native_prompt_indices(native: &[ConversationItem]) -> Vec<usize> {
     native
         .iter()
         .filter_map(|item| match item {
-            ConversationItem::User(u) if u.synthetic_reason.is_none() => u.prompt_index,
+            ConversationItem::User(u) if u.synthetic_reason.is_human() => u.prompt_index,
             _ => None,
         })
         .collect()
@@ -220,7 +220,7 @@ pub fn assign_prompt_indices_from_tail(body: &mut [ConversationItem], indices: &
     let mut user_slots: Vec<usize> = Vec::new();
     for (idx, item) in body.iter().enumerate() {
         if let ConversationItem::User(u) = item
-            && u.synthetic_reason.is_none()
+            && u.synthetic_reason.is_human()
         {
             user_slots.push(idx);
         }
@@ -250,7 +250,7 @@ fn runtime_note_text(item: &ConversationItem) -> Option<&str> {
     let ConversationItem::User(u) = item else {
         return None;
     };
-    if u.synthetic_reason.is_none() {
+    if u.synthetic_reason.is_human() {
         return None;
     }
     match u.content.as_slice() {
@@ -277,7 +277,7 @@ fn user_item_text(u: &xai_grok_sampling_types::UserItem) -> String {
 fn same_host_item(a: &ConversationItem, b: &ConversationItem) -> bool {
     match (a, b) {
         (ConversationItem::User(x), ConversationItem::User(y)) => {
-            x.synthetic_reason.is_some() == y.synthetic_reason.is_some()
+            x.synthetic_reason.is_human() == y.synthetic_reason.is_human()
                 && user_item_text(x) == user_item_text(y)
         }
         (ConversationItem::Assistant(x), ConversationItem::Assistant(y)) => {
@@ -332,7 +332,7 @@ pub fn align_runtime_notes_with_native(
         };
         let Some(j) = rest.iter().position(|n| {
             matches!(n, ConversationItem::User(u)
-                if u.synthetic_reason.is_some() && user_item_text(u) == text)
+                if u.synthetic_reason.is_human() == false && user_item_text(u) == text)
         }) else {
             i += 1;
             continue;
@@ -1103,7 +1103,7 @@ mod tests {
         let markers: Vec<Option<usize>> = items
             .iter()
             .filter_map(|i| match i {
-                ConversationItem::User(u) if u.synthetic_reason.is_none() => Some(u.prompt_index),
+                ConversationItem::User(u) if u.synthetic_reason.is_human() => Some(u.prompt_index),
                 _ => None,
             })
             .collect();
@@ -1114,7 +1114,7 @@ mod tests {
         let users: Vec<_> = kept
             .iter()
             .filter_map(|i| match i {
-                ConversationItem::User(u) if u.synthetic_reason.is_none() => Some(u.prompt_index),
+                ConversationItem::User(u) if u.synthetic_reason.is_human() => Some(u.prompt_index),
                 _ => None,
             })
             .collect();
@@ -1148,7 +1148,7 @@ mod tests {
         };
         let cut = conversation_truncate_for_prompt(&items, 0);
         let first_user = items[cut..].iter().find_map(|i| match i {
-            ConversationItem::User(u) if u.synthetic_reason.is_none() => Some(u.prompt_index),
+            ConversationItem::User(u) if u.synthetic_reason.is_human() => Some(u.prompt_index),
             _ => None,
         });
         assert_eq!(first_user, Some(Some(0)));
@@ -1166,7 +1166,7 @@ mod tests {
         let real: Vec<_> = items
             .iter()
             .filter_map(|i| match i {
-                ConversationItem::User(u) if u.synthetic_reason.is_none() => u.prompt_index,
+                ConversationItem::User(u) if u.synthetic_reason.is_human() => u.prompt_index,
                 _ => None,
             })
             .collect();
@@ -1216,7 +1216,7 @@ mod tests {
         match pasted_item {
             ConversationItem::User(u) => {
                 assert!(
-                    u.synthetic_reason.is_none(),
+                    u.synthetic_reason.is_human(),
                     "typed real user must not become CompactionMeta"
                 );
                 assert_eq!(u.prompt_index, Some(1));
@@ -1236,11 +1236,11 @@ mod tests {
         .unwrap();
         assert!(matches!(
             &items[0],
-            ConversationItem::User(u) if u.synthetic_reason.is_some()
+            ConversationItem::User(u) if u.synthetic_reason.is_human() == false
         ));
         assert!(matches!(
             &items[1],
-            ConversationItem::User(u) if u.synthetic_reason.is_none()
+            ConversationItem::User(u) if u.synthetic_reason.is_human()
         ));
     }
 
@@ -1595,7 +1595,7 @@ mod tests {
                 .iter()
                 .map(|i| match i {
                     ConversationItem::System(_) => "sys",
-                    ConversationItem::User(u) if u.synthetic_reason.is_some() => "meta",
+                    ConversationItem::User(u) if u.synthetic_reason.is_human() == false => "meta",
                     ConversationItem::User(_) => "user",
                     ConversationItem::Assistant(_) => "asst",
                     ConversationItem::ToolResult(_) => "tool",
@@ -1619,7 +1619,7 @@ mod tests {
             items
                 .iter()
                 .filter_map(|i| match i {
-                    ConversationItem::User(u) if u.synthetic_reason.is_none() => {
+                    ConversationItem::User(u) if u.synthetic_reason.is_human() => {
                         Some(i.text_content())
                     }
                     _ => None,
@@ -1665,7 +1665,7 @@ mod tests {
         match &items[0] {
             ConversationItem::User(u) => {
                 assert!(
-                    u.synthetic_reason.is_some(),
+                    u.synthetic_reason.is_human() == false,
                     "RuntimeNote message_id must classify as user_meta"
                 );
             }
@@ -1675,7 +1675,7 @@ mod tests {
         let unknown = SourceKindIndex::new();
         let items = session_view_to_serve_items(&v, &unknown, None).unwrap();
         assert!(
-            matches!(&items[0], ConversationItem::User(u) if u.synthetic_reason.is_some()),
+            matches!(&items[0], ConversationItem::User(u) if u.synthetic_reason.is_human() == false),
             "lookup miss must not promote to real user"
         );
     }
@@ -1690,7 +1690,7 @@ mod tests {
         let real: Vec<_> = items
             .iter()
             .filter_map(|i| match i {
-                ConversationItem::User(u) if u.synthetic_reason.is_none() => Some(i.text_content()),
+                ConversationItem::User(u) if u.synthetic_reason.is_human() => Some(i.text_content()),
                 _ => None,
             })
             .collect();
@@ -1703,7 +1703,7 @@ mod tests {
         );
         assert!(
             items.iter().any(|i| {
-                matches!(i, ConversationItem::User(u) if u.synthetic_reason.is_some())
+                matches!(i, ConversationItem::User(u) if u.synthetic_reason.is_human() == false)
                     && i.text_content().contains("cwd switched")
             }),
             "runtime note must write back as user_meta"
@@ -1721,7 +1721,7 @@ mod tests {
         let real_users: Vec<_> = items
             .iter()
             .filter_map(|i| match i {
-                ConversationItem::User(u) if u.synthetic_reason.is_none() => Some(i.text_content()),
+                ConversationItem::User(u) if u.synthetic_reason.is_human() => Some(i.text_content()),
                 _ => None,
             })
             .collect();
@@ -1741,7 +1741,7 @@ mod tests {
                 let kind = match i {
                     ConversationItem::System(_) => "sys",
                     ConversationItem::User(u) => {
-                        if u.synthetic_reason.is_some() {
+                        if u.synthetic_reason.is_human() == false {
                             "meta"
                         } else {
                             "user"
@@ -1785,7 +1785,7 @@ mod tests {
         let markers: Vec<Option<usize>> = items
             .iter()
             .filter_map(|i| match i {
-                ConversationItem::User(u) if u.synthetic_reason.is_none() => Some(u.prompt_index),
+                ConversationItem::User(u) if u.synthetic_reason.is_human() => Some(u.prompt_index),
                 _ => None,
             })
             .collect();
@@ -1794,7 +1794,7 @@ mod tests {
         let kept_users: Vec<_> = items[cut..]
             .iter()
             .filter_map(|i| match i {
-                ConversationItem::User(u) if u.synthetic_reason.is_none() => Some(u.prompt_index),
+                ConversationItem::User(u) if u.synthetic_reason.is_human() => Some(u.prompt_index),
                 _ => None,
             })
             .collect();
@@ -1827,7 +1827,7 @@ mod tests {
         .expect("writeback");
         let cut = conversation_truncate_for_prompt(&items, 5);
         let first = items[cut..].iter().find_map(|i| match i {
-            ConversationItem::User(u) if u.synthetic_reason.is_none() => Some(u.prompt_index),
+            ConversationItem::User(u) if u.synthetic_reason.is_human() => Some(u.prompt_index),
             _ => None,
         });
         assert_eq!(first, Some(Some(5)));
@@ -1844,7 +1844,7 @@ mod tests {
             .filter_map(|i| match i {
                 ConversationItem::User(u)
                     if u.synthetic_reason
-                        == Some(xai_grok_sampling_types::SyntheticReason::CompactionMeta) =>
+                        == xai_grok_sampling_types::SyntheticReason::CompactionMeta =>
                 {
                     Some(i.text_content())
                 }
@@ -1918,7 +1918,7 @@ mod tests {
         assert!(matches!(
             &served[2],
             ConversationItem::User(u)
-                if u.synthetic_reason == Some(xai_grok_sampling_types::SyntheticReason::SystemReminder)
+                if u.synthetic_reason == xai_grok_sampling_types::SyntheticReason::SystemReminder
         ));
     }
 
@@ -1944,7 +1944,7 @@ mod tests {
         assert!(matches!(&body[0], ConversationItem::User(u)
             if user_item_text(u) == "[runtime note] cwd switched"));
         assert!(matches!(&body[2], ConversationItem::User(u)
-            if u.synthetic_reason == Some(xai_grok_sampling_types::SyntheticReason::SystemReminder)
+            if u.synthetic_reason == xai_grok_sampling_types::SyntheticReason::SystemReminder
                 && user_item_text(u) == "R"));
     }
 

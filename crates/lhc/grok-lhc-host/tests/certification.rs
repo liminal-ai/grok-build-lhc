@@ -322,7 +322,7 @@ fn replace_history_records_compaction_meta_only() {
 
     let mut summary = ConversationItem::user("compacted summary");
     if let ConversationItem::User(u) = &mut summary {
-        u.synthetic_reason = Some(SyntheticReason::CompactionMeta);
+        u.synthetic_reason = SyntheticReason::CompactionMeta;
     }
     let compacted = vec![summary, full[3].clone()];
     handle.replace_history(&compacted);
@@ -803,7 +803,7 @@ fn aborted_tool_turn_closed_by_synthetic_wake() {
     ));
     let mut wake = ConversationItem::user("task done");
     if let ConversationItem::User(u) = &mut wake {
-        u.synthetic_reason = Some(SyntheticReason::TaskCompleted);
+        u.synthetic_reason = SyntheticReason::TaskCompleted;
     }
     handle.persist(&wake);
     handle.flush_blocking();
@@ -1451,7 +1451,7 @@ fn writeback_body_is_fixpoint_through_replace_history() {
             .map(|i| {
                 let kind = match i {
                     ConversationItem::System(_) => "system",
-                    ConversationItem::User(u) if u.synthetic_reason.is_some() => "user_meta",
+                    ConversationItem::User(u) if u.synthetic_reason.is_human() == false => "user_meta",
                     ConversationItem::User(_) => "user",
                     ConversationItem::Assistant(a) if !a.tool_calls.is_empty() => "assistant_tools",
                     ConversationItem::Assistant(_) => "assistant",
@@ -2820,7 +2820,7 @@ fn writeback_live_tail_kinds_round_trip() {
     );
     assert!(
         body.iter().any(|i| {
-            matches!(i, ConversationItem::User(u) if u.synthetic_reason.is_some())
+            matches!(i, ConversationItem::User(u) if u.synthetic_reason.is_human() == false)
                 && i.text_content().contains(NOTE)
         }),
         "runtime note must remain user_meta"
@@ -4207,7 +4207,7 @@ fn writeback_crash_between_lhc_compact_and_native_replace_is_transient() {
     let meta_with_band = body
         .iter()
         .filter(|i| {
-            matches!(i, ConversationItem::User(u) if u.synthetic_reason.is_some())
+            matches!(i, ConversationItem::User(u) if u.synthetic_reason.is_human() == false)
                 && band_texts.iter().any(|b| i.text_content().contains(b))
         })
         .count();

@@ -341,13 +341,13 @@ fn raw_fingerprint(item: &ConversationItem) -> String {
             push_framed(&mut out, s.content.as_ref());
         }
         ConversationItem::User(u) => {
-            out.push_str(if u.synthetic_reason.is_some() {
-                "user_meta"
-            } else {
+            out.push_str(if u.synthetic_reason.is_human() {
                 "user"
+            } else {
+                "user_meta"
             });
-            // PIN: User.synthetic_reason
-            push_option_dbg(&mut out, u.synthetic_reason.as_ref());
+            // PIN: User.synthetic_reason (enum, never optional)
+            push_framed(&mut out, &format!("{:?}", u.synthetic_reason));
             // PIN: User.cwd_generation
             push_option_dbg(&mut out, u.cwd_generation.as_ref());
             // PIN: User.prior_turn_interrupt
@@ -1280,7 +1280,7 @@ mod tests {
     fn base_user() -> xai_grok_sampling_types::UserItem {
         xai_grok_sampling_types::UserItem {
             content: vec![ContentPart::Text { text: "hi".into() }],
-            synthetic_reason: None,
+            synthetic_reason: SyntheticReason::Human,
             cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
@@ -1292,8 +1292,8 @@ mod tests {
         use xai_grok_sampling_types::SyntheticReason;
         let mut a = base_user();
         let mut b = base_user();
-        a.synthetic_reason = Some(SyntheticReason::CompactionMeta);
-        b.synthetic_reason = Some(SyntheticReason::SystemReminder);
+        a.synthetic_reason = SyntheticReason::CompactionMeta;
+        b.synthetic_reason = SyntheticReason::SystemReminder;
         assert_fp_diff(
             ConversationItem::User(a),
             ConversationItem::User(b),
@@ -2042,7 +2042,7 @@ mod tests {
     fn pin_kind_user_meta() {
         use xai_grok_sampling_types::SyntheticReason;
         let mut u = base_user();
-        u.synthetic_reason = Some(SyntheticReason::CompactionMeta);
+        u.synthetic_reason = SyntheticReason::CompactionMeta;
         assert_kind_prefix(&ConversationItem::User(u), "user_meta", "kind.user_meta");
     }
 
@@ -2317,8 +2317,8 @@ mod tests {
         // user vs user_meta changes kind tag too; keep both as user_meta-capable
         // by using CompactionMeta vs None on items that stay "user" when None —
         // kind prefix differs (user vs user_meta). Pin presence on meta arm:
-        a.synthetic_reason = None;
-        b.synthetic_reason = Some(SyntheticReason::CompactionMeta);
+        a.synthetic_reason = SyntheticReason::Human;
+        b.synthetic_reason = SyntheticReason::CompactionMeta;
         // Kind tag differs by design (user vs user_meta) — still a real wire
         // difference the fingerprint must see.
         assert_fp_diff(

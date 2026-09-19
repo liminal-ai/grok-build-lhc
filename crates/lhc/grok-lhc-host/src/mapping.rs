@@ -230,23 +230,24 @@ pub fn map_item(
                 None,
             )]
         }
-        ConversationItem::User(user) => match &user.synthetic_reason {
-            None => {
+        ConversationItem::User(user) => {
+            if user.synthetic_reason.is_human() {
                 let (text, blocks) = content_parts_blocks(&user.content);
                 vec![user_prompt_event(
                     session_id, generation, &digest, occ, &text, blocks,
                 )]
+            } else {
+                map_synthetic_user(
+                    session_id,
+                    generation,
+                    &digest,
+                    occ,
+                    &user.synthetic_reason,
+                    user,
+                    turn_end_facts,
+                )
             }
-            Some(reason) => map_synthetic_user(
-                session_id,
-                generation,
-                &digest,
-                occ,
-                reason,
-                user,
-                turn_end_facts,
-            ),
-        },
+        }
         ConversationItem::Assistant(assistant) => {
             let mut out = Vec::new();
             let text = assistant.content.as_ref();
@@ -322,7 +323,11 @@ fn map_synthetic_user(
         // another agent) is a turn start; `Unknown` flipped to a turn start
         // (fail-safe boundary for future reasons); `LengthContinue` is the
         // mid-turn continue reminder after a salvaged Length truncation.
-        SyntheticReason::AgentMessage
+        SyntheticReason::Human
+        | SyntheticReason::AgentMessage
+        | SyntheticReason::ParentHumanMessage
+        | SyntheticReason::DirectBash
+        | SyntheticReason::GoalSetup
         | SyntheticReason::Unknown
         | SyntheticReason::TaskCompleted
         | SyntheticReason::SubagentCompleted
@@ -332,7 +337,9 @@ fn map_synthetic_user(
             debug_assert!(reason.starts_prompt_turn());
             true
         }
-        SyntheticReason::CompactionMeta
+        SyntheticReason::Primary
+        | SyntheticReason::SessionPrefix
+        | SyntheticReason::CompactionMeta
         | SyntheticReason::SystemReminder
         | SyntheticReason::LengthContinue
         | SyntheticReason::ProjectInstructions
