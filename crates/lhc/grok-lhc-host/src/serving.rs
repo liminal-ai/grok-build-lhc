@@ -1690,7 +1690,9 @@ mod tests {
         let real: Vec<_> = items
             .iter()
             .filter_map(|i| match i {
-                ConversationItem::User(u) if u.synthetic_reason.is_human() => Some(i.text_content()),
+                ConversationItem::User(u) if u.synthetic_reason.is_human() => {
+                    Some(i.text_content())
+                }
                 _ => None,
             })
             .collect();
@@ -1721,7 +1723,9 @@ mod tests {
         let real_users: Vec<_> = items
             .iter()
             .filter_map(|i| match i {
-                ConversationItem::User(u) if u.synthetic_reason.is_human() => Some(i.text_content()),
+                ConversationItem::User(u) if u.synthetic_reason.is_human() => {
+                    Some(i.text_content())
+                }
                 _ => None,
             })
             .collect();

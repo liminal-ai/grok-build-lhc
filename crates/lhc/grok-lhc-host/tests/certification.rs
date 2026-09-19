@@ -1451,7 +1451,9 @@ fn writeback_body_is_fixpoint_through_replace_history() {
             .map(|i| {
                 let kind = match i {
                     ConversationItem::System(_) => "system",
-                    ConversationItem::User(u) if u.synthetic_reason.is_human() == false => "user_meta",
+                    ConversationItem::User(u) if u.synthetic_reason.is_human() == false => {
+                        "user_meta"
+                    }
                     ConversationItem::User(_) => "user",
                     ConversationItem::Assistant(a) if !a.tool_calls.is_empty() => "assistant_tools",
                     ConversationItem::Assistant(_) => "assistant",

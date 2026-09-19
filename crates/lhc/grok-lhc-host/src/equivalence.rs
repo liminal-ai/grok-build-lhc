@@ -737,6 +737,7 @@ pub fn reset_equivalence_counters() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xai_grok_sampling_types::SyntheticReason;
     use xai_grok_sampling_types::ToolCall;
 
     #[test]

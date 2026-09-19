@@ -1022,7 +1022,7 @@ mod tests {
         for reason in starters {
             let mut item = ConversationItem::user("wake");
             if let ConversationItem::User(u) = &mut item {
-                u.synthetic_reason = Some(reason.clone());
+                u.synthetic_reason = reason.clone();
             }
             let mut t = OccurrenceTracker::new();
             let ev = map_item("s", 0, &item, &mut t, &empty_facts());
@@ -1043,7 +1043,7 @@ mod tests {
         for reason in [SyntheticReason::Interjection, SyntheticReason::GoalSummary] {
             let mut item = ConversationItem::user("mid");
             if let ConversationItem::User(u) = &mut item {
-                u.synthetic_reason = Some(reason);
+                u.synthetic_reason = reason;
             }
             let mut t = OccurrenceTracker::new();
             let ev = map_item("s", 0, &item, &mut t, &empty_facts());
