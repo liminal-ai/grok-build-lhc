@@ -1364,10 +1364,10 @@ index e0b8a786..9ba4dfb3 100644
      completed_tasks: HashSet<String>,
      subagents: HashMap<String, SubagentLifecycleState>,
 diff --git a/crates/codegen/xai-grok-pager/src/headless_tests.rs b/crates/codegen/xai-grok-pager/src/headless_tests.rs
-index 4a9d0963..29a7be33 100644
+index 4a9d0963..ff23894c 100644
 --- a/crates/codegen/xai-grok-pager/src/headless_tests.rs
 +++ b/crates/codegen/xai-grok-pager/src/headless_tests.rs
-@@ -109,6 +109,223 @@ fn drain_records_task_backgrounded_delivered_at_exit() {
+@@ -109,6 +109,400 @@ fn drain_records_task_backgrounded_delivered_at_exit() {
      );
  }
  
@@ -1588,10 +1588,187 @@ index 4a9d0963..29a7be33 100644
 +        .await;
 +}
 +
++/// YOLO cold attach must select AllowOnce rather than cancel, still without
++/// deadlocking the outstanding NewSession oneshot.
++#[tokio::test(flavor = "current_thread")]
++async fn cold_attach_yolo_selects_allow_once_without_deadlock() {
++    use std::time::Duration;
++
++    use xai_acp_lib::{AcpAgentMessage, AcpArgs, AcpClientMessage, acp_channels};
++
++    let (client, mut agent) = acp_channels();
++    let acp_tx = client.tx;
++    let mut acp_rx = client.rx;
++
++    let local = tokio::task::LocalSet::new();
++    local
++        .run_until(async move {
++            let peer = tokio::task::spawn_local(async move {
++                let msg = agent.rx.recv().await.expect("new_session request");
++                let AcpAgentMessage::NewSession(args) = msg else {
++                    panic!("expected NewSession, got {msg:?}");
++                };
++
++                let (perm_tx, perm_rx) = tokio::sync::oneshot::channel();
++                agent
++                    .tx
++                    .send(AcpClientMessage::RequestPermission(AcpArgs {
++                        request: acp::RequestPermissionRequest::new(
++                            acp::SessionId::new("s-yolo"),
++                            acp::ToolCallUpdate::new(
++                                acp::ToolCallId::new(std::sync::Arc::from("tc-yolo")),
++                                acp::ToolCallUpdateFields::default(),
++                            ),
++                            vec![acp::PermissionOption::new(
++                                acp::PermissionOptionId::new(std::sync::Arc::from("allow-once")),
++                                "Allow once",
++                                acp::PermissionOptionKind::AllowOnce,
++                            )],
++                        ),
++                        response_tx: perm_tx,
++                    }))
++                    .unwrap();
++
++                let outcome = tokio::time::timeout(Duration::from_secs(2), perm_rx)
++                    .await
++                    .expect("permission request not answered during yolo cold attach")
++                    .expect("permission oneshot closed");
++                let resp = outcome.expect("permission reply error");
++                match resp.outcome {
++                    acp::RequestPermissionOutcome::Selected(selected) => {
++                        assert_eq!(selected.option_id.0.as_ref(), "allow-once");
++                    }
++                    other => panic!("yolo cold attach must select AllowOnce, got {other:?}"),
++                }
++
++                args.response_tx
++                    .send(Ok(acp::NewSessionResponse::new(acp::SessionId::new(
++                        "s-yolo",
++                    ))))
++                    .unwrap();
++            });
++
++            let mut inbox = super::ColdAttachInbox::default();
++            let resp = tokio::time::timeout(
++                Duration::from_secs(3),
++                super::acp_send_servicing_cold_attach(
++                    acp::NewSessionRequest::new(std::path::PathBuf::from("/tmp")),
++                    &acp_tx,
++                    &mut acp_rx,
++                    &mut inbox,
++                    /*yolo*/ true,
++                ),
++            )
++            .await
++            .expect("new_session deadlocked on unanswered yolo permission")
++            .expect("new_session ok");
++            assert_eq!(resp.session_id.0.as_ref(), "s-yolo");
++            peer.await.expect("peer");
++        })
++        .await;
++}
++
++/// Live `task_backgrounded` during cold load must arm wait-for-background
++/// (`pending_bg`) rather than the quiet completed-task tombstone used for
++/// stale `task_completed`.
++#[tokio::test(flavor = "current_thread")]
++async fn cold_load_task_backgrounded_arms_pending_lifecycle() {
++    use std::time::Duration;
++
++    use xai_acp_lib::{AcpAgentMessage, AcpArgs, AcpClientMessage, acp_channels};
++
++    let (client, mut agent) = acp_channels();
++    let acp_tx = client.tx;
++    let mut acp_rx = client.rx;
++
++    let local = tokio::task::LocalSet::new();
++    local
++        .run_until(async move {
++            let peer = tokio::task::spawn_local(async move {
++                let msg = agent
++                    .rx
++                    .recv()
++                    .await
++                    .expect("client must send session/load");
++                let AcpAgentMessage::LoadSession(args) = msg else {
++                    panic!("expected LoadSession, got {msg:?}");
++                };
++
++                let payload = serde_json::json!({
++                    "sessionId": "s-bg-load",
++                    "update": {
++                        "sessionUpdate": "task_backgrounded",
++                        "task_id": "bg-live-1",
++                    },
++                });
++                let raw = serde_json::value::to_raw_value(&payload).unwrap();
++                let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
++                agent
++                    .tx
++                    .send(AcpClientMessage::ExtNotification(AcpArgs {
++                        request: acp::ExtNotification::new("x.ai/task_backgrounded", raw.into()),
++                        response_tx: completion_tx,
++                    }))
++                    .expect("enqueue task_backgrounded while load outstanding");
++
++                tokio::time::timeout(Duration::from_secs(2), completion_rx)
++                    .await
++                    .expect("task_backgrounded was not acknowledged during session/load")
++                    .expect("task_backgrounded oneshot closed")
++                    .expect("task_backgrounded ack");
++
++                args.response_tx
++                    .send(Ok(acp::LoadSessionResponse::new()))
++                    .expect("deliver LoadSessionResponse after nested ack");
++            });
++
++            let mut inbox = super::ColdAttachInbox::default();
++            let load = super::acp_send_servicing_cold_attach(
++                acp::LoadSessionRequest::new(
++                    acp::SessionId::new("s-bg-load"),
++                    std::path::PathBuf::from("/tmp"),
++                )
++                .meta({
++                    let mut m = acp::Meta::new();
++                    m.insert("noReplay".into(), serde_json::Value::Bool(true));
++                    Some(m)
++                }),
++                &acp_tx,
++                &mut acp_rx,
++                &mut inbox,
++                /*yolo*/ false,
++            );
++
++            tokio::time::timeout(Duration::from_secs(3), load)
++                .await
++                .expect("session/load deadlocked on task_backgrounded")
++                .expect("session/load should succeed");
++
++            assert!(
++                inbox
++                    .pending_bg
++                    .contains(&super::BackgroundWork::Task("bg-live-1".into())),
++                "live task_backgrounded must arm pending work: {:?}",
++                inbox.pending_bg
++            );
++            assert!(
++                !inbox
++                    .background_lifecycle
++                    .completed_tasks
++                    .contains("bg-live-1"),
++                "live backgrounded task is not a completed tombstone: {:?}",
++                inbox.background_lifecycle.completed_tasks
++            );
++
++            peer.await.expect("peer task");
++        })
++        .await;
++}
++
  /// `begin_session` runs before the model and effort are applied, so a post-open error carries the real context.
  #[test]
  fn post_open_error_carries_real_session_context() {
-@@ -320,7 +537,8 @@ async fn worktree_create_opens_session_at_worktree_subdirectory() {
+@@ -320,7 +714,8 @@ async fn worktree_create_opens_session_at_worktree_subdirectory() {
      );
      let spec = WorktreeSpec::from_cli(Some("fix"), Some("origin/main")).unwrap();
  
@@ -1601,7 +1778,7 @@ index 4a9d0963..29a7be33 100644
          .await
          .unwrap();
  
-@@ -365,10 +583,17 @@ async fn worktree_create_with_session_id_names_worktree_and_session() {
+@@ -365,10 +760,17 @@ async fn worktree_create_with_session_id_names_worktree_and_session() {
      );
      let sid = "2d3c6b3e-3d43-4f0a-9d2e-2b6d1b6a9c11";
  
@@ -1623,7 +1800,7 @@ index 4a9d0963..29a7be33 100644
  
      assert_eq!(opened.session_id.0.as_ref(), sid);
      assert_eq!(opened.cwd, wt_root.path());
-@@ -406,10 +631,18 @@ async fn worktree_create_failure_is_reported_before_any_session_opens() {
+@@ -406,10 +808,19 @@ async fn worktree_create_failure_is_reported_before_any_session_opens() {
          ),
      ] {
          let (tx, log) = spawn_fake_agent(reply, Ok("never"));
@@ -1641,12 +1818,13 @@ index 4a9d0963..29a7be33 100644
 +            false,
 +        )
 +        .await
-+        .unwrap_err()
++        .err()
++        .expect("worktree create must fail")
 +        .to_string();
          assert!(err.contains("couldn't create worktree"), "{err}");
          assert!(err.contains(expect), "{err}");
          assert!(log.lock().unwrap().new_sessions.is_empty());
-@@ -425,10 +658,18 @@ async fn worktree_create_then_session_failure_names_the_orphaned_worktree() {
+@@ -425,10 +836,19 @@ async fn worktree_create_then_session_failure_names_the_orphaned_worktree() {
          Err("agent refused"),
      );
  
@@ -1664,12 +1842,13 @@ index 4a9d0963..29a7be33 100644
 +        false,
 +    )
 +    .await
-+    .unwrap_err()
++    .err()
++    .expect("session open after worktree create must fail")
 +    .to_string();
  
      assert!(err.contains("agent refused"), "{err}");
      assert!(err.contains(&wt_root.path().display().to_string()), "{err}");
-@@ -451,10 +692,19 @@ async fn worktree_resume_loads_reported_session_without_re_restoring_code() {
+@@ -451,10 +871,19 @@ async fn worktree_resume_loads_reported_session_without_re_restoring_code() {
      );
      let spec = WorktreeSpec::from_cli(Some(""), Some("v1.2")).unwrap();
  
@@ -1693,7 +1872,7 @@ index 4a9d0963..29a7be33 100644
  
      assert_eq!(opened.session_id.0.as_ref(), "forked-in-worktree");
      assert_eq!(opened.cwd, eff_cwd);
-@@ -501,14 +751,34 @@ async fn worktree_resume_failure_carries_local_miss_hint_like_the_tui() {
+@@ -501,14 +930,36 @@ async fn worktree_resume_failure_carries_local_miss_hint_like_the_tui() {
      let (tx, _log) = spawn_fake_agent(serde_json::json!({"error": "archive unavailable"}), Ok("x"));
      let spec = WorktreeSpec::default();
  
@@ -1717,7 +1896,8 @@ index 4a9d0963..29a7be33 100644
 +        false,
 +    )
 +    .await
-+    .unwrap_err()
++    .err()
++    .expect("hinted worktree resume must fail")
 +    .to_string();
 +    let (_client_tx2, mut acp_rx2) = tokio::sync::mpsc::unbounded_channel();
 +    let plain = resume_session_in_new_worktree(
@@ -1731,16 +1911,35 @@ index 4a9d0963..29a7be33 100644
 +        false,
 +    )
 +    .await
-+    .unwrap_err()
++    .err()
++    .expect("plain worktree resume must fail")
 +    .to_string();
  
      assert_eq!(
          plain,
 diff --git a/crates/codegen/xai-grok-shell/Cargo.toml b/crates/codegen/xai-grok-shell/Cargo.toml
-index f36d134b..53f777f9 100644
+index f36d134b..8a9173aa 100644
 --- a/crates/codegen/xai-grok-shell/Cargo.toml
 +++ b/crates/codegen/xai-grok-shell/Cargo.toml
-@@ -134,6 +134,8 @@ xai-interjection-core = { workspace = true }
+@@ -9,9 +9,14 @@ default = []
+ dhat-heap = ["dep:dhat"]
+ # Session synthesis + in-process e2e harness (`session::testkit`) for soak,
+ # load, and bench tests. Off by default; the tests/benches that use it declare
+-# it via `required-features`. Forwards login and sampler `test-support` so
+-# downstream test builds see those crates' test seams.
+-test-support = ["xai-grok-login/test-support", "xai-grok-sampler/test-support"]
++# it via `required-features`. Forwards login, sampler, and workspace
++# `test-support` so pager/headless test builds see `WorkspaceOps::for_test`
++# when `isolated_spawn_e2e` is compiled.
++test-support = [
++    "xai-grok-login/test-support",
++    "xai-grok-sampler/test-support",
++    "xai-grok-workspace/test-support",
++]
+ test-util = []
+ # Local Computer Hub workspace_server (own/attach + crash-restart). Requires
+ local-workspace = []
+@@ -134,6 +139,8 @@ xai-interjection-core = { workspace = true }
  xai-message-delivery-core = { workspace = true }
  xai-grok-sandbox = { path = "../xai-grok-sandbox", default-features = false }
  xai-chat-state = { path = "../xai-chat-state" }
@@ -1749,7 +1948,7 @@ index f36d134b..53f777f9 100644
  # Segment markdown rendering + the `compaction/` store path convention.
  xai-compaction-transcript = { workspace = true }
  xai-grok-compaction = { path = "../../common/xai-grok-compaction" }
-@@ -205,6 +207,11 @@ ctor = { workspace = true }
+@@ -205,6 +212,11 @@ ctor = { workspace = true }
  filetime = { workspace = true }
  pretty_assertions = { workspace = true }
  tempfile = { workspace = true }
@@ -3022,7 +3221,7 @@ index 818462e8..8b3b6475 100644
          let mut inline_images: Vec<ContentPart> = Vec::new();
          let extraction = if !self.is_cursor_harness()
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
-index 914ae3b8..c4346ee1 100644
+index 914ae3b8..b867bf78 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
 @@ -1611,6 +1611,40 @@ impl SessionActor {
@@ -3086,12 +3285,12 @@ index 914ae3b8..c4346ee1 100644
 +            // refreshes. Reuse the last frozen identity; send-time resolver
 +            // supplies the bearer (same contract as run_turn_via_sampler).
 +            let mut attempt_identity = if turn_parked.is_parked() {
++                // Parked resubmits skip prepare (it drives preflight
++                // refreshes). The previous iteration froze the identity;
++                // never invent an empty model / default backend.
 +                last_attempt_identity
 +                    .clone()
-+                    .unwrap_or_else(|| SamplerAttemptIdentity {
-+                        api_backend: Default::default(),
-+                        model: String::new(),
-+                    })
++                    .expect("parked resubmit must reuse the last frozen SamplerAttemptIdentity")
 +            } else {
 +                self.prepare_sampler_for_turn().await
 +            };
@@ -5104,18 +5303,118 @@ index 63c41fc0..339907fc 100644
      let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
          ImageBuffer::from_pixel(32, 32, Rgba([128, 64, 32, 255]));
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/turn/auth_retry_budget_tests.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/turn/auth_retry_budget_tests.rs
-index dfcdd20c..579dd011 100644
+index dfcdd20c..672c0f0e 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/turn/auth_retry_budget_tests.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/turn/auth_retry_budget_tests.rs
-@@ -814,6 +814,7 @@ async fn parked_429_wait_does_not_drive_refreshes() {
+@@ -164,7 +164,6 @@ fn drain_persistence(mut rx: tokio::sync::mpsc::UnboundedReceiver<PersistenceMsg
+ }
+ 
+ /// Shape options for [`session_token_actor`].
+-#[derive(Default)]
+ struct ActorShape {
+     /// Shape the actor like a spawned subagent turn — the only shape that
+     /// gets a 429 wait budget.
+@@ -173,6 +172,24 @@ struct ActorShape {
+     task_output_budget: Option<u64>,
+     /// Flip the `uncharged_401_park` kill switch off.
+     park_disabled: bool,
++    /// Sampler transport retry policy. Default `max_retries: 0` keeps 401
++    /// tests from absorbing retries inside the sampler. Parked 429 coverage
++    /// must disable the sampler's rate-limit loop so the pacer owns the wait.
++    retry_policy: xai_grok_sampler::RetryPolicy,
++}
++
++impl Default for ActorShape {
++    fn default() -> Self {
++        Self {
++            is_subagent: false,
++            task_output_budget: None,
++            park_disabled: false,
++            retry_policy: xai_grok_sampler::RetryPolicy {
++                max_retries: 0,
++                ..Default::default()
++            },
++        }
++    }
+ }
+ 
+ /// Actor wired for session-token auth against the mock server: a real sampler, the `cached_token` method, and the supplied auth manager.
+@@ -182,25 +199,20 @@ async fn session_token_actor(
+     auth_manager: Arc<AuthManager>,
+     shape: ActorShape,
+ ) -> (Arc<SessionActor>, XaiUpdates) {
++    let retry_policy = shape.retry_policy.clone();
+     let sampling_cfg = xai_grok_sampler::SamplerConfig {
+         base_url: server.url(),
+         model: "test".to_string(),
+         api_backend: xai_grok_sampler::ApiBackend::Responses,
+         context_window: 256_000,
+-        max_retries: Some(0),
++        max_retries: Some(retry_policy.max_retries),
+         idle_timeout_secs: Some(30),
+         ..Default::default()
+     };
+     let (sampler_event_tx, sampler_event_rx) =
+         tokio::sync::mpsc::unbounded_channel::<xai_grok_sampler::SamplingEvent>();
+-    let sampler_handle = xai_grok_sampler::SamplerActor::spawn(
+-        sampling_cfg,
+-        xai_grok_sampler::RetryPolicy {
+-            max_retries: 0,
+-            ..Default::default()
+-        },
+-        sampler_event_tx,
+-    );
++    let sampler_handle =
++        xai_grok_sampler::SamplerActor::spawn(sampling_cfg, retry_policy.clone(), sampler_event_tx);
+ 
+     let (gateway_tx, gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+     let xai_updates = drain_gateway(gateway_rx);
+@@ -233,6 +245,11 @@ async fn session_token_actor(
+     cfg.base_url = server.url();
+     cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+     cfg.model = "test".to_string();
++    if retry_policy.rate_limit_retry_threshold == xai_grok_sampler::RATE_LIMIT_RETRY_DISABLED {
++        cfg.max_retries = Some(retry_policy.max_retries);
++        cfg.rate_limit_retry_threshold = Some(retry_policy.rate_limit_retry_threshold);
++        actor.max_retries = retry_policy.max_retries;
++    }
+     actor.chat_state_handle.update_sampling_config(cfg);
+     let mut creds = actor.chat_state_handle.get_credentials().await;
+     creds.api_key = None;
+@@ -792,10 +809,13 @@ async fn parked_429_wait_does_not_drive_refreshes() {
+             let server = MockInferenceServer::start_with_models(vec![MockModelEntry::new("test")])
+                 .await
+                 .expect("mock inference server");
+-            // One 429 rung, then the default 200: exactly one paced wait.
++            // One surfaced 429 (retry-after + sampler rate-limit loop disabled),
++            // then the default 200: exactly one paced wait. JSON 429 with the
++            // default sampler policy is absorbed inside the sampler and never
++            // reaches the pacer.
+             server.enqueue_response(
+                 "/v1/responses",
+-                ScriptedResponse::json(429, serde_json::json!({ "error": "rate limited" })),
++                super::rate_limit_backoff_tests::rate_limited_reply(1),
+             );
+ 
+             let refresher = Arc::new(DeferredRefreshNeverLands::default());
+@@ -807,6 +827,7 @@ async fn parked_429_wait_does_not_drive_refreshes() {
+                 am,
+                 ActorShape {
+                     is_subagent: true,
++                    retry_policy: super::rate_limit_backoff_tests::sampler_surfaces_429(),
+                     ..Default::default()
+                 },
+             )
+@@ -814,6 +835,8 @@ async fn parked_429_wait_does_not_drive_refreshes() {
  
              let request = super::rate_limit_backoff_tests::conversation_request(&actor).await;
              let mut budget = actor.rate_limit_wait_budget(None);
 +            let mut attempt = actor.prepare_sampler_for_turn().await;
++            let preflights_after_prepare = pre_request_calls.load(Ordering::SeqCst);
              let outcome = tokio::time::timeout(
                  Duration::from_secs(300),
                  actor.run_turn_via_sampler(
-@@ -821,6 +822,7 @@ async fn parked_429_wait_does_not_drive_refreshes() {
+@@ -821,6 +844,7 @@ async fn parked_429_wait_does_not_drive_refreshes() {
                      &mut budget,
                      transient_state(0, true),
                      false,
@@ -5123,10 +5422,32 @@ index dfcdd20c..579dd011 100644
                      TurnParkState::Parked,
                  ),
              )
+@@ -832,10 +856,10 @@ async fn parked_429_wait_does_not_drive_refreshes() {
+             );
+             assert_eq!(budget.attempts_used(), 1, "the pacer must own the 429 wait");
+             // The expired token makes every prepare observable: a re-prepare
+-            // during the wait would dispatch at least one preflight refresh.
++            // during the wait would dispatch at least one extra preflight.
+             assert_eq!(
+                 pre_request_calls.load(Ordering::SeqCst),
+-                0,
++                preflights_after_prepare,
+                 "a parked iteration's 429 waits must not drive preflight refreshes"
+             );
+             assert_eq!(
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/turn/rate_limit_backoff_tests.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/turn/rate_limit_backoff_tests.rs
-index c6c978a9..e4fa08a6 100644
+index c6c978a9..c0797c43 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/turn/rate_limit_backoff_tests.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/turn/rate_limit_backoff_tests.rs
+@@ -12,7 +12,7 @@ pub(super) enum SessionKind {
+     Subagent,
+ }
+ 
+-fn rate_limited_reply(retry_after_secs: u64) -> ScriptedResponse {
++pub(super) fn rate_limited_reply(retry_after_secs: u64) -> ScriptedResponse {
+     let mut reply = ScriptedResponse::text(429, "concurrent sampling cap exceeded");
+     reply
+         .headers
 @@ -219,6 +219,7 @@ async fn subagent_429_wait_is_owned_and_capped_by_the_pacer() {
              let request = conversation_request(&actor).await;
              let requests_before = server.request_count();
