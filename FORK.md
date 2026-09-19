@@ -219,6 +219,16 @@ bands under real budgets for that kill test to be meaningful.
 
 ## Sync record
 
+### 2026-09-19 — public source 1.0.35 (`a28ee2b2`)
+
+At sync time the upstream stable channel advertised 1.0.34. No public
+source snapshot for 1.0.34 was available; public source history jumped
+from 1.0.32 to 1.0.35 and upstream advertised no tags. This fork is built
+from public source snapshot `a28ee2b2063426e8816e380ccea528b9de95e5da`
+(1.0.35), selected by Reed. Merge `--no-ff` from frozen
+`4e44265b3bec3baed12a9ba5a459dcfcc4479629`; `patches/BASE` advanced to
+`a28ee2b2`. LHC pin bump to `aa9caa16` is a separate integration commit.
+
 ### 2026-09-04 — slice 3: vendor pin `dd251ec` → `e9456a6e` (thread schema 6 → 13)
 
 Submodule-only certified code tip advance on `heron/sync` (no upstream
