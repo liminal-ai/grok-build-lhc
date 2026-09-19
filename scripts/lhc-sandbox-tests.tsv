@@ -2,20 +2,20 @@
 # Grok sandbox-path inventory. Hosted runner (workflow_dispatch) executes this
 # set with SANDBOX_E2E_REQUIRE_ENFORCEMENT=1. Local build-box cannot bwrap
 # (apparmor_restrict_unprivileged_userns=1). No build-box sysctl.
-xai-grok-shell::all	config::tests::required_bwrap_routes_fail_closed
-xai-grok-shell::all	config::tests::optional_bwrap_routes_can_degrade
-xai-grok-shell::all	session::persistence::resumed_sandbox_profile_tests::explicit_id_returns_persisted_profile
-xai-grok-shell::all	session::persistence::resumed_sandbox_profile_tests::explicit_id_without_persisted_profile_is_none
-xai-grok-shell::all	session::persistence::resumed_sandbox_profile_tests::explicit_remote_id_resolves_local_child_profile
-xai-grok-shell::all	session::persistence::resumed_sandbox_profile_tests::empty_or_missing_id_and_no_cwd_is_none
-xai-grok-shell::all	session::persistence::resumed_sandbox_profile_tests::most_recent_cwd_picks_latest_session_profile
-xai-grok-shell::all	session::persistence::resumed_sandbox_profile_tests::most_recent_cwd_skips_corrupt_summary
-xai-grok-shell::all	session::persistence::resumed_sandbox_profile_tests::most_recent_cwd_skips_raced_not_found
-xai-grok-shell::all	session::persistence::resumed_sandbox_profile_tests::most_recent_cwd_propagates_non_not_found_io_errors
-xai-grok-shell::all	session::persistence::resumed_sandbox_profile_tests::most_recent_cwd_prefers_last_active_at_over_updated_at
-xai-grok-shell::all	session::persistence::resumed_sandbox_profile_tests::most_recent_cwd_skips_hidden_session
-xai-grok-shell::all	session::persistence::resumed_sandbox_profile_tests::most_recent_cwd_skips_headless_session
-xai-grok-shell::all	session::persistence::resumed_sandbox_profile_tests::most_recent_cwd_with_no_sessions_is_none
+xai-grok-shell	config::tests::required_bwrap_routes_fail_closed
+xai-grok-shell	config::tests::optional_bwrap_routes_can_degrade
+xai-grok-shell	session::persistence::resumed_sandbox_profile_tests::explicit_id_returns_persisted_profile
+xai-grok-shell	session::persistence::resumed_sandbox_profile_tests::explicit_id_without_persisted_profile_is_none
+xai-grok-shell	session::persistence::resumed_sandbox_profile_tests::explicit_remote_id_resolves_local_child_profile
+xai-grok-shell	session::persistence::resumed_sandbox_profile_tests::empty_or_missing_id_and_no_cwd_is_none
+xai-grok-shell	session::persistence::resumed_sandbox_profile_tests::most_recent_cwd_picks_latest_session_profile
+xai-grok-shell	session::persistence::resumed_sandbox_profile_tests::most_recent_cwd_skips_corrupt_summary
+xai-grok-shell	session::persistence::resumed_sandbox_profile_tests::most_recent_cwd_skips_raced_not_found
+xai-grok-shell	session::persistence::resumed_sandbox_profile_tests::most_recent_cwd_propagates_non_not_found_io_errors
+xai-grok-shell	session::persistence::resumed_sandbox_profile_tests::most_recent_cwd_prefers_last_active_at_over_updated_at
+xai-grok-shell	session::persistence::resumed_sandbox_profile_tests::most_recent_cwd_skips_hidden_session
+xai-grok-shell	session::persistence::resumed_sandbox_profile_tests::most_recent_cwd_skips_headless_session
+xai-grok-shell	session::persistence::resumed_sandbox_profile_tests::most_recent_cwd_with_no_sessions_is_none
 xai-grok-sandbox::integration_test	test_profile_capability_set_construction
 xai-grok-sandbox::integration_test	test_sandbox_manager_lifecycle
 xai-grok-sandbox::integration_test	test_sandbox_logger

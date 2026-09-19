@@ -1,6 +1,9 @@
 #!/bin/sh
 # Verify the reviewed Grok sandbox gate list: unique binary/name pairs,
 # and (when cargo nextest can list) that JSON identities match.
+# Parser matches Codex C: rust-suites / binary-id / testcases / filter-match=matches.
+# Shell unit tests are listed with --lib (binary-id xai-grok-shell). Do not
+# compile xai-grok-shell integration tests (they need test-support).
 # Do not pass --retries to `nextest list`.
 set -eu
 ROOT=$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)
@@ -50,57 +53,90 @@ fi
 
 filter=$("$ROOT/scripts/lhc-sandbox-filter.sh")
 json_out=${LHC_SANDBOX_LIST_JSON:-}
-list_tmp=$(mktemp)
-trap 'rm -f "$list_tmp"' EXIT
+sandbox_json=$(mktemp)
+shell_json=$(mktemp)
+trap 'rm -f "$sandbox_json" "$shell_json"' EXIT
+
 set +e
 cargo nextest list \
   -p xai-grok-sandbox \
-  -p xai-grok-shell \
   --message-format json \
-  -E "$filter" >"$list_tmp"
-list_status=$?
+  -E "$filter" >"$sandbox_json"
+sandbox_status=$?
+cargo nextest list \
+  -p xai-grok-shell \
+  --lib \
+  --message-format json \
+  -E "$filter" >"$shell_json"
+shell_status=$?
 set -e
-if [ -n "$json_out" ]; then
-  cp "$list_tmp" "$json_out"
+
+if [ "$sandbox_status" != "0" ]; then
+  echo "cargo nextest list -p xai-grok-sandbox failed with status $sandbox_status" >&2
+  exit "$sandbox_status"
 fi
-if [ "$list_status" != "0" ]; then
-  echo "cargo nextest list failed with status $list_status" >&2
-  exit "$list_status"
+if [ "$shell_status" != "0" ]; then
+  echo "cargo nextest list -p xai-grok-shell --lib failed with status $shell_status" >&2
+  exit "$shell_status"
 fi
 
-EXPECTED_TSV="$data" EXPECTED_N="$EXPECTED" python3 - "$list_tmp" <<'PY'
-import json, os, sys
-path = sys.argv[1]
-expected = set()
-for line in os.environ["EXPECTED_TSV"].splitlines():
-    line = line.strip()
-    if not line:
-        continue
-    bid, name = line.split("\t", 1)
-    expected.add((bid, name))
-with open(path) as f:
-    data = json.load(f)
-rust = data.get("rust-binaries") or data.get("rust_binaries") or {}
+if [ -n "$json_out" ]; then
+  python3 - "$sandbox_json" "$shell_json" "$json_out" <<'PY'
+import json, sys
+a = json.load(open(sys.argv[1], encoding="utf-8"))
+b = json.load(open(sys.argv[2], encoding="utf-8"))
+out = {
+    "rust-suites": {},
+    "test-count": (a.get("test-count") or 0) + (b.get("test-count") or 0),
+}
+for src in (a, b):
+    out["rust-suites"].update(src.get("rust-suites") or {})
+json.dump(out, open(sys.argv[3], "w", encoding="utf-8"))
+PY
+fi
+
+EXPECTED_TSV="$data" python3 - "$sandbox_json" "$shell_json" "$EXPECTED" <<'PY'
+import json
+import os
+import sys
+
+expected_n = int(sys.argv[3])
 got = set()
-for bid, spec in rust.items():
-    tests = spec.get("tests") or {}
-    for tname in tests:
-        got.add((bid, tname))
+for path in (sys.argv[1], sys.argv[2]):
+    payload = json.load(open(path, encoding="utf-8"))
+    suites = payload.get("rust-suites") or {}
+    for suite in suites.values():
+        binary = suite.get("binary-id")
+        if not binary:
+            print("list JSON suite missing binary-id", file=sys.stderr)
+            sys.exit(1)
+        for name, meta in (suite.get("testcases") or {}).items():
+            match = (meta or {}).get("filter-match") or {}
+            if match.get("status") != "matches":
+                continue
+            got.add(f"{binary}\t{name}")
+
+expected = {line for line in os.environ["EXPECTED_TSV"].splitlines() if line}
+if len(expected) != expected_n:
+    print(f"internal expected set {len(expected)} != {expected_n}", file=sys.stderr)
+    sys.exit(1)
 missing = sorted(expected - got)
 extra = sorted(got - expected)
-if missing:
-    print("missing from nextest list:", file=sys.stderr)
-    for row in missing:
-        print(f"  {row[0]}\t{row[1]}", file=sys.stderr)
-if extra:
-    print("extra in nextest list:", file=sys.stderr)
-    for row in extra:
-        print(f"  {row[0]}\t{row[1]}", file=sys.stderr)
-want = int(os.environ["EXPECTED_N"])
-if len(expected) != want:
-    print(f"tsv unique {len(expected)} != header {want}", file=sys.stderr)
+if missing or extra or len(got) != expected_n:
+    print(
+        f"sandbox JSON identity mismatch: listed {len(got)}, expected {expected_n}",
+        file=sys.stderr,
+    )
+    if missing:
+        print("missing:", file=sys.stderr)
+        print("\n".join(missing), file=sys.stderr)
+    if extra:
+        print("extra:", file=sys.stderr)
+        print("\n".join(extra), file=sys.stderr)
     sys.exit(1)
-if missing or extra:
-    sys.exit(1)
-print(f"ok sandbox-identities: {len(got)} match nextest list")
+print(f"ok sandbox-filter: {expected_n} nextest binary/name identities match")
+ident_path = os.environ.get("LHC_SANDBOX_IDENTITIES")
+if ident_path:
+    with open(ident_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(sorted(got)) + "\n")
 PY

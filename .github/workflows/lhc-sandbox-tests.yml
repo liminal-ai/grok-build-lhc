@@ -97,17 +97,27 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/lhc-sandbox/sandbox-path.log"
           filter=$(./scripts/lhc-sandbox-filter.sh)
+          # Two invocations: sandbox package includes e2e bins; shell must
+          # be --lib so integration tests (test-support) are not compiled.
           set +e
-          cargo nextest run \
-            --no-fail-fast \
-            --retries 0 \
-            -p xai-grok-sandbox \
-            -p xai-grok-shell \
-            -E "$filter" \
-            2>&1 | tee "$log"
-          status=${PIPESTATUS[0]}
-          echo "SANDBOX_PATH_EXIT:$status" | tee -a "$log"
-          exit "$status"
+          (
+            cargo nextest run \
+              --no-fail-fast \
+              --retries 0 \
+              -p xai-grok-sandbox \
+              -E "$filter"
+            echo "SANDBOX_PKG_EXIT:$?"
+            cargo nextest run \
+              --no-fail-fast \
+              --retries 0 \
+              -p xai-grok-shell \
+              --lib \
+              -E "$filter"
+            echo "SANDBOX_SHELL_LIB_EXIT:$?"
+          ) 2>&1 | tee "$log"
+          grep -q '^SANDBOX_PKG_EXIT:0$' "$log" || exit 1
+          grep -q '^SANDBOX_SHELL_LIB_EXIT:0$' "$log" || exit 1
+          echo "SANDBOX_PATH_EXIT:0" | tee -a "$log"
 
       - name: Upload sandbox logs
         if: always()
