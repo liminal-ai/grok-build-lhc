@@ -1986,6 +1986,7 @@ mod stale_reconcile_gate_tests {
                         cursor: None,
                     },
                     /*no_replay*/ true,
+                    /*skip_local_background_tasks_replay*/ false,
                 );
                 let gate_result = tokio::time::timeout(Duration::from_secs(2), gate)
                     .await
@@ -2054,6 +2055,7 @@ mod stale_reconcile_gate_tests {
                             cursor: None,
                         },
                         /*no_replay*/ false,
+                        /*skip_local_background_tasks_replay*/ false,
                     )
                     .await
                     .expect("empty replay");
@@ -2078,6 +2080,7 @@ mod stale_reconcile_gate_tests {
             GatewaySender::new(tx),
             &AgentConfig::default(),
             auth_manager,
+            None,
             None,
         )
         .expect("valid test config");

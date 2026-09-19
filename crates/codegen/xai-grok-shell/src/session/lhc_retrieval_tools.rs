@@ -167,27 +167,21 @@ pub(crate) async fn register_lhc_retrieval_tools(
     let turns_schema = retrieval_args_schema("Turn ids, e.g. t211");
     let messages_schema = retrieval_args_schema("Message ids, e.g. m3177");
 
-    if let Err(e) = bridge
-        .register_mcp_tools(
-            GET_TURNS_TOOL_NAME.to_owned(),
-            GetTurnsTool {
-                session: session.clone(),
-            },
-            Some(turns_schema),
-        )
-        .await
-    {
+    if let Err(e) = bridge.register_mcp_tools(
+        GET_TURNS_TOOL_NAME.to_owned(),
+        GetTurnsTool {
+            session: session.clone(),
+        },
+        Some(turns_schema),
+    ) {
         unregister_lhc_retrieval_tools(bridge);
         return Err(format!("failed to register get_turns: {e}"));
     }
-    if let Err(e) = bridge
-        .register_mcp_tools(
-            GET_MESSAGES_TOOL_NAME.to_owned(),
-            GetMessagesTool { session },
-            Some(messages_schema),
-        )
-        .await
-    {
+    if let Err(e) = bridge.register_mcp_tools(
+        GET_MESSAGES_TOOL_NAME.to_owned(),
+        GetMessagesTool { session },
+        Some(messages_schema),
+    ) {
         // Roll back turns so the pair is never half-advertised.
         unregister_lhc_retrieval_tools(bridge);
         return Err(format!("failed to register get_messages: {e}"));

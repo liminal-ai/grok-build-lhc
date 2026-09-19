@@ -2689,6 +2689,7 @@ impl SessionActor {
         let mut turn_tools_called: Vec<String> = Vec::new();
         let mut tool_turn_count: usize = 1;
         let mut loop_index: u32 = 0;
+        let mut last_attempt_identity: Option<SamplerAttemptIdentity> = None;
         let mut identical_tool_calls = IdenticalToolCallRun::default();
         let mut todo_gate_fires: u32 = 0;
         let mut length_salvage_streak = LengthSalvageStreak::default();
@@ -2967,7 +2968,20 @@ impl SessionActor {
             // signature admission and response stamping share the exact
             // config this attempt will use (FIFO UpdateConfig → Submit).
             // Auth-retry / compact-resubmit re-enter this loop and freeze again.
-            let mut attempt_identity = self.prepare_sampler_for_turn().await;
+            // Parked uncharged-401 resubmits skip prepare: it drives preflight
+            // refreshes. Reuse the last frozen identity; send-time resolver
+            // supplies the bearer (same contract as run_turn_via_sampler).
+            let mut attempt_identity = if turn_parked.is_parked() {
+                last_attempt_identity
+                    .clone()
+                    .unwrap_or_else(|| SamplerAttemptIdentity {
+                        api_backend: Default::default(),
+                        model: String::new(),
+                    })
+            } else {
+                self.prepare_sampler_for_turn().await
+            };
+            last_attempt_identity = Some(attempt_identity.clone());
             // LHC-HOOK 4/10: substitute LHC request context after build_request
             // (+ live identity for signature gate). Cheap atomic first, then
             // per-session registry — no mutex when off. Instrumented-redundant
