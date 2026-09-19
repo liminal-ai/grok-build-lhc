@@ -2972,12 +2972,12 @@ impl SessionActor {
             // refreshes. Reuse the last frozen identity; send-time resolver
             // supplies the bearer (same contract as run_turn_via_sampler).
             let mut attempt_identity = if turn_parked.is_parked() {
+                // Parked resubmits skip prepare (it drives preflight
+                // refreshes). The previous iteration froze the identity;
+                // never invent an empty model / default backend.
                 last_attempt_identity
                     .clone()
-                    .unwrap_or_else(|| SamplerAttemptIdentity {
-                        api_backend: Default::default(),
-                        model: String::new(),
-                    })
+                    .expect("parked resubmit must reuse the last frozen SamplerAttemptIdentity")
             } else {
                 self.prepare_sampler_for_turn().await
             };

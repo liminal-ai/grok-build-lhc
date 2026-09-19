@@ -164,7 +164,6 @@ fn drain_persistence(mut rx: tokio::sync::mpsc::UnboundedReceiver<PersistenceMsg
 }
 
 /// Shape options for [`session_token_actor`].
-#[derive(Default)]
 struct ActorShape {
     /// Shape the actor like a spawned subagent turn — the only shape that
     /// gets a 429 wait budget.
@@ -173,6 +172,24 @@ struct ActorShape {
     task_output_budget: Option<u64>,
     /// Flip the `uncharged_401_park` kill switch off.
     park_disabled: bool,
+    /// Sampler transport retry policy. Default `max_retries: 0` keeps 401
+    /// tests from absorbing retries inside the sampler. Parked 429 coverage
+    /// must disable the sampler's rate-limit loop so the pacer owns the wait.
+    retry_policy: xai_grok_sampler::RetryPolicy,
+}
+
+impl Default for ActorShape {
+    fn default() -> Self {
+        Self {
+            is_subagent: false,
+            task_output_budget: None,
+            park_disabled: false,
+            retry_policy: xai_grok_sampler::RetryPolicy {
+                max_retries: 0,
+                ..Default::default()
+            },
+        }
+    }
 }
 
 /// Actor wired for session-token auth against the mock server: a real sampler, the `cached_token` method, and the supplied auth manager.
@@ -182,25 +199,20 @@ async fn session_token_actor(
     auth_manager: Arc<AuthManager>,
     shape: ActorShape,
 ) -> (Arc<SessionActor>, XaiUpdates) {
+    let retry_policy = shape.retry_policy.clone();
     let sampling_cfg = xai_grok_sampler::SamplerConfig {
         base_url: server.url(),
         model: "test".to_string(),
         api_backend: xai_grok_sampler::ApiBackend::Responses,
         context_window: 256_000,
-        max_retries: Some(0),
+        max_retries: Some(retry_policy.max_retries),
         idle_timeout_secs: Some(30),
         ..Default::default()
     };
     let (sampler_event_tx, sampler_event_rx) =
         tokio::sync::mpsc::unbounded_channel::<xai_grok_sampler::SamplingEvent>();
-    let sampler_handle = xai_grok_sampler::SamplerActor::spawn(
-        sampling_cfg,
-        xai_grok_sampler::RetryPolicy {
-            max_retries: 0,
-            ..Default::default()
-        },
-        sampler_event_tx,
-    );
+    let sampler_handle =
+        xai_grok_sampler::SamplerActor::spawn(sampling_cfg, retry_policy.clone(), sampler_event_tx);
 
     let (gateway_tx, gateway_rx) = tokio::sync::mpsc::unbounded_channel();
     let xai_updates = drain_gateway(gateway_rx);
@@ -233,6 +245,11 @@ async fn session_token_actor(
     cfg.base_url = server.url();
     cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
     cfg.model = "test".to_string();
+    if retry_policy.rate_limit_retry_threshold == xai_grok_sampler::RATE_LIMIT_RETRY_DISABLED {
+        cfg.max_retries = Some(retry_policy.max_retries);
+        cfg.rate_limit_retry_threshold = Some(retry_policy.rate_limit_retry_threshold);
+        actor.max_retries = retry_policy.max_retries;
+    }
     actor.chat_state_handle.update_sampling_config(cfg);
     let mut creds = actor.chat_state_handle.get_credentials().await;
     creds.api_key = None;
@@ -792,10 +809,13 @@ async fn parked_429_wait_does_not_drive_refreshes() {
             let server = MockInferenceServer::start_with_models(vec![MockModelEntry::new("test")])
                 .await
                 .expect("mock inference server");
-            // One 429 rung, then the default 200: exactly one paced wait.
+            // One surfaced 429 (retry-after + sampler rate-limit loop disabled),
+            // then the default 200: exactly one paced wait. JSON 429 with the
+            // default sampler policy is absorbed inside the sampler and never
+            // reaches the pacer.
             server.enqueue_response(
                 "/v1/responses",
-                ScriptedResponse::json(429, serde_json::json!({ "error": "rate limited" })),
+                super::rate_limit_backoff_tests::rate_limited_reply(1),
             );
 
             let refresher = Arc::new(DeferredRefreshNeverLands::default());
@@ -807,6 +827,7 @@ async fn parked_429_wait_does_not_drive_refreshes() {
                 am,
                 ActorShape {
                     is_subagent: true,
+                    retry_policy: super::rate_limit_backoff_tests::sampler_surfaces_429(),
                     ..Default::default()
                 },
             )
@@ -815,6 +836,7 @@ async fn parked_429_wait_does_not_drive_refreshes() {
             let request = super::rate_limit_backoff_tests::conversation_request(&actor).await;
             let mut budget = actor.rate_limit_wait_budget(None);
             let mut attempt = actor.prepare_sampler_for_turn().await;
+            let preflights_after_prepare = pre_request_calls.load(Ordering::SeqCst);
             let outcome = tokio::time::timeout(
                 Duration::from_secs(300),
                 actor.run_turn_via_sampler(
@@ -834,10 +856,10 @@ async fn parked_429_wait_does_not_drive_refreshes() {
             );
             assert_eq!(budget.attempts_used(), 1, "the pacer must own the 429 wait");
             // The expired token makes every prepare observable: a re-prepare
-            // during the wait would dispatch at least one preflight refresh.
+            // during the wait would dispatch at least one extra preflight.
             assert_eq!(
                 pre_request_calls.load(Ordering::SeqCst),
-                0,
+                preflights_after_prepare,
                 "a parked iteration's 429 waits must not drive preflight refreshes"
             );
             assert_eq!(

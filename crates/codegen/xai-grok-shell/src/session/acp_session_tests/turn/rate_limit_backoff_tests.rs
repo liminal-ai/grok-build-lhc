@@ -12,7 +12,7 @@ pub(super) enum SessionKind {
     Subagent,
 }
 
-fn rate_limited_reply(retry_after_secs: u64) -> ScriptedResponse {
+pub(super) fn rate_limited_reply(retry_after_secs: u64) -> ScriptedResponse {
     let mut reply = ScriptedResponse::text(429, "concurrent sampling cap exceeded");
     reply
         .headers

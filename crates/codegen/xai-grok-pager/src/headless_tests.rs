@@ -326,6 +326,183 @@ async fn cold_attach_answers_permission_request_without_deadlock() {
         .await;
 }
 
+/// YOLO cold attach must select AllowOnce rather than cancel, still without
+/// deadlocking the outstanding NewSession oneshot.
+#[tokio::test(flavor = "current_thread")]
+async fn cold_attach_yolo_selects_allow_once_without_deadlock() {
+    use std::time::Duration;
+
+    use xai_acp_lib::{AcpAgentMessage, AcpArgs, AcpClientMessage, acp_channels};
+
+    let (client, mut agent) = acp_channels();
+    let acp_tx = client.tx;
+    let mut acp_rx = client.rx;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let peer = tokio::task::spawn_local(async move {
+                let msg = agent.rx.recv().await.expect("new_session request");
+                let AcpAgentMessage::NewSession(args) = msg else {
+                    panic!("expected NewSession, got {msg:?}");
+                };
+
+                let (perm_tx, perm_rx) = tokio::sync::oneshot::channel();
+                agent
+                    .tx
+                    .send(AcpClientMessage::RequestPermission(AcpArgs {
+                        request: acp::RequestPermissionRequest::new(
+                            acp::SessionId::new("s-yolo"),
+                            acp::ToolCallUpdate::new(
+                                acp::ToolCallId::new(std::sync::Arc::from("tc-yolo")),
+                                acp::ToolCallUpdateFields::default(),
+                            ),
+                            vec![acp::PermissionOption::new(
+                                acp::PermissionOptionId::new(std::sync::Arc::from("allow-once")),
+                                "Allow once",
+                                acp::PermissionOptionKind::AllowOnce,
+                            )],
+                        ),
+                        response_tx: perm_tx,
+                    }))
+                    .unwrap();
+
+                let outcome = tokio::time::timeout(Duration::from_secs(2), perm_rx)
+                    .await
+                    .expect("permission request not answered during yolo cold attach")
+                    .expect("permission oneshot closed");
+                let resp = outcome.expect("permission reply error");
+                match resp.outcome {
+                    acp::RequestPermissionOutcome::Selected(selected) => {
+                        assert_eq!(selected.option_id.0.as_ref(), "allow-once");
+                    }
+                    other => panic!("yolo cold attach must select AllowOnce, got {other:?}"),
+                }
+
+                args.response_tx
+                    .send(Ok(acp::NewSessionResponse::new(acp::SessionId::new(
+                        "s-yolo",
+                    ))))
+                    .unwrap();
+            });
+
+            let mut inbox = super::ColdAttachInbox::default();
+            let resp = tokio::time::timeout(
+                Duration::from_secs(3),
+                super::acp_send_servicing_cold_attach(
+                    acp::NewSessionRequest::new(std::path::PathBuf::from("/tmp")),
+                    &acp_tx,
+                    &mut acp_rx,
+                    &mut inbox,
+                    /*yolo*/ true,
+                ),
+            )
+            .await
+            .expect("new_session deadlocked on unanswered yolo permission")
+            .expect("new_session ok");
+            assert_eq!(resp.session_id.0.as_ref(), "s-yolo");
+            peer.await.expect("peer");
+        })
+        .await;
+}
+
+/// Live `task_backgrounded` during cold load must arm wait-for-background
+/// (`pending_bg`) rather than the quiet completed-task tombstone used for
+/// stale `task_completed`.
+#[tokio::test(flavor = "current_thread")]
+async fn cold_load_task_backgrounded_arms_pending_lifecycle() {
+    use std::time::Duration;
+
+    use xai_acp_lib::{AcpAgentMessage, AcpArgs, AcpClientMessage, acp_channels};
+
+    let (client, mut agent) = acp_channels();
+    let acp_tx = client.tx;
+    let mut acp_rx = client.rx;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let peer = tokio::task::spawn_local(async move {
+                let msg = agent
+                    .rx
+                    .recv()
+                    .await
+                    .expect("client must send session/load");
+                let AcpAgentMessage::LoadSession(args) = msg else {
+                    panic!("expected LoadSession, got {msg:?}");
+                };
+
+                let payload = serde_json::json!({
+                    "sessionId": "s-bg-load",
+                    "update": {
+                        "sessionUpdate": "task_backgrounded",
+                        "task_id": "bg-live-1",
+                    },
+                });
+                let raw = serde_json::value::to_raw_value(&payload).unwrap();
+                let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+                agent
+                    .tx
+                    .send(AcpClientMessage::ExtNotification(AcpArgs {
+                        request: acp::ExtNotification::new("x.ai/task_backgrounded", raw.into()),
+                        response_tx: completion_tx,
+                    }))
+                    .expect("enqueue task_backgrounded while load outstanding");
+
+                tokio::time::timeout(Duration::from_secs(2), completion_rx)
+                    .await
+                    .expect("task_backgrounded was not acknowledged during session/load")
+                    .expect("task_backgrounded oneshot closed")
+                    .expect("task_backgrounded ack");
+
+                args.response_tx
+                    .send(Ok(acp::LoadSessionResponse::new()))
+                    .expect("deliver LoadSessionResponse after nested ack");
+            });
+
+            let mut inbox = super::ColdAttachInbox::default();
+            let load = super::acp_send_servicing_cold_attach(
+                acp::LoadSessionRequest::new(
+                    acp::SessionId::new("s-bg-load"),
+                    std::path::PathBuf::from("/tmp"),
+                )
+                .meta({
+                    let mut m = acp::Meta::new();
+                    m.insert("noReplay".into(), serde_json::Value::Bool(true));
+                    Some(m)
+                }),
+                &acp_tx,
+                &mut acp_rx,
+                &mut inbox,
+                /*yolo*/ false,
+            );
+
+            tokio::time::timeout(Duration::from_secs(3), load)
+                .await
+                .expect("session/load deadlocked on task_backgrounded")
+                .expect("session/load should succeed");
+
+            assert!(
+                inbox
+                    .pending_bg
+                    .contains(&super::BackgroundWork::Task("bg-live-1".into())),
+                "live task_backgrounded must arm pending work: {:?}",
+                inbox.pending_bg
+            );
+            assert!(
+                !inbox
+                    .background_lifecycle
+                    .completed_tasks
+                    .contains("bg-live-1"),
+                "live backgrounded task is not a completed tombstone: {:?}",
+                inbox.background_lifecycle.completed_tasks
+            );
+
+            peer.await.expect("peer task");
+        })
+        .await;
+}
+
 /// `begin_session` runs before the model and effort are applied, so a post-open error carries the real context.
 #[test]
 fn post_open_error_carries_real_session_context() {
@@ -641,7 +818,8 @@ async fn worktree_create_failure_is_reported_before_any_session_opens() {
             false,
         )
         .await
-        .unwrap_err()
+        .err()
+        .expect("worktree create must fail")
         .to_string();
         assert!(err.contains("couldn't create worktree"), "{err}");
         assert!(err.contains(expect), "{err}");
@@ -668,7 +846,8 @@ async fn worktree_create_then_session_failure_names_the_orphaned_worktree() {
         false,
     )
     .await
-    .unwrap_err()
+    .err()
+    .expect("session open after worktree create must fail")
     .to_string();
 
     assert!(err.contains("agent refused"), "{err}");
@@ -763,7 +942,8 @@ async fn worktree_resume_failure_carries_local_miss_hint_like_the_tui() {
         false,
     )
     .await
-    .unwrap_err()
+    .err()
+    .expect("hinted worktree resume must fail")
     .to_string();
     let (_client_tx2, mut acp_rx2) = tokio::sync::mpsc::unbounded_channel();
     let plain = resume_session_in_new_worktree(
@@ -777,7 +957,8 @@ async fn worktree_resume_failure_carries_local_miss_hint_like_the_tui() {
         false,
     )
     .await
-    .unwrap_err()
+    .err()
+    .expect("plain worktree resume must fail")
     .to_string();
 
     assert_eq!(
