@@ -4281,6 +4281,7 @@ async fn writeback_replace_decreases_estimated_total_tokens() {
         context_window: std::num::NonZeroU64::new(128_000).unwrap(),
         reasoning_effort: None,
         stream_tool_calls: None,
+        ..Default::default()
     };
     let handle = ChatStateActor::spawn(fat, config, Box::new(NullChatPersistence), event_tx, token);
     let _ = handle.get_conversation().await;

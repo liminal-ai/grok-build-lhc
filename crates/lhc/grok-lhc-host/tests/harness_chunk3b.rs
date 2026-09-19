@@ -62,6 +62,7 @@ fn sampling_config() -> SamplingConfig {
         context_window: NonZeroU64::new(128_000).unwrap(),
         reasoning_effort: None,
         stream_tool_calls: None,
+        ..Default::default()
     }
 }
 
