@@ -328,7 +328,7 @@ fn golden_every_synthetic_reason() {
     for (i, reason) in reasons.into_iter().enumerate() {
         let mut item = ConversationItem::user(format!("synthetic-{i}"));
         if let ConversationItem::User(u) = &mut item {
-            u.synthetic_reason = Some(reason);
+            u.synthetic_reason = reason;
         }
         items.push(item);
     }
